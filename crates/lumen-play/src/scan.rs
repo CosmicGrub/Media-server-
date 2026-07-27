@@ -618,8 +618,10 @@ mod tests {
         assert_eq!(s.playable().count(), 1);
         assert_eq!(s.skipped_samples, 1);
 
-        let with =
-            scan(std::slice::from_ref(&d.0), &ScanOptions { include_samples: true, ..Default::default() });
+        let with = scan(
+            std::slice::from_ref(&d.0),
+            &ScanOptions { include_samples: true, ..Default::default() },
+        );
         assert_eq!(with.playable().count(), 2);
     }
 
@@ -660,7 +662,8 @@ mod tests {
         for n in ["a.mkv", "b.mkv", "c.mkv"] {
             d.file(n, &mkv_bytes());
         }
-        let s = scan(std::slice::from_ref(&d.0), &ScanOptions { limit: Some(2), ..Default::default() });
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { limit: Some(2), ..Default::default() });
         assert_eq!(s.playable().count(), 2);
         assert!(s.truncated, "a truncated scan must not read as the whole library");
     }

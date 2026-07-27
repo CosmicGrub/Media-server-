@@ -3,3 +3,7 @@
 conformance/media/
 conformance/golden/
 native/out/
+
+# Release bundles: lumen.exe is small but mpv.exe is 115 MB. Built by
+# crates/lumen-play/package-windows.sh, not committed.
+/dist/

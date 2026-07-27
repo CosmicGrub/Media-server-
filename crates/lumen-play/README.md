@@ -9,15 +9,36 @@ library is also the first real test of that code on data that is not a fixture.
 
 ## Install
 
+**Windows — prebuilt bundle, nothing to install.** Unzip
+`lumen-windows-x86_64.zip` anywhere and run `lumen.exe` from that folder. It carries `mpv.exe`
+(mpv 0.41.0, with FFmpeg and libplacebo statically linked) beside it, so the folder is
+self-contained and portable — a USB stick works. Nothing touches the registry; deleting the folder
+undoes everything.
+
+Build it yourself, from Linux or Windows:
+
 ```bash
-# The only prerequisite. Everything plays through mpv.
-#   Windows   winget install mpv.net
+# Cross-compiling from Linux needs these once:
+apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-x86-64-dev
+rustup target add x86_64-pc-windows-gnu
+
+./crates/lumen-play/package-windows.sh --with-mpv   # -> dist/lumen-windows-x86_64.zip
+```
+
+**Anywhere else**, mpv is the one prerequisite:
+
+```bash
 #   macOS     brew install mpv
 #   Linux     apt install mpv     (or dnf / pacman / zypper)
 
 cargo build --release -p lumen-play
 ./target/release/lumen doctor
 ```
+
+`lumen` finds mpv beside its own executable first, then on `PATH`, then in the usual install
+locations. `LUMEN_MPV=/path/to/mpv` overrides all of it. Bundled-first is deliberate: a copy you
+put next to the binary is one you chose, and quietly preferring an older system install would show
+up only as a file that mysteriously fails to play.
 
 `doctor` tells you whether mpv is present, whether it has the `gpu-next` video output, and whether
 hardware decoding is available. Worth reading before drawing conclusions from anything else: a
@@ -89,9 +110,9 @@ Playback controls are mpv's own — space, arrows, `f`, `q`. There is no UI of o
 file it cannot open and waits at the end instead of exiting, so a thousand-file scan finishes even if
 the first fifty are corrupt. That is the "no refusal" guarantee (`docs/11` §G2) applied to a playlist.
 
-**Results are attributed by path, not by a counter.** mpv does not have to play the playlist in the
-order it was written — `--shuffle` reorders it and mpv may skip an entry — so counting would record
-every file's outcome against the wrong file.
+**Results are keyed on mpv's `playlist_entry_id`, not on a counter or a path lookup.** mpv need not
+play the playlist in the order it was written, and the entry id rides on the events themselves so it
+cannot race a property read. See Status below for the bug this replaced.
 
 **Events are never dropped while a command is in flight.** mpv interleaves events with replies
 freely, so a property read at the wrong moment would swallow the `end-file` event carrying the reason
@@ -103,11 +124,24 @@ that substring matching gets wrong silently.
 
 ## Status
 
-64 tests. Everything that does not need a display is covered: the scanner against real directory
-trees, the JSON parser against malformed and hostile input, the IPC event queueing, the playlist
-ordering, and the report renderers.
+76 tests, plus an end-to-end run of the Windows binary against real encoded media (H.264 in
+Matroska and MP4, MPEG-4 part 2 in AVI, and a deliberately corrupt file) under Wine: five files,
+four played, one correctly reported as `unrecognized file format`, every resolution and codec
+attributed to the right file, exit code 1.
 
-**Playback itself has not been run.** It was built in an environment with no mpv, no GPU and no
-display. The scan, parse, playlist, protocol and report layers are all tested; what has not been
-exercised is the part where mpv actually opens a file. Expect to hit something on first run — start
-with `lumen doctor`, then `lumen test <folder> --limit 5` before pointing it at everything.
+That last point was a bug the real run caught, and it is worth knowing about:
+
+- mpv given a playlist **on the command line** starts playing before this process can connect, so
+  the first `start-file` event is gone before anything is listening.
+- Reading the `path` property on `start-file` looks like a fix and is not: at that moment mpv still
+  reports the *previous* file.
+
+Together those shifted every result one position — a report in which a corrupt 18-byte file was
+credited with 320x240 MPEG-4 video belonging to the next file in the list. Plausible, entirely
+wrong, and invisible without checking the output against known inputs. The playlist is now sent
+over IPC after connecting, and results are keyed on `playlist_entry_id`, which rides on the events
+themselves and cannot race.
+
+**Not yet exercised:** real GPU decoding and rendering. The Wine verification ran with `--vo=null`
+on a machine with no GPU, so hardware decode paths, `gpu-next`, HDR tone mapping and frame pacing
+are still untested. `LUMEN_DEBUG_EVENTS=1` dumps the raw mpv event stream if something looks wrong.

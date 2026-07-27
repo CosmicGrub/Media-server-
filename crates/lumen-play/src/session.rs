@@ -189,10 +189,13 @@ impl SessionReport {
 ///
 /// Split out so the argument list is inspectable without launching anything — `--dry-run` prints
 /// exactly this, which is the difference between "the player did something odd" and a diagnosis.
-pub fn mpv_args(playlist: &Path, ipc_path: &str, opts: &PlayOptions) -> Vec<String> {
+pub fn mpv_args(ipc_path: &str, opts: &PlayOptions) -> Vec<String> {
     let mut args = vec![
         format!("--input-ipc-server={ipc_path}"),
-        format!("--playlist={}", playlist.display()),
+        // No `--playlist` here on purpose. mpv given a playlist on the command line starts playing
+        // before this process can connect, and the first `start-file` event is gone before anyone is
+        // listening — which silently shifts every result onto the wrong file. The playlist is sent
+        // over IPC once the connection exists, so no event can be missed.
         format!("--hwdec={}", opts.hwdec),
         // gpu-next is the libplacebo renderer this product is built on.
         format!("--vo={}", opts.vo.as_deref().unwrap_or("gpu-next")),
@@ -211,9 +214,6 @@ pub fn mpv_args(playlist: &Path, ipc_path: &str, opts: &PlayOptions) -> Vec<Stri
     ];
     if opts.fullscreen {
         args.push("--fullscreen=yes".into());
-    }
-    if opts.shuffle {
-        args.push("--shuffle".into());
     }
     if opts.start_paused {
         args.push("--pause=yes".into());
@@ -244,7 +244,10 @@ pub fn write_playlist(dir: &Path, files: &[&ScannedFile]) -> std::io::Result<Pat
 }
 
 fn spawn_mpv(args: &[String]) -> std::io::Result<Child> {
-    Command::new("mpv")
+    // Resolved rather than assumed, so a bundled mpv sitting next to this binary is used in
+    // preference to whatever happens to be installed.
+    let exe = crate::mpvbin::find().unwrap_or_else(|| PathBuf::from("mpv"));
+    Command::new(exe)
         .args(args)
         .stdout(Stdio::null())
         // mpv's own errors go to the terminal, where they belong: when a file fails, its message is
@@ -269,10 +272,11 @@ pub fn run(
     let playlist = write_playlist(&tmp, &files).map_err(|e| format!("playlist: {e}"))?;
     let ipc_path = ipc::default_ipc_path("play");
     let _ = std::fs::remove_file(&ipc_path);
-    let args = mpv_args(&playlist, &ipc_path, opts);
+    let args = mpv_args(&ipc_path, opts);
 
     if opts.dry_run {
         println!("mpv \\\n  {}", args.join(" \\\n  "));
+        println!("  (then over IPC: loadlist {} replace)", playlist.display());
         println!("\nplaylist ({} files): {}", files.len(), playlist.display());
         return Ok(SessionReport {
             results: files.iter().map(|f| FileResult::new(f)).collect(),
@@ -281,7 +285,7 @@ pub fn run(
     }
 
     let mut child = spawn_mpv(&args)
-        .map_err(|e| format!("cannot launch mpv: {e}. Is it installed and on PATH?"))?;
+        .map_err(|e| format!("cannot launch mpv: {e}\n\n{}", crate::mpvbin::install_hint()))?;
 
     let mut mpv = match Mpv::connect(&ipc_path, Duration::from_secs(20)) {
         Ok(m) => m,
@@ -295,6 +299,21 @@ pub fn run(
         }
     };
 
+    // Now that events cannot be missed, hand mpv the playlist.
+    let list_arg = playlist.to_string_lossy().into_owned();
+    if mpv.command(&["loadlist", &list_arg, "replace"]).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("mpv would not accept the playlist".into());
+    }
+    if opts.shuffle {
+        let _ = mpv.command(&["playlist-shuffle"]);
+    }
+
+    // Set by LUMEN_DEBUG_EVENTS=1. Dumps every event mpv sends, which is the only way to tell a
+    // protocol misunderstanding from a logic bug when the results look plausible but are wrong.
+    let debug_events = std::env::var_os("LUMEN_DEBUG_EVENTS").is_some();
+
     let start = Instant::now();
     let mut report = SessionReport {
         results: files.iter().map(|f| FileResult::new(f)).collect(),
@@ -304,11 +323,20 @@ pub fn run(
     };
 
     let total = files.len();
-    // Path -> index. mpv does not have to play the playlist in the order it was written — `--shuffle`
-    // reorders it, and mpv may skip an entry entirely — so attributing results by a counter would
-    // record every file's outcome against the wrong file. The path mpv reports is authoritative.
+    // Path -> our index, for the one case where an entry id is unavailable.
     let by_path: std::collections::HashMap<String, usize> =
         files.iter().enumerate().map(|(i, f)| (f.path.to_string_lossy().into_owned(), i)).collect();
+
+    // Entry id -> our index. This is the authoritative mapping: `playlist_entry_id` rides on the
+    // `start-file` and `end-file` events themselves, so it cannot race the way a property read can.
+    //
+    // Reading the `path` property on `start-file` looks equivalent and is not — at that moment mpv
+    // still reports the *previous* file, so every result lands one position early. That bug produced
+    // a report where a corrupt 18-byte file was credited with 320x240 MPEG-4 video.
+    let ids = mpv.get("playlist").map(|pl| entry_id_map(&pl, &by_path)).unwrap_or_default();
+    if debug_events {
+        eprintln!("[playlist] {} entries mapped by id", ids.len());
+    }
 
     let mut current: Option<usize> = None;
     let mut reached = 0usize;
@@ -333,25 +361,30 @@ pub fn run(
         }
 
         let Some(event) = mpv.next_event(Duration::from_millis(250)) else {
+            // (no event this tick)
             if mpv.is_closed() {
                 break;
             }
             continue;
         };
 
+        if debug_events {
+            eprintln!("[event] {event:?}");
+        }
+
         match ipc::event_name(&event) {
             Some("start-file") => {
-                // Resolved from mpv's own `path`, not from a counter. The fallback only fires when
-                // the property is unavailable, and it advances rather than guessing an absolute
-                // position — the least-wrong answer when mpv will not say which file it opened.
-                current = mpv
-                    .get_string("path")
-                    .and_then(|p| by_path.get(&p).copied())
+                current = event_index(&event, &ids)
                     .or_else(|| current.map(|c| (c + 1).min(total - 1)).or(Some(0)));
                 reached += 1;
                 file_started = Instant::now();
             }
             Some("file-loaded") => {
+                // `file-loaded` carries no entry id, but by now the `path` property *is* the current
+                // file, so it recovers the position if the start-file event was somehow missed.
+                if current.is_none() {
+                    current = mpv.get_string("path").and_then(|p| by_path.get(&p).copied());
+                }
                 if let Some(i) = current {
                     collect_properties(&mut mpv, &mut report.results[i]);
                     base_delayed =
@@ -364,6 +397,11 @@ pub fn run(
                 }
             }
             Some("end-file") => {
+                // The entry id wins over `current`: a file that failed to open never emitted
+                // `file-loaded`, and this is the only event that says which file it was.
+                if let Some(i) = event_index(&event, &ids) {
+                    current = Some(i);
+                }
                 if let Some(i) = current {
                     let r = &mut report.results[i];
                     r.seconds_played = file_started.elapsed().as_secs_f64();
@@ -424,6 +462,38 @@ fn collect_properties(mpv: &mut Mpv, r: &mut FileResult) {
     }
 }
 
+/// Map mpv's playlist entry ids onto our own indices.
+///
+/// Built from the `playlist` property rather than assumed to be `id - 1`: mpv only documents entry
+/// ids as unique and stable, not as consecutive from one, and `playlist-shuffle` reorders entries
+/// while keeping their ids. Matching on filename is what makes both facts irrelevant.
+pub fn entry_id_map(
+    playlist: &Value,
+    by_path: &std::collections::HashMap<String, usize>,
+) -> std::collections::HashMap<u64, usize> {
+    let mut out = std::collections::HashMap::new();
+    for (pos, entry) in playlist.as_array().unwrap_or(&[]).iter().enumerate() {
+        let Some(id) = entry.get("id").and_then(Value::as_f64) else { continue };
+        let index = entry
+            .get("filename")
+            .and_then(Value::as_str)
+            .and_then(|f| by_path.get(f).copied())
+            // Positional fallback for a build that reports a filename we cannot match — better than
+            // dropping the entry, which would lose that file's result entirely.
+            .or_else(|| (pos < by_path.len()).then_some(pos));
+        if let Some(i) = index {
+            out.insert(id as u64, i);
+        }
+    }
+    out
+}
+
+/// Our index for the file an event refers to, via its `playlist_entry_id`.
+fn event_index(event: &Value, ids: &std::collections::HashMap<u64, usize>) -> Option<usize> {
+    let id = event.get("playlist_entry_id")?.as_f64()?;
+    ids.get(&(id as u64)).copied()
+}
+
 /// Count video, audio and subtitle tracks in mpv's `track-list`.
 pub fn count_tracks(list: &Value) -> TrackCounts {
     let mut c = TrackCounts::default();
@@ -447,7 +517,7 @@ mod tests {
     fn the_arguments_keep_a_broken_file_from_ending_the_run() {
         // The single most important property of a library test: fifty corrupt files at the front of
         // a thousand-file scan must not stop it at file one.
-        let args = mpv_args(Path::new("/tmp/pl.txt"), "/tmp/s.sock", &PlayOptions::new());
+        let args = mpv_args("/tmp/s.sock", &PlayOptions::new());
         let joined = args.join(" ");
         assert!(joined.contains("--keep-open=no"), "must advance past a file it cannot open");
         assert!(joined.contains("--idle=yes"), "must not exit before results are collected");
@@ -456,7 +526,7 @@ mod tests {
 
     #[test]
     fn the_arguments_pick_up_sidecar_subtitles_and_audio() {
-        let args = mpv_args(Path::new("/tmp/pl.txt"), "/tmp/s.sock", &PlayOptions::new());
+        let args = mpv_args("/tmp/s.sock", &PlayOptions::new());
         let joined = args.join(" ");
         assert!(joined.contains("--sub-auto=fuzzy"));
         assert!(joined.contains("--audio-file-auto=fuzzy"));
@@ -464,13 +534,10 @@ mod tests {
 
     #[test]
     fn the_video_output_is_gpu_next_unless_overridden() {
-        let default = mpv_args(Path::new("/p"), "/s", &PlayOptions::new());
+        let default = mpv_args("/s", &PlayOptions::new());
         assert!(default.iter().any(|a| a == "--vo=gpu-next"));
-        let overridden = mpv_args(
-            Path::new("/p"),
-            "/s",
-            &PlayOptions { vo: Some("gpu".into()), ..PlayOptions::new() },
-        );
+        let overridden =
+            mpv_args("/s", &PlayOptions { vo: Some("gpu".into()), ..PlayOptions::new() });
         assert!(overridden.iter().any(|a| a == "--vo=gpu"));
         assert!(!overridden.iter().any(|a| a == "--vo=gpu-next"));
     }
@@ -480,7 +547,7 @@ mod tests {
         // mpv takes the last occurrence of an option, so a pass-through override has to be able to
         // beat our defaults — otherwise `--vo=x11` on the command line would silently do nothing.
         let opts = PlayOptions { extra_args: vec!["--vo=x11".into()], ..PlayOptions::new() };
-        let args = mpv_args(Path::new("/p"), "/s", &opts);
+        let args = mpv_args("/s", &opts);
         let vo_positions: Vec<usize> = args
             .iter()
             .enumerate()
@@ -488,6 +555,69 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(args[*vo_positions.last().unwrap()], "--vo=x11");
+    }
+
+    #[test]
+    fn the_playlist_is_not_passed_on_the_command_line() {
+        // mpv given a playlist as an argument starts playing before this process can connect, and
+        // the first `start-file` event is gone before anyone is listening — which shifts every
+        // result onto the wrong file. Observed for real: a corrupt 18-byte file was credited with
+        // 320x240 MPEG-4 video that belonged to the next file in the list.
+        let args = mpv_args("/tmp/s.sock", &PlayOptions::new());
+        assert!(
+            !args.iter().any(|a| a.starts_with("--playlist")),
+            "the playlist must be sent over IPC after connecting: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--idle=yes"), "mpv must wait for it");
+    }
+
+    #[test]
+    fn entry_ids_map_to_our_indices_by_filename() {
+        let by_path: std::collections::HashMap<String, usize> =
+            [("/m/a.mkv".to_string(), 0), ("/m/b.mkv".to_string(), 1)].into_iter().collect();
+        // Shuffled: mpv reordered the entries but kept their ids. Matching on filename is what makes
+        // the order irrelevant — assuming `id - 1` would swap these two files' results.
+        let pl =
+            parse(r#"[{"id":2,"filename":"/m/b.mkv"},{"id":1,"filename":"/m/a.mkv"}]"#).unwrap();
+        let ids = entry_id_map(&pl, &by_path);
+        assert_eq!(ids.get(&1), Some(&0));
+        assert_eq!(ids.get(&2), Some(&1));
+    }
+
+    #[test]
+    fn entry_ids_are_not_assumed_to_start_at_one() {
+        // mpv documents entry ids as unique and stable, not as consecutive from one. A playlist
+        // edited during the run can leave gaps.
+        let by_path: std::collections::HashMap<String, usize> =
+            [("/m/a.mkv".to_string(), 0)].into_iter().collect();
+        let pl = parse(r#"[{"id":97,"filename":"/m/a.mkv"}]"#).unwrap();
+        assert_eq!(entry_id_map(&pl, &by_path).get(&97), Some(&0));
+    }
+
+    #[test]
+    fn an_unmatched_filename_falls_back_to_position_rather_than_being_dropped() {
+        // A build that normalises the path it reports would otherwise lose that file's result
+        // entirely — a silent hole in the report, which is worse than an approximate answer.
+        let by_path: std::collections::HashMap<String, usize> =
+            [("/m/a.mkv".to_string(), 0), ("/m/b.mkv".to_string(), 1)].into_iter().collect();
+        // A build that normalises the case of what it reports back, which Windows genuinely does.
+        let pl =
+            parse(r#"[{"id":1,"filename":"/M/A.MKV"},{"id":2,"filename":"/m/b.mkv"}]"#).unwrap();
+        let ids = entry_id_map(&pl, &by_path);
+        assert_eq!(ids.get(&1), Some(&0), "positional fallback");
+        assert_eq!(ids.get(&2), Some(&1), "exact match still wins");
+    }
+
+    #[test]
+    fn an_event_resolves_to_the_file_its_entry_id_names() {
+        let ids: std::collections::HashMap<u64, usize> = [(1, 0), (2, 1)].into_iter().collect();
+        let ev = parse(r#"{"event":"end-file","playlist_entry_id":2,"reason":"error"}"#).unwrap();
+        assert_eq!(event_index(&ev, &ids), Some(1));
+        // An event without an id must not resolve to a guess; the caller has a fallback for that.
+        assert_eq!(event_index(&parse(r#"{"event":"file-loaded"}"#).unwrap(), &ids), None);
+        // An unknown id is not a silent zero.
+        let unknown = parse(r#"{"event":"end-file","playlist_entry_id":99}"#).unwrap();
+        assert_eq!(event_index(&unknown, &ids), None);
     }
 
     #[test]

@@ -15,6 +15,7 @@
 
 mod ipc;
 mod json;
+mod mpvbin;
 mod report;
 mod scan;
 mod session;
@@ -29,6 +30,7 @@ const USAGE: &str = "\
 lumen — media library player and test harness
 
   lumen doctor                        check mpv and this machine's decoding support
+  lumen setup                         fetch mpv into this folder (Windows), or explain how
   lumen scan  <paths...>              walk the library and report what is there
   lumen items <paths...>              the collection, grouped into films and seasons
   lumen play  <paths...>              play everything found
@@ -55,6 +57,7 @@ fn main() -> ExitCode {
     let cmd = args.first().map(String::as_str);
     match cmd {
         Some("doctor") => doctor(),
+        Some("setup") => setup(),
         Some(c @ ("scan" | "items" | "play" | "test")) => match run(c, &args[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -198,69 +201,133 @@ fn write_json(
 
 /// Is this machine able to play anything, and with what?
 fn doctor() -> ExitCode {
-    let mut ok = true;
-    println!("mpv");
-    match std::process::Command::new("mpv").arg("--version").output() {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            println!("  {}", text.lines().next().unwrap_or("(no version line)"));
-        }
-        _ => {
-            ok = false;
-            println!("  NOT FOUND. Install it — everything here plays through mpv.");
-            println!("    Windows   winget install mpv.net");
-            println!("    macOS     brew install mpv");
-            println!("    Linux     apt install mpv   (or dnf/pacman/zypper)");
-        }
+    println!(
+        "lumen {}  ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    if let Ok(p) = std::env::current_exe() {
+        println!("  running from {}", p.display());
     }
 
-    let list = |arg: &str| -> Vec<String> {
-        std::process::Command::new("mpv")
-            .arg(arg)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .skip(1)
-                    .filter_map(|l| l.split_whitespace().next().map(str::to_string))
-                    .filter(|s| !s.is_empty() && !s.starts_with('-'))
-                    .collect()
-            })
-            .unwrap_or_default()
+    println!("\nmpv");
+    let Some(mpv) = mpvbin::find() else {
+        println!("  NOT FOUND\n");
+        for line in mpvbin::install_hint().lines() {
+            println!("  {line}");
+        }
+        return ExitCode::from(2);
     };
+    println!("  {}", mpvbin::version(&mpv).unwrap_or_else(|| "(no version line)".into()));
+    println!("  at {}", mpv.display());
 
-    if ok {
-        let vos = list("--vo=help");
-        println!("\nvideo output");
-        if vos.iter().any(|v| v == "gpu-next") {
-            println!("  gpu-next present — the libplacebo renderer this product is built on");
-        } else {
-            println!(
-                "  gpu-next MISSING (have: {}). Playback still works via `gpu`, but HDR handling\n  \
-                 and tone mapping differ from what the product will ship.",
-                vos.join(", ")
-            );
-        }
+    let vos = mpvbin::list(&mpv, "--vo=help");
+    println!("\nvideo output");
+    if vos.iter().any(|v| v == "gpu-next") {
+        println!("  gpu-next present — the libplacebo renderer this product is built on");
+    } else if vos.is_empty() {
+        println!("  could not be queried; this mpv may be a wrapper rather than the real binary");
+    } else {
+        println!(
+            "  gpu-next MISSING (have: {}). Playback still works via `gpu`, but HDR handling\n  \
+             and tone mapping differ from what the product will ship. Run with --vo gpu.",
+            vos.join(", ")
+        );
+    }
 
-        let hw = list("--hwdec=help");
-        println!("\nhardware decoding");
-        let real: Vec<&String> = hw.iter().filter(|h| *h != "no" && *h != "auto").collect();
-        if real.is_empty() {
-            println!(
-                "  none reported. Files will decode on the CPU: 4K HEVC and AV1 may stutter, and\n  \
-                 that is a driver problem rather than anything to do with the file."
-            );
-        } else {
-            println!("  {}", real.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
-        }
+    let hw = mpvbin::list(&mpv, "--hwdec=help");
+    let real: Vec<&String> = hw.iter().filter(|h| *h != "no" && *h != "auto").collect();
+    println!("\nhardware decoding");
+    if real.is_empty() {
+        println!(
+            "  none reported. Files will decode on the CPU: 4K HEVC and AV1 may stutter, and\n  \
+             that is a driver problem rather than anything to do with the file."
+        );
+    } else {
+        println!("  {}", real.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
     }
 
     println!("\nnext");
     println!("  lumen scan  <your media folder>");
-    println!("  lumen test  <your media folder> --seconds 20 --json report.json");
-    if ok { ExitCode::SUCCESS } else { ExitCode::from(2) }
+    println!("  lumen test  <your media folder> --limit 5");
+    ExitCode::SUCCESS
+}
+
+/// Fetch mpv into the folder holding this binary, so the pair is portable afterwards.
+///
+/// Deliberately does not install anything system-wide, touch the registry, or require an elevated
+/// prompt. It puts one file next to this one; deleting the folder undoes it completely.
+fn setup() -> ExitCode {
+    if let Some(existing) = mpvbin::find() {
+        println!("mpv is already available at {}", existing.display());
+        println!("Nothing to do. Run `lumen doctor` to see what it supports.");
+        return ExitCode::SUCCESS;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("cannot determine where this binary lives; install mpv by hand:\n");
+        eprintln!("{}", mpvbin::install_hint());
+        return ExitCode::from(2);
+    };
+    let dir = exe.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+
+    if !cfg!(windows) {
+        // On Linux and macOS the package manager is the right answer and needs no help from here.
+        println!("{}", mpvbin::install_hint());
+        return ExitCode::from(2);
+    }
+
+    println!("mpv is not present. Fetching a Windows build into:\n  {}\n", dir.display());
+    println!("This downloads from the official mpv Windows builds and extracts mpv.exe here.");
+    println!("Nothing is installed system-wide and no registry keys are written.\n");
+
+    // PowerShell does the work: it is present on every supported Windows, handles TLS and redirects,
+    // and `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
+    // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$dest = $args[0]
+$tmp  = Join-Path $env:TEMP ("lumen-mpv-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tmp | Out-Null
+try {
+  Write-Host 'Locating the latest build...'
+  $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest' -Headers @{ 'User-Agent' = 'lumen' }
+  $asset = $rel.assets | Where-Object { $_.name -like 'mpv-x86_64-2*' -and $_.name -like '*.7z' -and $_.name -notlike '*v3*' } | Select-Object -First 1
+  if (-not $asset) { throw 'no matching x86_64 asset in the latest release' }
+  $archive = Join-Path $tmp $asset.name
+  Write-Host ("Downloading " + $asset.name + " (" + [math]::Round($asset.size/1MB,1) + " MB)...")
+  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -UseBasicParsing
+  Write-Host 'Extracting...'
+  # tar.exe is libarchive and reads 7-Zip. 7z.exe is tried first if the user happens to have it.
+  if (Get-Command 7z -ErrorAction SilentlyContinue) { & 7z x $archive ("-o" + $tmp) -y | Out-Null }
+  else { & tar -xf $archive -C $tmp }
+  $found = Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse | Select-Object -First 1
+  if (-not $found) { throw 'mpv.exe was not in the archive' }
+  Copy-Item $found.FullName (Join-Path $dest 'mpv.exe') -Force
+  Write-Host ('Installed mpv.exe into ' + $dest)
+} finally {
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+}
+"#;
+
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, "-args"])
+        .arg(&dir)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("\nDone. Checking what it can do:\n");
+            doctor()
+        }
+        _ => {
+            // A failed download is not a dead end — the manual route is three steps and always works.
+            eprintln!("\nAutomatic setup did not complete. Do it by hand instead:\n");
+            eprintln!("{}", mpvbin::install_hint());
+            ExitCode::from(2)
+        }
+    }
 }
 
 #[cfg(test)]

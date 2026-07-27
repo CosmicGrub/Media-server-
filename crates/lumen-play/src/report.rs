@@ -429,7 +429,8 @@ mod tests {
         for n in ["a.mkv", "b.mkv", "c.mkv"] {
             d.file(n, &mkv());
         }
-        let s = scan(std::slice::from_ref(&d.0), &ScanOptions { limit: Some(1), ..Default::default() });
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { limit: Some(1), ..Default::default() });
         assert!(render_scan(&s).contains("not the whole library"), "{}", render_scan(&s));
     }
 
