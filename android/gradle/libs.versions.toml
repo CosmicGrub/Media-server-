@@ -1,0 +1,53 @@
+# Version catalogue. One place to change a dependency, and Gradle validates the coordinates rather
+# than letting a typo become a "could not resolve" at build time.
+
+[versions]
+agp = "8.7.3"
+kotlin = "2.0.21"
+# Compose compiler is versioned with Kotlin from 2.0 onward, so there is no separate pin to drift.
+composeBom = "2024.12.01"
+coreKtx = "1.15.0"
+lifecycle = "2.8.7"
+activityCompose = "1.9.3"
+# Media3 replaces ExoPlayer. 1.5.x is the first line with stable AV1 software fallback and the
+# session APIs used for background playback.
+media3 = "1.5.0"
+# The foldable APIs. `window` gives FoldingFeature; `window-core` is pulled in transitively.
+window = "1.3.0"
+# Adaptive layout helpers keyed off window size class, which is what makes one layout serve both
+# the 6.2" cover screen and the 7.6" inner display.
+adaptive = "1.0.0"
+documentfile = "1.0.1"
+coroutines = "1.9.0"
+
+[libraries]
+core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
+lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+# Gives collectAsStateWithLifecycle, which stops a Flow being collected while the app is in the
+# background — on a foldable that matters, because closing the device backgrounds the activity.
+lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-graphics = { module = "androidx.compose.ui:ui-graphics" }
+compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+compose-material-icons = { module = "androidx.compose.material:material-icons-extended" }
+
+media3-exoplayer = { module = "androidx.media3:media3-exoplayer", version.ref = "media3" }
+media3-ui = { module = "androidx.media3:media3-ui", version.ref = "media3" }
+media3-session = { module = "androidx.media3:media3-session", version.ref = "media3" }
+media3-common = { module = "androidx.media3:media3-common", version.ref = "media3" }
+
+window = { module = "androidx.window:window", version.ref = "window" }
+adaptive = { module = "androidx.compose.material3.adaptive:adaptive", version.ref = "adaptive" }
+documentfile = { module = "androidx.documentfile:documentfile", version.ref = "documentfile" }
+coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
