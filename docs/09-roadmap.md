@@ -55,8 +55,9 @@ hardware ([`../crates/`](../crates/)):
 | `lumen-playback` | **The decision ladder** and track auto-selection — ADR-0004's one implementation | 21 + 15 |
 | `lumen-identity` | Move-surviving content sketch — decision D5 | 12 |
 | `lumen-probe` | Content sniffing (G0/Rule 1), MKV + MP4 structural analysis, the recovery ladder (§5) | 71 + 10 |
+| `lumen-match` | Filename parsing and candidate ranking — `docs/05` §4.4, research **R8** | 41 + 19 |
 
-**159 tests total, 18 of them properties.** The properties have found **seven real bugs**: plans that
+**219 tests total, 29 of them properties, plus an 83-row labelled filename corpus.** The properties have found **seven real bugs**: plans that
 emitted a container the client could not open; a fallback that degraded audio when video was the
 blocker; a transcode target picked without checking the client could decode it; a burn-in codec the
 chosen container could not carry; an upscaling burn-in transcode; in-band captions selected without
@@ -81,6 +82,23 @@ What `lumen-probe` answers, all without FFmpeg:
 | Encrypted, and under which scheme? | 12 §2.7, §3.6 | A named scheme, never a mysterious decode failure |
 | Edit lists present? | 12 §3.2 | The #1 A/V-sync bug source in MP4 |
 | `moov` missing entirely? | 12 §3.7 | Rung 4 reconstruction — interrupted phone recordings are irreplaceable |
+
+**R8 is answered.** `lumen-match` scores **100% on title, year, and episode** across 83 labelled
+rows covering scene, P2P, anime, Plex-style, daily-show, and degenerate naming
+(`crates/lumen-match/fixtures/filenames.tsv`). The corpus found **six parser bugs** on its first run
+and one mis-labelled expectation of my own; the accuracy floors are now pinned at 100% so a
+regression cannot pass quietly.
+
+Two design answers worth recording:
+
+- **Runtime proximity works, and it is the reason to bother.** `Dune` with no year in the filename is
+  unresolvable from title and year alone — the corpus test `runtime_resolves_a_remake_that_title_and_year_cannot`
+  shows the 1984 and 2021 films separated purely by duration. Research item **R9** should now
+  quantify this against a real library rather than a fixture.
+- **`MAX_BARE_YEAR` is load-bearing.** A bare four-digit number is only read as a year up to 2030;
+  above that it stays in the title, which is what keeps `Blade Runner 2049` from becoming season 20
+  episode 49. Parenthesised years get the full range because the user wrote them deliberately. This
+  constant needs bumping as time passes, and the corpus row is what will catch it.
 
 **Kill criteria.** If S1 fails on all three desktops → switch desktop to Qt 6. If S3 fails → iOS ships with VLCKit or
 not at all in v1. If S4 fails → decide consciously to be a GPL product and drop the App Store. If S5 fails → the

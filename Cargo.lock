@@ -107,6 +107,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-match"
+version = "0.1.0"
+dependencies = [
+ "lumen-model",
+ "proptest",
+]
+
+[[package]]
 name = "lumen-model"
 version = "0.1.0"
 

@@ -95,7 +95,7 @@ on hard files. If resources are limited, stopping at Phase 2 or 3 and being exce
 depends on is implemented and tested.
 
 ```bash
-cargo test --workspace     # 159 tests, incl. 18 property tests
+cargo test --workspace     # 219 tests, incl. 29 property tests
 ci/license-gate.sh         # ADR-0002 licence posture
 python3 conformance/runner/coverage.py
 ```
@@ -107,15 +107,23 @@ python3 conformance/runner/coverage.py
 | [`lumen-playback`](crates/lumen-playback) | **The playback decision ladder** and track auto-selection | 21 + 15 |
 | [`lumen-identity`](crates/lumen-identity) | Move-surviving content sketch | 12 |
 | [`lumen-probe`](crates/lumen-probe) | Content sniffing, MKV/MP4 structural analysis, the recovery ladder | 71 + 10 |
+| [`lumen-match`](crates/lumen-match) | Filename parsing and candidate ranking (research R8) | 41 + 19 |
 
 Two deliberate choices about order. The **ladder** came first because ADR-0004 makes it the one piece
 that must never diverge across clients. The **probe layer** came second because guarantees G0 and G2
 rest on it: content sniffing over extension trust, and an escalation ladder that only DRM, an absent
 decoder, or genuinely undecodable data may exhaust.
 
-Both are property-tested, and the properties have found **seven real bugs** so far — including plans
-that emitted a container the client could not open, and a panic on any 12–15 byte MP4 header, which
-was a denial of service on a watched folder.
+Everything is property-tested, and the properties plus the labelled filename corpus have found
+**fifteen real bugs** so far — including plans that emitted a container the client could not open, a
+panic on any 12–15 byte MP4 header (a denial of service on a watched folder), and an asymmetric title
+similarity that made candidate ranking depend on argument order.
+
+The filename parser scores **100% on all three fields** across the 83-row labelled corpus
+([`crates/lumen-match/fixtures/filenames.tsv`](crates/lumen-match/fixtures/filenames.tsv)) — the
+research-item-R8 benchmark. Its distinguishing feature is using the **probed runtime** as a matching
+signal, which resolves remakes that title-and-year scoring cannot, and treating ambiguity as a real
+outcome rather than silently taking the first result.
 
 Remaining Phase 0 spikes and their status: [docs/09-roadmap.md](docs/09-roadmap.md) §2.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the four rules that govern changes here.
