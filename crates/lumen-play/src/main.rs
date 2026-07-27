@@ -262,6 +262,11 @@ fn doctor() -> ExitCode {
         );
     } else {
         println!("  {}", real.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        // `--hwdec=help` lists what mpv was *compiled* with, not what works here. A build with
+        // nvdec support on a machine with no NVIDIA driver lists nvdec and then fails to load
+        // libcuda at playback. `lumen test` reports what each file actually decoded with, which is
+        // the number to trust.
+        println!("  (compiled-in support; `lumen test` reports what actually decoded)");
     }
 
     println!("\nnext");

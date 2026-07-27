@@ -211,6 +211,15 @@ pub fn mpv_args(ipc_path: &str, opts: &PlayOptions) -> Vec<String> {
         "--audio-file-auto=fuzzy".into(),
         // Never stop for a missing codec or a bad stream — try, and report.
         "--audio-fallback-to-null=yes".into(),
+        // Quiet the terminal without going silent. mpv's status line repaints several times a
+        // second and buries this tool's own per-file output — on a ten-file run it produced roughly
+        // eight hundred lines of `V: 00:00:03 / 00:00:05 (61%)` around nine lines that mattered.
+        // Error messages are kept, because they name the codec or container that failed.
+        "--term-status-msg=".into(),
+        "--msg-level=all=error".into(),
+        // mpv must not read the terminal this process is sharing, or it competes for keystrokes.
+        // The playback window still takes its own input.
+        "--no-input-terminal".into(),
     ];
     if opts.fullscreen {
         args.push("--fullscreen=yes".into());
@@ -522,6 +531,22 @@ mod tests {
         assert!(joined.contains("--keep-open=no"), "must advance past a file it cannot open");
         assert!(joined.contains("--idle=yes"), "must not exit before results are collected");
         assert!(joined.contains("--force-window=yes"), "a failing file must be visibly attempted");
+    }
+
+    #[test]
+    fn the_status_line_is_suppressed_without_silencing_errors() {
+        // Found by running this against real media on Linux: mpv's status line repaints several
+        // times a second, and a ten-file run buried nine lines of report under ~800 lines of
+        // `V: 00:00:03 / 00:00:05 (61%)`. Errors must survive, because they name what failed.
+        let args = mpv_args("/tmp/s.sock", &PlayOptions::new());
+        let joined = args.join(" ");
+        assert!(joined.contains("--term-status-msg="), "the status line must be off");
+        assert!(joined.contains("--msg-level=all=error"), "errors must still be shown");
+        assert!(
+            !joined.contains("--no-terminal"),
+            "--no-terminal would suppress the error text too, which is the useful part"
+        );
+        assert!(joined.contains("--no-input-terminal"), "mpv must not steal our keystrokes");
     }
 
     #[test]
