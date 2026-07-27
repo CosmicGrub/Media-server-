@@ -11,6 +11,13 @@ name: Desktop release
 on:
   push:
     tags: ['v*']
+  # A release pipeline that is only exercised at tag time is one that breaks at tag time, when it is
+  # least convenient. Changing this file revalidates it against the open pull request, so a mistake
+  # surfaces on the commit that caused it rather than during a release.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'crates/lumen-play/**'
   workflow_dispatch:
     inputs:
       bundle_mpv:
@@ -94,7 +101,10 @@ jobs:
       # and macOS it is a dynamically linked package with a long dependency chain, and shipping that
       # correctly means shipping a distribution — which is what the package manager already is.
       - name: Bundle mpv (Windows)
-        if: matrix.os == 'windows-latest' && (github.event_name == 'push' || inputs.bundle_mpv)
+        # Bundles on tag pushes and on pull-request validation; only an explicit dispatch can turn
+        # it off. The download and 7z extraction are the most fragile steps here, so skipping them
+        # during validation would leave the part most likely to break unexercised.
+        if: matrix.os == 'windows-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
