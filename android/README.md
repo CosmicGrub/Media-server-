@@ -3,12 +3,19 @@
 A sideloadable media player targeting the Z Fold 5's three postures. Kotlin, Compose, Media3,
 Gradle KTS.
 
-> **Read this first: the APK in this commit has never been compiled.** It was written in an
-> environment where `dl.google.com` and Google's Maven repo are blocked — no Android SDK, no NDK, no
-> build-tools, no AndroidX artifacts — so `assembleDebug` could not be run even once. What *was*
-> verified is listed under [Verification](#verification). Expect to fix something on the first
-> build; the CI workflow exists so the first build happens somewhere with the SDK rather than on
-> your machine.
+> **This builds.** CI run 30272610131 (2026-07-27) compiled debug and release, linked resources,
+> dexed, packaged and signed both, and they passed `aapt2 dump badging` and `apksigner verify`.
+> Artifact `lumen-android-apk`, 22.9 MB.
+>
+> It was authored in an environment where `dl.google.com` and Google's Maven repo are blocked — no
+> SDK, no NDK, no AndroidX — so it could not be compiled locally even once; the CI workflow exists
+> for exactly that reason. **Device behaviour is still unverified:** the fold transitions, the
+> tabletop hinge maths, playback and permissions have never run on hardware.
+
+See **[MASTERFILE.md](MASTERFILE.md)** for the complete build specification — toolchain versions,
+the full dependency catalogue, the PC→Android capability parity matrix, the JNI and libmpv paths to
+real codec parity, signing, and the pitfall list. **[PROMPT.md](PROMPT.md)** is a standalone brief
+for continuing this work in a fresh session.
 
 ## Getting the APK
 
@@ -119,20 +126,15 @@ want to run this in Android Studio's emulator.
 
 What was actually checked, and how:
 
-- **Every Kotlin file parses.** Compiled with kotlinc 2.0.21. Every remaining diagnostic is an
-  unresolved `androidx`/`android` symbol — no syntax errors, no broken references between files in
-  this project, no redeclarations or argument mismatches.
+- **It compiles, packages and signs.** CI run 30272610131: `assembleDebug` and `assembleRelease`
+  both succeeded, including R8 on release, and the APKs passed `aapt2` and `apksigner` inspection.
+- **Every Kotlin file parses.** Checked locally with kotlinc 2.0.21 before CI existed.
 - **Every XML file parses**, including the manifest. The first draft had comments *between*
   attributes inside the `<activity>` tag, which is malformed XML; that was caught this way.
 - **The Gradle wrapper runs.** `./gradlew --version` downloads and executes Gradle 8.11.1.
 - **The CI workflow is valid YAML** and its job graph resolves.
 
-What was **not** checked, because it could not be:
+What was **not** checked:
 
-- Compilation against the real Android SDK and AndroidX. Unresolved-symbol errors hide type errors,
-  so expect API mismatches — particularly in Compose and Media3, where signatures move between
-  versions.
-- Resource linking (`aapt2`), dexing, packaging, signing.
-- Anything on a device: the fold transitions, the tabletop hinge maths, playback, permissions.
-
-The CI workflow closes most of that gap on the first push. The device behaviour only you can check.
+- Anything on a device — the fold transitions, the tabletop hinge maths, playback, permissions.
+  Only you can check that.
