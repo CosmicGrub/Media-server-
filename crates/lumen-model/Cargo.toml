@@ -1,0 +1,13 @@
+[package]
+name = "lumen-model"
+description = "Core media domain types: containers, codecs, streams, colour, HDR."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

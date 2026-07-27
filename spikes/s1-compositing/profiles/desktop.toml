@@ -1,0 +1,31 @@
+# S1 compositing spike — DESKTOP profile
+#
+# Assumes: mains power, a discrete GPU, a fixed display, and thermal headroom.
+# Run with:  cargo run -p s1-compositing -- run --profile profiles/desktop.toml --clip <file>
+
+name = "desktop"
+description = "Mains-powered desktop with a discrete GPU. The reference case: if compositing fails here it fails everywhere, and ADR-0001's fallback to Qt 6 applies."
+
+# ── Pass/fail thresholds ─────────────────────────────────────────────────────────────────────────
+# Above this, the baseline itself could not play the clip and the run says nothing about compositing.
+baseline_max_delayed_per_min  = 4.0
+# The actual S1 question: what does putting a WebView over the video cost?
+# A discrete GPU has headroom, so the budget is tight — anything more suggests a real compositing
+# problem rather than a machine limit.
+max_added_delayed_per_min     = 2.0
+min_fps_ratio                 = 0.99
+max_avsync_ms                 = 40.0
+# Generous: a desktop has cores to spare. Present so a pathological result still gets flagged.
+max_added_cpu_frac            = 1.00
+max_osd_latency_ms            = 100.0
+
+# ── Run shape ────────────────────────────────────────────────────────────────────────────────────
+run_seconds                   = 120
+warmup_ms                     = 5000
+sample_interval_ms            = 500
+
+# ── Desktop-specific checks ──────────────────────────────────────────────────────────────────────
+test_on_battery               = false   # no battery to compare against
+thermal_soak_minutes          = 0       # desktop cooling does not throttle over minutes
+check_refresh_match           = true
+expect_discrete_gpu           = true    # warn if the render lands on an iGPU by mistake

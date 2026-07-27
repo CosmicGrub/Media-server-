@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "lumen-s1-shell",
+  "version": "0.1.0",
+  "identifier": "dev.lumen.s1-shell",
+  "build": {
+    "frontendDist": "../"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Lumen S1 shell",
+        "fullscreen": true,
+        "decorations": false,
+        "resizable": false,
+        "// transparent": "Required: mpv renders into this same window via --wid, underneath the WebView. An opaque WebView background would cover the video entirely and the run would measure a black rectangle.",
+        "transparent": true,
+        "// shadow": "A window shadow on a fullscreen transparent window costs the compositor a blur pass for nothing.",
+        "shadow": false,
+        "// dragDropEnabled": "Off because the drag-drop handler installs an OS-level subclass on the window that interferes with the embedded child surface on Windows.",
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "// active": "No installer is produced. The harness runs the binary from target/release directly.",
+    "active": false,
+    "targets": []
+  }
+}

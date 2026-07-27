@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+      Media access. READ_MEDIA_VIDEO/AUDIO replaced READ_EXTERNAL_STORAGE at API 33, and both are
+      declared because the minSdk floor is 24 — a device below 33 gets nothing from the new
+      permissions and would silently be unable to see any media without the old one.
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- Playback that survives the screen turning off, and the notification that goes with it. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!--
+      Declared so the Play Store and the system know this is a screen-flexible app. Without
+      `screen.landscape` a foldable can treat the app as portrait-only and letterbox it on the inner
+      display, which is exactly the failure this build exists to avoid.
+    -->
+    <uses-feature android:name="android.hardware.screen.landscape" android:required="false" />
+    <uses-feature android:name="android.hardware.screen.portrait" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <application
+        android:name=".LumenApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Lumen"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true"
+        tools:targetApi="35">
+
+        <!--
+          The attributes that make or break a foldable.
+
+          `resizeableActivity` is what allows the inner display and multi-window at all; without it
+          the system runs the app in a compatibility box.
+
+          `configChanges` lists every dimension that changes when a Fold 5 is opened or closed:
+          screenSize and smallestScreenSize (7.6" 2176x1812 inner vs 6.2" 2316x904 cover),
+          screenLayout (the aspect ratio swings from 23.1:9 to roughly 6:5), density, and
+          orientation. Handling them here keeps playback running across the fold instead of tearing
+          down the Activity and restarting the video — the most visible foldable bug there is.
+
+          No `screenOrientation` on purpose: pinning an orientation on a device whose natural
+          orientation changes when it opens is how apps end up sideways on the inner display.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density"
+            android:supportsPictureInPicture="true"
+            android:preferMinimalPostProcessing="true">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Open a video handed over from a file manager or another app. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".player.PlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

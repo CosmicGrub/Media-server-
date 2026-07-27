@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lumen-model",
+    "crates/lumen-caps",
+    "crates/lumen-playback",
+    "crates/lumen-identity",
+    "crates/lumen-probe",
+    "crates/lumen-match",
+    "crates/lumen-meta",
+    "crates/lumen-subs",
+    "crates/lumen-play",
+    "spikes/s1-compositing",
+]
+
+# The S1 shell needs WebKitGTK and the platform WebView SDKs. Pulling that into the workspace would
+# make every tested crate unbuildable on a machine without them, so it builds separately.
+exclude = ["spikes/s1-compositing/ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MPL-2.0"
+repository = "https://github.com/CosmicGrub/Media-server-"
+
+[workspace.dependencies]
+lumen-model = { path = "crates/lumen-model" }
+lumen-caps = { path = "crates/lumen-caps" }
+lumen-playback = { path = "crates/lumen-playback" }
+lumen-identity = { path = "crates/lumen-identity" }
+lumen-probe = { path = "crates/lumen-probe" }
+lumen-match = { path = "crates/lumen-match" }
+lumen-meta = { path = "crates/lumen-meta" }
+lumen-subs = { path = "crates/lumen-subs" }
+lumen-play = { path = "crates/lumen-play" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

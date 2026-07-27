@@ -1,0 +1,429 @@
+//! `lumen` — a runnable player and library test harness.
+//!
+//! Point it at your collection. It walks the tree, works out what each file actually is from its
+//! bytes, plays the lot through mpv, and records what happened to every file.
+//!
+//! ```text
+//! lumen doctor                          is this machine able to play anything?
+//! lumen scan  ~/Media                    what is in the library, and what looks wrong
+//! lumen play  ~/Media                    play it
+//! lumen test  ~/Media --seconds 20       open every file for 20 s and report the failures
+//! ```
+//!
+//! `test` is the mode worth running first on a large collection: it walks a thousand files in an
+//! evening rather than a fortnight, and the output is a list of exactly which ones failed and why.
+
+mod ipc;
+mod json;
+mod mpvbin;
+mod report;
+mod scan;
+mod session;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use scan::{ScanOptions, playlist_order};
+use session::PlayOptions;
+
+const USAGE: &str = "\
+lumen — media library player and test harness
+
+  lumen doctor                        check mpv and this machine's decoding support
+  lumen setup                         fetch mpv into this folder (Windows), or explain how
+  lumen scan  <paths...>              walk the library and report what is there
+  lumen items <paths...>              the collection, grouped into films and seasons
+  lumen play  <paths...>              play everything found
+  lumen test  <paths...>              open every file briefly and report which fail
+
+Options
+  --seconds <n>       play only n seconds of each file (default 20 for `test`)
+  --limit <n>         stop after n playable files
+  --depth <n>         maximum directory depth
+  --include-samples   keep files that look like sample clips
+  --shuffle           play in random order
+  --windowed          do not go fullscreen
+  --paused            start paused
+  --vo <name>         video output (default gpu-next)
+  --hwdec <mode>      hardware decoding (default auto-safe)
+  --dry-run           print the mpv command and playlist, launch nothing
+  --json <path>       write the machine-readable report here
+  --                  everything after this is passed to mpv verbatim
+
+Exit codes: 0 all played, 1 at least one file failed, 2 usage or setup error.";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first().map(String::as_str);
+    match cmd {
+        Some("doctor") => doctor(),
+        Some("setup") => setup(),
+        Some(c @ ("scan" | "items" | "play" | "test")) => match run(c, &args[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("--help" | "-h" | "help") => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn flag(args: &[String], name: &str) -> bool {
+    args.iter().take_while(|a| *a != "--").any(|a| a == name)
+}
+
+fn value(args: &[String], name: &str) -> Option<String> {
+    let stop = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let i = args[..stop].iter().position(|a| a == name)?;
+    args.get(i + 1).cloned()
+}
+
+/// Arguments after a bare `--`, passed to mpv verbatim.
+fn passthrough(args: &[String]) -> Vec<String> {
+    match args.iter().position(|a| a == "--") {
+        Some(i) => args[i + 1..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// Everything that is neither a flag, a flag's value, nor after `--`.
+fn positional(args: &[String]) -> Vec<PathBuf> {
+    const TAKES_VALUE: &[&str] = &["--seconds", "--limit", "--depth", "--vo", "--hwdec", "--json"];
+    let stop = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < stop {
+        let a = &args[i];
+        if TAKES_VALUE.contains(&a.as_str()) {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        out.push(PathBuf::from(a));
+        i += 1;
+    }
+    out
+}
+
+fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
+    let roots = positional(args);
+    if roots.is_empty() {
+        return Err("give me at least one file or folder to scan".into());
+    }
+
+    let opts = ScanOptions {
+        include_samples: flag(args, "--include-samples"),
+        limit: value(args, "--limit").and_then(|v| v.parse().ok()),
+        max_depth: value(args, "--depth").and_then(|v| v.parse().ok()),
+    };
+
+    eprintln!("scanning {} path(s)...", roots.len());
+    let found = scan::scan(&roots, &opts);
+    println!("{}", report::render_scan(&found));
+
+    if cmd == "items" {
+        println!("{}", report::render_items(&found));
+        write_json(args, &found, None)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if cmd == "scan" {
+        write_json(args, &found, None)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let order = playlist_order(&found);
+    if order.is_empty() {
+        return Err(
+            "the scan found no playable files. Check the path, or pass a file directly.".into()
+        );
+    }
+
+    // `test` exists to walk a whole library quickly, so it defaults to a short look at each file.
+    // `play` is for watching, so it has no limit unless one is asked for.
+    let default_seconds = if cmd == "test" { Some(20) } else { None };
+    // Built from the defaults rather than field by field, so the default hwdec and video output
+    // live in exactly one place and cannot drift between here and the session layer.
+    let mut play = PlayOptions::new();
+    play.seconds_each = value(args, "--seconds").and_then(|v| v.parse().ok()).or(default_seconds);
+    play.start_paused = flag(args, "--paused");
+    play.vo = value(args, "--vo");
+    play.fullscreen = !flag(args, "--windowed");
+    play.shuffle = flag(args, "--shuffle");
+    play.extra_args = passthrough(args);
+    play.dry_run = flag(args, "--dry-run");
+    if let Some(h) = value(args, "--hwdec") {
+        play.hwdec = h;
+    }
+
+    match &play.seconds_each {
+        Some(n) => println!("playing {} files, {n} s each\n", order.len()),
+        None => println!("playing {} files\n", order.len()),
+    }
+
+    let session = session::run(&found, &order, &play, |r, n, total| {
+        println!("{}", report::render_progress(r, n, total));
+    })?;
+
+    if play.dry_run {
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("{}", report::render_session(&session));
+    write_json(args, &found, Some(&session))?;
+
+    // A failed file is the finding. Exiting zero on a run that could not open half the library would
+    // make this useless in a script.
+    Ok(if session.failed().count() > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+fn write_json(
+    args: &[String],
+    found: &scan::Scan,
+    session: Option<&session::SessionReport>,
+) -> Result<(), String> {
+    let Some(path) = value(args, "--json") else { return Ok(()) };
+    let text = report::render_json(found, session);
+    std::fs::write(&path, text).map_err(|e| format!("cannot write {path}: {e}"))?;
+    println!("report written to {path}");
+    Ok(())
+}
+
+/// Is this machine able to play anything, and with what?
+fn doctor() -> ExitCode {
+    println!(
+        "lumen {}  ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    if let Ok(p) = std::env::current_exe() {
+        println!("  running from {}", p.display());
+    }
+
+    println!("\nmpv");
+    let Some(mpv) = mpvbin::find() else {
+        println!("  NOT FOUND\n");
+        for line in mpvbin::install_hint().lines() {
+            println!("  {line}");
+        }
+        return ExitCode::from(2);
+    };
+    println!("  {}", mpvbin::version(&mpv).unwrap_or_else(|| "(no version line)".into()));
+    println!("  at {}", mpv.display());
+
+    let vos = mpvbin::list(&mpv, "--vo=help");
+    println!("\nvideo output");
+    if vos.iter().any(|v| v == "gpu-next") {
+        println!("  gpu-next present — the libplacebo renderer this product is built on");
+    } else if vos.is_empty() {
+        println!("  could not be queried; this mpv may be a wrapper rather than the real binary");
+    } else {
+        println!(
+            "  gpu-next MISSING (have: {}). Playback still works via `gpu`, but HDR handling\n  \
+             and tone mapping differ from what the product will ship. Run with --vo gpu.",
+            vos.join(", ")
+        );
+    }
+
+    let hw = mpvbin::list(&mpv, "--hwdec=help");
+    let real: Vec<&String> = hw.iter().filter(|h| *h != "no" && *h != "auto").collect();
+    println!("\nhardware decoding");
+    if real.is_empty() {
+        println!(
+            "  none reported. Files will decode on the CPU: 4K HEVC and AV1 may stutter, and\n  \
+             that is a driver problem rather than anything to do with the file."
+        );
+    } else {
+        println!("  {}", real.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    }
+
+    println!("\nnext");
+    println!("  lumen scan  <your media folder>");
+    println!("  lumen test  <your media folder> --limit 5");
+    ExitCode::SUCCESS
+}
+
+/// Fetch mpv into the folder holding this binary, so the pair is portable afterwards.
+///
+/// Deliberately does not install anything system-wide, touch the registry, or require an elevated
+/// prompt. It puts one file next to this one; deleting the folder undoes it completely.
+fn setup() -> ExitCode {
+    if let Some(existing) = mpvbin::find() {
+        println!("mpv is already available at {}", existing.display());
+        println!("Nothing to do. Run `lumen doctor` to see what it supports.");
+        return ExitCode::SUCCESS;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("cannot determine where this binary lives; install mpv by hand:\n");
+        eprintln!("{}", mpvbin::install_hint());
+        return ExitCode::from(2);
+    };
+    let dir = exe.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+
+    if !cfg!(windows) {
+        // On Linux and macOS the package manager is the right answer and needs no help from here.
+        println!("{}", mpvbin::install_hint());
+        return ExitCode::from(2);
+    }
+
+    println!("mpv is not present. Fetching a Windows build into:\n  {}\n", dir.display());
+    println!("This downloads from the official mpv Windows builds and extracts mpv.exe here.");
+    println!("Nothing is installed system-wide and no registry keys are written.\n");
+
+    // PowerShell does the work: it is present on every supported Windows, handles TLS and redirects,
+    // and `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
+    // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
+    // PowerShell does the work: present on every supported Windows, handles TLS and redirects, and
+    // `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
+    // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
+    //
+    // SourceForge first because that is the source mpv.io itself links to for Windows, and its URL
+    // shape is stable. GitHub is the fallback: its API is rate-limited unauthenticated, which is
+    // fine for one call but not something to depend on first.
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$dest = $args[0]
+$tmp  = Join-Path $env:TEMP ("lumen-mpv-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tmp | Out-Null
+$ProgressPreference = 'SilentlyContinue'
+
+function Get-Url {
+  try {
+    Write-Host 'Looking up the latest mpv build (sourceforge)...'
+    $listing = Invoke-WebRequest -UseBasicParsing -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
+    $vers = [regex]::Matches($listing.Content, 'mpv-(\d+\.\d+\.\d+)-x86_64\.7z') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
+    if ($vers) {
+      $v = $vers[-1]
+      Write-Host ("  mpv " + $v)
+      return "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
+    }
+  } catch { Write-Host '  sourceforge lookup failed, trying github' }
+  try {
+    $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest' -Headers @{ 'User-Agent' = 'lumen' }
+    $a = $rel.assets | Where-Object { $_.name -like 'mpv-x86_64-2*' -and $_.name -like '*.7z' -and $_.name -notlike '*v3*' } | Select-Object -First 1
+    if ($a) { Write-Host ("  " + $a.name); return $a.browser_download_url }
+  } catch { }
+  return $null
+}
+
+try {
+  $url = Get-Url
+  if (-not $url) { throw 'could not find an mpv download' }
+  $archive = Join-Path $tmp 'mpv.7z'
+  Write-Host 'Downloading (about 30 MB)...'
+  Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+  if ((Get-Item $archive).Length -lt 1MB) { throw 'the download is too small to be an mpv build' }
+
+  Write-Host 'Extracting...'
+  $extracted = $false
+  # 7z if the user has it; otherwise tar.exe, which is libarchive and reads 7-Zip.
+  foreach ($try in @(
+      { & 7z x $archive ('-o' + $tmp) -y | Out-Null },
+      { & tar -xf $archive -C $tmp })) {
+    try { & $try; if (Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse) { $extracted = $true; break } }
+    catch { }
+  }
+  if (-not $extracted) {
+    throw 'could not unpack the archive. Install 7-Zip (https://7-zip.org) and run setup again, or extract mpv.exe by hand.'
+  }
+
+  $found = Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse | Select-Object -First 1
+  Copy-Item $found.FullName (Join-Path $dest 'mpv.exe') -Force
+  # Shader compilation on the older D3D paths wants this; it ships in the upstream archive.
+  $d3d = Get-ChildItem -Path $tmp -Filter 'd3dcompiler_*.dll' -Recurse | Select-Object -First 1
+  if ($d3d) { Copy-Item $d3d.FullName $dest -Force }
+  Write-Host ('Installed mpv.exe into ' + $dest)
+} finally {
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+}
+"#;
+
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, "-args"])
+        .arg(&dir)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!("\nDone. Checking what it can do:\n");
+            doctor()
+        }
+        _ => {
+            // A failed download is not a dead end — the manual route is three steps and always works.
+            eprintln!("\nAutomatic setup did not complete. Do it by hand instead:\n");
+            eprintln!("{}", mpvbin::install_hint());
+            ExitCode::from(2)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn paths_are_separated_from_flags_and_their_values() {
+        let a = argv(&["/media/films", "--seconds", "20", "--shuffle", "/media/tv"]);
+        assert_eq!(positional(&a), vec![PathBuf::from("/media/films"), PathBuf::from("/media/tv")]);
+        assert_eq!(value(&a, "--seconds").as_deref(), Some("20"));
+        assert!(flag(&a, "--shuffle"));
+        assert!(!flag(&a, "--paused"));
+    }
+
+    #[test]
+    fn a_flag_value_is_never_mistaken_for_a_path() {
+        // Without the takes-a-value list, `20` would become a path and the scan would report it
+        // missing — a confusing failure for a perfectly correct command line.
+        let a = argv(&["--limit", "20", "/media"]);
+        assert_eq!(positional(&a), vec![PathBuf::from("/media")]);
+    }
+
+    #[test]
+    fn everything_after_a_bare_dash_dash_goes_to_mpv() {
+        let a = argv(&["/media", "--", "--vo=x11", "--gpu-api=vulkan"]);
+        assert_eq!(passthrough(&a), vec!["--vo=x11", "--gpu-api=vulkan"]);
+        assert_eq!(positional(&a), vec![PathBuf::from("/media")]);
+        // A flag after `--` belongs to mpv, not to us. Reading it as ours would silently change
+        // behaviour the user meant for the player.
+        let b = argv(&["/media", "--", "--shuffle"]);
+        assert!(!flag(&b, "--shuffle"));
+        assert_eq!(value(&b, "--vo"), None);
+    }
+
+    #[test]
+    fn a_path_after_the_separator_is_left_to_mpv() {
+        let a = argv(&["/media", "--", "--sub-file", "/subs/a.srt"]);
+        assert_eq!(positional(&a), vec![PathBuf::from("/media")]);
+        assert_eq!(passthrough(&a).len(), 2);
+    }
+
+    #[test]
+    fn a_missing_value_is_none_rather_than_a_panic() {
+        let a = argv(&["--limit"]);
+        assert_eq!(value(&a, "--limit"), None);
+        assert!(positional(&a).is_empty());
+    }
+
+    #[test]
+    fn no_paths_is_an_actionable_error() {
+        let err = run("scan", &argv(&["--shuffle"])).unwrap_err();
+        assert!(err.contains("at least one file or folder"), "{err}");
+    }
+}

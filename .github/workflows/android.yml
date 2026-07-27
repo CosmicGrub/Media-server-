@@ -1,0 +1,83 @@
+name: Android APK
+
+# Builds a sideloadable APK and attaches it to the run as a downloadable artifact.
+#
+# This exists because the Android SDK cannot be fetched in every environment — dl.google.com is
+# frequently blocked on locked-down networks — while a GitHub runner has it preinstalled. Push the
+# branch and collect the APK from the run's Artifacts section; no Android Studio required.
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  # So a build can be triggered without pushing anything.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          # AGP 8.7 requires 17. The runner also has 21, but Gradle's toolchain resolution is
+          # simpler when the JDK on PATH is the one the build targets.
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Accept SDK licences
+        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+      # A debug keystore is not a secret — it is the same well-known key every Android developer's
+      # machine generates, and its only purpose is to make the APK installable. Generating it here
+      # rather than committing it keeps a key, even a worthless one, out of the repository.
+      - name: Generate debug keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore app/debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Build release APK
+        run: ./gradlew --no-daemon assembleRelease
+
+      # Proof the APK is structurally sound and targets what it claims. A build that produces a file
+      # nobody checked is how a broken manifest reaches a device.
+      - name: Inspect the APK
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          APK=app/build/outputs/apk/release/app-release.apk
+          echo "=== badging ==="
+          "$BT/aapt2" dump badging "$APK" | grep -E "package:|sdkVersion|targetSdkVersion|native-code|application-label" || true
+          echo "=== signature ==="
+          "$BT/apksigner" verify --print-certs "$APK" | head -5
+          echo "=== size ==="
+          ls -lh app/build/outputs/apk/*/*.apk
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: android/app/build/outputs/apk/*/*.apk
+          if-no-files-found: error
+          retention-days: 30

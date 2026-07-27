@@ -1,0 +1,972 @@
+# Conformance corpus — seed set
+#
+# Schema: schema.json   Docs: ../docs/11, ../docs/12, ../docs/13
+# Tiers: T0 bit-exact | T1 full fidelity | T2 preserved | T3 adapted | T4 recovered | T5 blocked
+# Recovery rungs: see docs/12-container-conformance.md §5
+#
+# `status: planned` entries are declared coverage gaps, not omissions. Run runner/coverage.py.
+
+version: 1
+
+defaults:
+  platforms: [windows, macos, linux, android, ios, tvos]
+  severity: blocking
+  expect:
+    plays: true
+    recovery_rung: 0
+    av_sync_ms: { max_drift: 20 }
+
+vectors:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mkv-core — Matroska structural surface
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: mkv-core-lacing-xiph
+  group: mkv-core
+  title: "Xiph lacing, Vorbis audio"
+  spec: ["12#2.2"]
+  source: { origin: "matroska.org test suite / generated", license: redistributable }
+  properties: { lacing: xiph }
+  expect:
+    tier: T1
+    streams:
+      - { type: video, codec: h264 }
+      - { type: audio, codec: vorbis, channels: 2 }
+
+- id: mkv-core-lacing-ebml
+  group: mkv-core
+  title: "EBML lacing"
+  spec: ["12#2.2"]
+  source: { generate: "mkvmerge --engage use_ebml_lacing …" }
+  properties: { lacing: ebml }
+  expect: { tier: T1 }
+
+- id: mkv-core-lacing-fixed
+  group: mkv-core
+  title: "Fixed-size lacing"
+  spec: ["12#2.2"]
+  source: { generate: "mkvmerge fixed-lacing recipe" }
+  properties: { lacing: fixed }
+  expect: { tier: T1 }
+
+- id: mkv-core-unknown-size-segment
+  group: mkv-core
+  title: "Unknown-size Segment and Cluster (live/streamed MKV)"
+  spec: ["12#2.1"]
+  source: { generate: "ffmpeg -f matroska -live 1 … (piped, no seeking)" }
+  properties: { unknown_size: [segment, cluster] }
+  expect:
+    tier: T1
+    notes: "Must play; seeking limited to buffered range and reported as such."
+
+- id: mkv-core-timestampscale-100ns
+  group: mkv-core
+  title: "Non-default TimestampScale (100 ns)"
+  spec: ["12#2.2"]
+  source: { generate: "mkvmerge --timestamp-scale 100" }
+  properties: { timestamp_scale: 100 }
+  expect:
+    tier: T1
+    duration_s: { value: 10.0, tolerance: 0.02 }
+    notes: "Hard-coding the 1 ms default breaks timing entirely."
+
+- id: mkv-core-header-stripping
+  group: mkv-core
+  title: "ContentCompAlgo=3 header stripping on AVC + AAC"
+  spec: ["12#2.7"]
+  source: { generate: "mkvmerge --compression 0:header_removal --compression 1:header_removal" }
+  properties: { content_compression: header_stripping }
+  expect:
+    tier: T1
+    frame_hashes: golden/mkv-core-header-stripping.txt
+    notes: "Unhandled stripping corrupts every frame while still 'playing'. Frame hashes are the only real check."
+
+- id: mkv-core-content-comp-zlib
+  group: mkv-core
+  title: "ContentCompAlgo=0 zlib-compressed track"
+  spec: ["12#2.7"]
+  source: { generate: "mkvmerge --compression 0:zlib" }
+  expect: { tier: T1 }
+
+- id: mkv-core-blockadditions-hdr10plus
+  group: mkv-core
+  title: "HDR10+ dynamic metadata carried in BlockAdditions"
+  spec: ["12#2.2", "11#6.3"]
+  source: { generate: "hdr10plus_tool inject + mkvmerge" }
+  properties: { block_additions: hdr10plus, hdr: hdr10plus }
+  expect:
+    tier: T1
+    metadata_present: [hdr10plus_dynamic]
+    notes: "Ignoring BlockAdditions silently loses HDR10+. Must be detected, not just tolerated."
+
+- id: mkv-core-blockadditions-dv-rpu
+  group: mkv-core
+  title: "Dolby Vision RPU in BlockAdditions (P8.1)"
+  spec: ["12#2.2", "03#4.1"]
+  source: { generate: "dovi_tool + mkvmerge" }
+  properties: { block_additions: dv_rpu, dv_profile: "8.1" }
+  expect: { tier: T1, metadata_present: [dv_rpu] }
+
+- id: mkv-core-codecdelay-opus
+  group: mkv-core
+  title: "Opus with CodecDelay and SeekPreRoll"
+  spec: ["12#2.2"]
+  source: { generate: "ffmpeg -c:a libopus -f matroska" }
+  expect:
+    tier: T1
+    av_sync_ms: { max_drift: 5 }
+    notes: "Missing CodecDelay handling produces an audible click and a constant offset."
+
+- id: mkv-core-attached-fonts
+  group: mkv-core
+  title: "ASS subtitles with 12 attached fonts, wrong MIME types"
+  spec: ["12#2.7", "11#5"]
+  source: { generate: "mkvmerge --attach-file with deliberately wrong --attachment-mime-type" }
+  properties: { attachments: { fonts: 12, mime_correct: false } }
+  expect:
+    tier: T1
+    subtitle_render_hash: golden/mkv-core-attached-fonts.txt
+    notes: "Fonts must be detected by magic bytes, not MIME. Wrong font = 'broken subtitles' reports."
+
+- id: mkv-core-display-size-anamorphic
+  group: mkv-core
+  title: "PixelWidth 720 / DisplayWidth 1024 (anamorphic DAR)"
+  spec: ["12#2.6", "11#6.1"]
+  source: { generate: "mkvmerge --display-dimensions 0:1024x576" }
+  expect:
+    tier: T1
+    display_aspect: { value: 1.7778, tolerance: 0.01 }
+
+- id: mkv-core-pixelcrop
+  group: mkv-core
+  title: "PixelCropTop/Bottom/Left/Right set"
+  spec: ["12#2.6"]
+  source: { generate: "mkvmerge --cropping 0:8,8,8,8" }
+  expect:
+    tier: T1
+    cropped_geometry: { width: 1904, height: 1064 }
+
+- id: mkv-core-colour-element-full
+  group: mkv-core
+  title: "Complete Colour element incl. MasteringMetadata, MaxCLL, MaxFALL"
+  spec: ["12#2.6", "11#6.3"]
+  source: { generate: "mkvmerge colour flags, full set" }
+  properties: { hdr: hdr10 }
+  expect:
+    tier: T1
+    metadata_present: [mastering_display, max_cll, max_fall, primaries_bt2020, transfer_pq]
+
+- id: mkv-core-legacy-vfw-fourcc
+  group: mkv-core
+  title: "V_MS/VFW/FOURCC track with BITMAPINFOHEADER in CodecPrivate"
+  spec: ["12#2.5"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect: { tier: T1 }
+
+- id: mkv-core-unknown-codec-track
+  group: mkv-core
+  title: "One track with an unknown CodecID alongside valid tracks"
+  spec: ["12#2.5", "12#1"]
+  source: { generate: "hex-patch a CodecID to a private string" }
+  expect:
+    tier: T1
+    streams: [{ type: video, codec: h264 }, { type: audio, codec: aac }]
+    notes: "Unknown track is skipped; the file must still play. Never fail the file."
+
+- id: mkv-core-100-tracks
+  group: mkv-core
+  title: "12 audio + 40 subtitle tracks with mixed flags"
+  spec: ["12#2.5", "12#4"]
+  source: { generate: "mkvmerge multi-track recipe" }
+  expect:
+    tier: T1
+    selected_audio: { type: audio, language: jpn, flag_original: true }
+    selected_subtitle: { type: subtitle, language: eng, flag_forced: true }
+    notes: "Also asserts the auto-selection rules in 12#4."
+
+- id: mkv-core-output-sampling-freq-sbr
+  group: mkv-core
+  title: "HE-AAC with OutputSamplingFrequency = 2x SamplingFrequency"
+  spec: ["12#2.6"]
+  source: { generate: "HE-AAC in MKV" }
+  expect:
+    tier: T1
+    streams: [{ type: audio, codec: aac, sample_rate: 48000 }]
+    notes: "Using SamplingFrequency instead of OutputSamplingFrequency plays at half speed."
+
+- id: mkv-core-encrypted-track
+  group: mkv-core
+  title: "ContentEncryption on one track, no key"
+  spec: ["12#2.7", "11#7"]
+  source: { generate: "mkvmerge with ContentEncryption element" }
+  expect:
+    tier: T5
+    message_contains: ["encrypted", "no key"]
+    notes: "Must be a specific message, never a mysterious decode failure."
+
+- { id: mkv-core-crc32-mismatch,       group: mkv-core, title: "CRC-32 element present and wrong (must warn, not reject)", spec: ["12#2.1"], status: planned }
+- { id: mkv-core-multiple-segments,    group: mkv-core, title: "Two Segments concatenated in one file",                    spec: ["12#2.1"], status: planned }
+- { id: mkv-core-projection-360,       group: mkv-core, title: "Projection element, equirectangular 360",                  spec: ["12#2.6"], status: planned }
+- { id: mkv-core-stereomode-sbs,       group: mkv-core, title: "StereoMode side-by-side",                                  spec: ["12#2.6"], status: planned }
+- { id: mkv-core-tags-hierarchy,       group: mkv-core, title: "Nested Tags with TargetTypeValue 50/60/70",                spec: ["12#2.7"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mkv-chapters — the area with the worst cross-player support
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: mkv-chapters-ordered-basic
+  group: mkv-chapters
+  title: "EditionFlagOrdered with skipped regions"
+  spec: ["12#2.4"]
+  source: { origin: "hubblec4/Matroska-Playback", license: redistributable }
+  expect:
+    tier: T1
+    virtual_timeline_duration_s: { value: 8.0, tolerance: 0.05 }
+    notes: "Virtual timeline must exclude non-included regions; duration reflects the edition, not the file."
+
+- id: mkv-chapters-segment-uid-hardlink
+  group: mkv-chapters
+  title: "ChapterSegmentUID referencing a sibling file"
+  spec: ["12#2.4"]
+  source: { origin: "hubblec4/Matroska-Playback", license: redistributable }
+  properties: { linking: hard, files: 2 }
+  expect:
+    tier: T1
+    notes: "Requires scanning siblings and building a SegmentUID -> path map."
+
+- id: mkv-chapters-segment-edition-uid
+  group: mkv-chapters
+  title: "ChapterSegmentEditionUID — entire linked edition played, chapter times ignored"
+  spec: ["12#2.4"]
+  source: { origin: "hubblec4/Matroska-Playback", license: redistributable }
+  expect:
+    tier: T1
+    notes: >
+      Per spec the whole linked edition plays and the chapter's start/end times are ignored;
+      its full duration integrates into the virtual timeline. Commonly implemented wrong.
+
+- id: mkv-chapters-linking-loop
+  group: mkv-chapters
+  title: "Segment linking that forms an endless loop"
+  spec: ["12#2.4"]
+  source: { origin: "hubblec4/Matroska-Playback", license: redistributable }
+  severity: blocking
+  expect:
+    tier: T4
+    plays: true
+    timeout_s: 30
+    message_contains: ["circular", "link"]
+    notes: "A player without cycle detection hangs or OOMs. Must break the cycle, play what resolves, and warn."
+
+- id: mkv-chapters-missing-linked-file
+  group: mkv-chapters
+  title: "Hard link to a Segment UID that is not present"
+  spec: ["12#2.4"]
+  source: { generate: "delete the sibling of mkv-chapters-segment-uid-hardlink" }
+  expect:
+    tier: T4
+    plays: true
+    message_contains: ["linked segment", "not found"]
+    notes: "Must play the resolvable portion. Never abort."
+
+- id: mkv-chapters-multi-edition
+  group: mkv-chapters
+  title: "Three editions with EditionFlagDefault on the second"
+  spec: ["12#2.4"]
+  source: { generate: "mkvmerge --chapters with multiple EditionEntry" }
+  expect:
+    tier: T1
+    selected_edition: 2
+    editions_exposed: 3
+
+- { id: mkv-chapters-nested,          group: mkv-chapters, title: "Nested ChapterAtom tree",                        spec: ["12#2.4"], status: planned }
+- { id: mkv-chapters-hidden,          group: mkv-chapters, title: "ChapterFlagHidden / ChapterFlagEnabled",          spec: ["12#2.4"], status: planned }
+- { id: mkv-chapters-multilang,       group: mkv-chapters, title: "ChapterDisplay in 5 languages",                   spec: ["12#2.4"], status: planned }
+- { id: mkv-chapters-softlink-prevnext, group: mkv-chapters, title: "PrevUID/NextUID soft linking across 3 files",   spec: ["12#2.4"], status: planned }
+- { id: mkv-chapters-ordered-nocues,  group: mkv-chapters, title: "Ordered chapters with no Cues",                    spec: ["12#2.3"], status: planned }
+- { id: mkv-chapters-deep-chain,      group: mkv-chapters, title: "Link chain 20 segments deep (depth cap)",          spec: ["12#2.4"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mkv-damage
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: mkv-damage-no-cues
+  group: mkv-damage
+  title: "Cues element removed entirely"
+  spec: ["12#2.3", "12#5"]
+  source: { generate: "strip Cues from a valid MKV" }
+  expect:
+    tier: T1
+    recovery_rung: 2
+    seekable: true
+    notes: "Seeking must still work via cluster scan. Disabling seek is a failure."
+
+- id: mkv-damage-cues-wrong-offsets
+  group: mkv-damage
+  title: "Cues present with offsets that do not land on clusters"
+  spec: ["12#2.3"]
+  source: { generate: "corrupt CueClusterPosition values" }
+  expect:
+    tier: T4
+    recovery_rung: 2
+    seekable: true
+    notes: "Must validate element ID at the target and fall back to scanning."
+
+- id: mkv-damage-truncated-mid-cluster
+  group: mkv-damage
+  title: "File truncated at 60% mid-cluster"
+  spec: ["12#2.8", "12#5"]
+  source: { generate: "truncate -s 60%" }
+  expect:
+    tier: T4
+    plays: true
+    recovery_rung: 2
+    duration_reported: approximate
+
+- id: mkv-damage-broken-ebml-header
+  group: mkv-damage
+  title: "First 4 KB zeroed (EBML header destroyed)"
+  spec: ["12#2.1", "12#5"]
+  source: { generate: "dd zero the first 4096 bytes" }
+  expect:
+    tier: T4
+    plays: true
+    recovery_rung: 4
+    notes: "Must scan forward for the first valid Cluster and start there."
+
+- id: mkv-damage-garbage-between-clusters
+  group: mkv-damage
+  title: "2 KB of random bytes injected between clusters"
+  spec: ["12#2.8"]
+  source: { generate: "byte injection at cluster boundaries" }
+  expect: { tier: T4, plays: true, recovery_rung: 2 }
+
+- { id: mkv-damage-bad-seekhead,      group: mkv-damage, title: "SeekHead offsets point into mdat-equivalent",  spec: ["12#2.3"], status: planned }
+- { id: mkv-damage-no-duration,       group: mkv-damage, title: "Duration element absent",                      spec: ["12#2.8"], status: planned }
+- { id: mkv-damage-poor-interleave,   group: mkv-damage, title: "All video then all audio (no interleave)",     spec: ["12#2.8"], status: planned }
+- { id: mkv-damage-dup-timestamps,    group: mkv-damage, title: "Duplicate blocks at identical timestamps",     spec: ["12#2.8"], status: planned }
+- { id: mkv-damage-concatenated,      group: mkv-damage, title: "Two complete MKVs cat'd together",             spec: ["12#2.8"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mp4-core
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: mp4-core-elst-empty-edit
+  group: mp4-core
+  title: "Empty edit list entry (initial audio delay) — the classic A/V sync trap"
+  spec: ["12#3.2", "12#6"]
+  source: { generate: "MP4Box -add with an empty edit on the audio track" }
+  properties: { edit_list: empty_edit, delay_ms: 120 }
+  expect:
+    tier: T1
+    av_sync_ms: { max_drift: 10 }
+    notes: "Ignoring elst puts audio 120 ms early. Most common MP4 sync bug in the wild."
+
+- id: mp4-core-elst-media-offset
+  group: mp4-core
+  title: "Edit list with media start offset (trim)"
+  spec: ["12#3.2"]
+  source: { generate: "MP4Box edit list with media_time > 0" }
+  expect:
+    tier: T1
+    first_frame_pts_s: { value: 0.0, tolerance: 0.01 }
+
+- id: mp4-core-elst-multiple-and-dwell
+  group: mp4-core
+  title: "Multiple edits including a dwell (media_rate = 0)"
+  spec: ["12#3.2"]
+  source: { generate: "hand-built elst" }
+  expect: { tier: T1 }
+
+- id: mp4-core-ctts-v1-signed
+  group: mp4-core
+  title: "ctts version 1 with negative composition offsets"
+  spec: ["12#3.2"]
+  source: { generate: "x264-style negative-ctts muxing" }
+  expect:
+    tier: T1
+    first_frame_pts_s: { value: 0.0, tolerance: 0.01 }
+    notes: "Must normalize to zero-based while preserving relative offsets."
+
+- id: mp4-core-multiple-stsd
+  group: mp4-core
+  title: "Two stsd entries — resolution changes mid-file"
+  spec: ["12#3.3"]
+  source: { generate: "concatenate two resolutions into one track" }
+  expect:
+    tier: T1
+    resolution_changes: 1
+    notes: "Renderer must reconfigure without stopping playback."
+
+- id: mp4-core-avc3-inband-params
+  group: mp4-core
+  title: "avc3 sample entry, in-band SPS/PPS only"
+  spec: ["12#3.3"]
+  source: { generate: "MP4Box -inband" }
+  expect: { tier: T1 }
+
+- id: mp4-core-hev1-inband-params
+  group: mp4-core
+  title: "hev1 sample entry, in-band VPS/SPS/PPS"
+  spec: ["12#3.3"]
+  source: { generate: "MP4Box -inband HEVC" }
+  expect: { tier: T1 }
+
+- id: mp4-core-mdat-before-moov
+  group: mp4-core
+  title: "Non-faststart layout, served over HTTP"
+  spec: ["12#3.1"]
+  source: { generate: "ffmpeg without +faststart" }
+  properties: { layout: mdat_first, transport: http }
+  expect:
+    tier: T1
+    bytes_read_before_first_frame: { max: 8388608 }
+    notes: "Must range-request the tail for moov. Downloading the whole file to start is a failure."
+
+- id: mp4-core-mdat-size-zero
+  group: mp4-core
+  title: "Final mdat with size == 0 (extends to EOF)"
+  spec: ["12#3.1"]
+  source: { generate: "patch mdat size to 0" }
+  expect: { tier: T1 }
+
+- id: mp4-core-qt-pcm-twos
+  group: mp4-core
+  title: "QuickTime 'twos' big-endian PCM, 5.1, with chan layout box"
+  spec: ["12#3.3"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect:
+    tier: T0
+    streams: [{ type: audio, codec: pcm_s16be, channels: 6 }]
+
+- id: mp4-core-chapters-three-ways
+  group: mp4-core
+  title: "Chapters via tref-chap text track, Nero chpl, and ilst — all in one file"
+  spec: ["12#3.5"]
+  source: { generate: "MP4Box + mp4chaps" }
+  expect:
+    tier: T1
+    chapters_count: 12
+    notes: "Different tools write different mechanisms; all three must be readable."
+
+- id: mp4-core-clap-pasp
+  group: mp4-core
+  title: "clap (clean aperture) + pasp (non-square pixels) together"
+  spec: ["12#3.3", "11#6.1"]
+  source: { generate: "MP4Box -par and clap injection" }
+  expect:
+    tier: T1
+    display_aspect: { value: 1.7778, tolerance: 0.01 }
+
+- id: mp4-core-dv-profile5
+  group: mp4-core
+  title: "Dolby Vision Profile 5, dvh1 sample entry with dvcC"
+  spec: ["12#3.3", "03#4.1"]
+  source: { generate: "dovi_tool + MP4Box" }
+  expect:
+    tier: T1
+    metadata_present: [dv_rpu]
+    notes: "P5 has no HDR10-compatible base; must not render green/purple."
+
+- id: mp4-core-implicit-sbr
+  group: mp4-core
+  title: "HE-AAC with implicit SBR signalling"
+  spec: ["12#3.3"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect:
+    tier: T1
+    streams: [{ type: audio, codec: aac, sample_rate: 44100 }]
+    notes: "Implicit SBR misdetection plays at half speed."
+
+- id: mp4-core-no-ftyp
+  group: mp4-core
+  title: "QuickTime file with no ftyp box"
+  spec: ["12#3.5", "12#1"]
+  source: { generate: "strip ftyp" }
+  expect: { tier: T1, recovery_rung: 1 }
+
+- id: mp4-core-open-gop-sgpd
+  group: mp4-core
+  title: "Open-GOP HEVC with sgpd/sbgp roll groups"
+  spec: ["12#3.2"]
+  source: { generate: "open-GOP encode + MP4Box" }
+  expect:
+    tier: T1
+    seek_clean: true
+    notes: "Ignoring roll distance produces corrupt frames after a seek."
+
+- id: mp4-core-drm-cenc
+  group: mp4-core
+  title: "CENC-encrypted MP4 with pssh, no key"
+  spec: ["12#3.6", "11#7"]
+  source: { generate: "MP4Box -crypt" }
+  expect:
+    tier: T5
+    message_contains: ["DRM", "cenc"]
+    notes: "Must identify the scheme by name. Never decode garbage."
+
+- { id: mp4-core-wrong-extension,     group: mp4-core, title: "MP4 content in a file named .mkv",              spec: ["12#1"],   status: planned }
+- { id: mp4-core-mlpa-truehd,         group: mp4-core, title: "TrueHD in MP4 (mlpa sample entry)",             spec: ["12#3.3"], status: planned }
+- { id: mp4-core-reference-movie,     group: mp4-core, title: "QuickTime reference movie (rmra/rdrf)",         spec: ["12#3.5"], status: planned }
+- { id: mp4-core-timescale-mismatch,  group: mp4-core, title: "Track timescale 1001 vs movie timescale 600",   spec: ["12#3.2"], status: planned }
+- { id: mp4-core-stss-absent,         group: mp4-core, title: "All-intra ProRes with no stss",                 spec: ["12#3.2"], status: planned }
+- { id: mp4-core-gpmf-metadata,       group: mp4-core, title: "GoPro GPMF timed-metadata track present",       spec: ["12#3.5"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mp4-fragmented
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: mp4-frag-init-plus-segments
+  group: mp4-fragmented
+  title: "CMAF init segment + 5 media segments, separate files"
+  spec: ["12#3.4"]
+  source: { generate: "MP4Box -dash 2000" }
+  expect: { tier: T1 }
+
+- id: mp4-frag-tfdt-basetime
+  group: mp4-fragmented
+  title: "Segments with non-zero tfdt baseMediaDecodeTime"
+  spec: ["12#3.4"]
+  source: { generate: "DASH segment starting mid-timeline" }
+  expect: { tier: T1, first_frame_pts_s: { value: 30.0, tolerance: 0.05 } }
+
+- id: mp4-frag-init-switch
+  group: mp4-fragmented
+  title: "Init segment changes mid-stream (resolution switch)"
+  spec: ["12#3.4"]
+  source: { generate: "two DASH representations concatenated" }
+  expect: { tier: T1, resolution_changes: 1 }
+
+- id: mp4-frag-orphan-segment
+  group: mp4-fragmented
+  title: "Media segment handed over with no init segment"
+  spec: ["12#3.4", "12#5"]
+  source: { generate: "isolate a single .m4s" }
+  expect:
+    tier: T4
+    recovery_rung: 6
+    notes: "Must infer codec parameters from the bitstream."
+
+- { id: mp4-frag-sidx-seek,       group: mp4-fragmented, title: "Seeking via sidx in a single-file fMP4",  spec: ["12#3.4"], status: planned }
+- { id: mp4-frag-mfra-seek,       group: mp4-fragmented, title: "Seeking via mfra/tfra",                   spec: ["12#3.4"], status: planned }
+- { id: mp4-frag-live-dynamic,    group: mp4-fragmented, title: "Dynamic MPD, live edge, gaps",            spec: ["12#3.4"], status: planned }
+- { id: mp4-frag-llhls,           group: mp4-fragmented, title: "LL-HLS partial segments + preload hints", spec: ["13#6"],   status: planned }
+- { id: mp4-frag-multiperiod,     group: mp4-fragmented, title: "Multi-period DASH with ad insertion",     spec: ["12#3.4"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mp4-damage
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: mp4-damage-no-moov
+  group: mp4-damage
+  title: "Recording interrupted — mdat present, moov never written"
+  spec: ["12#3.7", "12#5"]
+  severity: blocking
+  source: { generate: "truncate a non-faststart MP4 before moov" }
+  expect:
+    tier: T4
+    plays: true
+    recovery_rung: 4
+    notes: >
+      Must reconstruct sample tables by scanning mdat for codec sync patterns (the untrunc technique).
+      These are irreplaceable user files — phone/camera crashes. Highest-value recovery case.
+
+- id: mp4-damage-bad-stco
+  group: mp4-damage
+  title: "stco chunk offsets shifted by 1024 bytes (file was edited)"
+  spec: ["12#3.7"]
+  source: { generate: "patch stco values" }
+  expect: { tier: T4, plays: true, recovery_rung: 4 }
+
+- id: mp4-damage-truncated-mdat
+  group: mp4-damage
+  title: "moov intact, mdat truncated at 70%"
+  spec: ["12#3.7"]
+  source: { generate: "faststart MP4, truncate" }
+  expect: { tier: T4, plays: true, duration_reported: approximate }
+
+- id: mp4-damage-concatenated
+  group: mp4-damage
+  title: "Two complete MP4s cat'd together"
+  spec: ["12#3.7"]
+  source: { generate: "cat a.mp4 b.mp4 > c.mp4" }
+  expect: { tier: T4, plays: true }
+
+- { id: mp4-damage-zero-duration,  group: mp4-damage, title: "mvhd/tkhd duration = 0",             spec: ["12#3.7"], status: planned }
+- { id: mp4-damage-stsz-mismatch,  group: mp4-damage, title: "stsz sizes inconsistent with mdat",  spec: ["12#3.7"], status: planned }
+- { id: mp4-damage-dup-track-id,   group: mp4-damage, title: "Two traks with the same track ID",   spec: ["12#3.7"], status: planned }
+- { id: mp4-damage-audio-at-end,   group: mp4-damage, title: "All audio samples after all video",  spec: ["12#3.7"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# codec-video (representative — see 11#3 for the full matrix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: codec-video-h264-hi10p
+  group: codec-video
+  title: "H.264 High 10 (Hi10P) 1080p — anime library staple"
+  spec: ["11#3.1", "11#8"]
+  source: { generate: "ffmpeg -pix_fmt yuv420p10le (LGPL encoder or FATE sample)" }
+  expect:
+    tier: T1
+    decode_path: software
+    notes: "No hardware decoder on essentially any GPU. Software path must be automatic and fast enough for 1080p."
+
+- id: codec-video-h264-422-10
+  group: codec-video
+  title: "H.264 High 4:2:2 10-bit"
+  spec: ["11#3.1"]
+  source: { origin: "ITU H.264 conformance", license: redistributable }
+  expect: { tier: T1, decode_path: software }
+
+- id: codec-video-hevc-main422-10
+  group: codec-video
+  title: "HEVC Main 4:2:2 10 intra"
+  spec: ["11#3.1"]
+  source: { origin: "JCT-VC conformance", license: redistributable }
+  expect: { tier: T1 }
+
+- id: codec-video-hevc-uhd-remux
+  group: codec-video
+  title: "HEVC Main10 3840x2160 HDR10, 92 Mbps sustained"
+  spec: ["11#6.4", "11#6.5"]
+  source: { generate: "high-bitrate HEVC encode from an open movie source" }
+  properties: { bitrate_mbps: 92, hdr: hdr10 }
+  expect:
+    tier: T0
+    dropped_frames: { max: 0 }
+    notes: "The remux case. Also asserts adaptive read-ahead sizing."
+
+- id: codec-video-vc1-interlaced
+  group: codec-video
+  title: "VC-1 Advanced Profile, interlaced, in m2ts"
+  spec: ["11#3.1", "13#3"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect:
+    tier: T1
+    deinterlaced: true
+    field_order_detected: true
+    notes: "Classic Blu-ray remux failure case. Field order must be detected, not assumed TFF."
+
+- id: codec-video-av1-filmgrain
+  group: codec-video
+  title: "AV1 10-bit with film grain synthesis"
+  spec: ["11#3.1"]
+  source: { origin: "AOM Argon vectors", license: redistributable }
+  expect: { tier: T1, film_grain_applied: true }
+
+- id: codec-video-vvc-scc
+  group: codec-video
+  title: "VVC with screen content coding (IBC, palette, ACT)"
+  spec: ["11#3.1"]
+  source: { origin: "JVET conformance", license: redistributable }
+  expect:
+    tier: T1
+    decode_path: software
+    notes: "FFmpeg 8.0 added VVC SCC decode support. VA-API hardware path where available."
+
+- id: codec-video-mvc-3d
+  group: codec-video
+  title: "H.264 MVC (Blu-ray 3D) — base view must decode"
+  spec: ["11#3.1", "11#6.1"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect:
+    tier: T1
+    streams: [{ type: video, codec: h264 }]
+    notes: "Must not fail on the dependent view. 2D left-eye extraction is the default."
+
+- id: codec-video-prores-4444xq
+  group: codec-video
+  title: "ProRes 4444 XQ with alpha, 500 Mbps"
+  spec: ["11#3.2", "11#6.4"]
+  source: { generate: "ffmpeg -c:v prores_ks -profile:v 5" }
+  expect:
+    tier: T1
+    notes: "Also asserts high-bitrate local I/O handling."
+
+- { id: codec-video-hevc-444-12,    group: codec-video, title: "HEVC Main 4:4:4 12-bit",              spec: ["11#3.1"], status: planned }
+- { id: codec-video-apv,            group: codec-video, title: "APV (FFmpeg 8.0 native decoder)",     spec: ["11#3.2"], status: planned }
+- { id: codec-video-prores-raw,     group: codec-video, title: "ProRes RAW",                          spec: ["11#3.2"], status: planned }
+- { id: codec-video-realvideo6,     group: codec-video, title: "RealVideo 6",                         spec: ["11#3.3"], status: planned }
+- { id: codec-video-ffv1-lossless,  group: codec-video, title: "FFV1 v3 lossless, slice-threaded",    spec: ["11#3.2"], status: planned }
+- { id: codec-video-mpeg2-interlaced, group: codec-video, title: "MPEG-2 interlaced PAL DVD rip",     spec: ["11#3.1"], status: planned }
+- { id: codec-video-divx3-packed,   group: codec-video, title: "DivX 3 packed bitstream AVI",         spec: ["11#3.1"], status: planned }
+- { id: codec-video-v210-uncompressed, group: codec-video, title: "v210 uncompressed 10-bit 4:2:2",   spec: ["11#3.2"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# codec-audio
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: codec-audio-truehd-atmos-passthrough
+  group: codec-audio
+  title: "Dolby TrueHD 7.1 with Atmos — bitstream passthrough"
+  spec: ["11#4.1", "03#5.4", "13#4"]
+  source: { generate: "TrueHD encode or FATE sample" }
+  platforms: [windows, linux, android]
+  expect:
+    tier: T0
+    audio_path: passthrough
+    sink_reports: "Dolby TrueHD"
+  overrides:
+    macos: { tier: T2, audio_path: decode_to_lpcm, reasons_present: [SinkLacksEncoding] }
+    ios:   { tier: T2, audio_path: decode_to_lpcm }
+    tvos:  { tier: T2, audio_path: decode_to_lpcm }
+  notes: "Platform overrides encode the honest macOS/Apple limitation from 03#5.4, not a waiver."
+
+- id: codec-audio-dtshd-ma-passthrough
+  group: codec-audio
+  title: "DTS-HD Master Audio 7.1 in Matroska — detection and passthrough"
+  spec: ["11#4.1", "03#5.4"]
+  source: { generate: "DTS-HD MA sample in MKV" }
+  platforms: [windows, linux, android]
+  expect:
+    tier: T0
+    audio_path: passthrough
+    sink_reports: "DTS-HD MA"
+  overrides:
+    macos: { tier: T2, audio_path: decode_to_lpcm }
+  notes: "DTS-HD detection in Matroska has historically been buggy (ExoPlayer #6225). Explicit vector."
+
+- id: codec-audio-dtshd-core-extraction
+  group: codec-audio
+  title: "DTS-HD MA to a core-only sink — core extracted, not re-encoded"
+  spec: ["13#4"]
+  source: { reuse: codec-audio-dtshd-ma-passthrough }
+  expect:
+    tier: T2
+    audio_path: core_extraction
+    reencoded: false
+    notes: "Must extract the original DTS core bitstream. Re-encoding here is a failure."
+
+- id: codec-audio-eac3-joc-atmos
+  group: codec-audio
+  title: "E-AC-3 JOC (Atmos) passthrough"
+  spec: ["11#4.2", "13#4"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect: { tier: T0, audio_path: passthrough }
+
+- id: codec-audio-flac-24-192-multichannel
+  group: codec-audio
+  title: "FLAC 7.1 24-bit 192 kHz — bit-perfect, exclusive mode, rate switch"
+  spec: ["11#4.1", "11#4.4", "13#4.1"]
+  source: { generate: "ffmpeg -c:a flac -sample_fmt s32 -ar 192000 -ac 8" }
+  platforms: [windows, linux, macos]
+  expect:
+    tier: T0
+    audio_path: exclusive_bitperfect
+    output_sample_rate: 192000
+    resampled: false
+
+- id: codec-audio-dsd64-dsf
+  group: codec-audio
+  title: "DSD64 .dsf — native DSD or DoP"
+  spec: ["11#4.1"]
+  source: { generate: "DSD sample" }
+  platforms: [windows, linux]
+  expect: { tier: T0, audio_path: dsd_native_or_dop }
+  overrides:
+    macos:   { tier: T2, audio_path: pcm_conversion }
+    android: { tier: T2, audio_path: pcm_conversion }
+
+- id: codec-audio-22-2-channels
+  group: codec-audio
+  title: "22.2 channel (24ch) audio"
+  spec: ["11#4.4"]
+  source: { generate: "ffmpeg 24-channel PCM in MKV" }
+  expect:
+    tier: T2
+    streams: [{ type: audio, channels: 24 }]
+    notes: "Must not truncate, crash, or mis-map. Fold-down uses the correct matrix."
+
+- id: codec-audio-xhe-aac
+  group: codec-audio
+  title: "xHE-AAC (USAC) with loudness metadata"
+  spec: ["11#4.2"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect: { tier: T1 }
+
+- id: codec-audio-opus-ambisonic
+  group: codec-audio
+  title: "Opus first-order ambisonics (ACN/SN3D)"
+  spec: ["11#4.4"]
+  source: { generate: "ffmpeg ambisonic Opus" }
+  expect: { tier: T2 }
+
+- { id: codec-audio-truehd-raw-thd,   group: codec-audio, title: "Raw .thd TrueHD elementary stream",  spec: ["11#2.3"],  status: planned }
+- { id: codec-audio-wavpack-hybrid,   group: codec-audio, title: "WavPack hybrid lossy+correction",    spec: ["11#4.1"],  status: planned }
+- { id: codec-audio-ape-insane,       group: codec-audio, title: "Monkey's Audio, Insane preset",      spec: ["11#4.1"],  status: planned }
+- { id: codec-audio-mp3-gapless,      group: codec-audio, title: "LAME gapless tags, album playback",  spec: ["12#6"],    status: planned }
+- { id: codec-audio-atrac3plus,       group: codec-audio, title: "ATRAC3+ in OMA",                     spec: ["11#4.2"],  status: planned }
+- { id: codec-audio-adpcm-variants,   group: codec-audio, title: "8 ADPCM variants in one suite",      spec: ["11#4.2"],  status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# subtitles
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: subtitles-ass-animated-4k
+  group: subtitles
+  title: "ASS with \\pos/\\move/\\clip/\\t animation, PlayRes 1280x720, rendered at 4K"
+  spec: ["11#5", "12#2.7"]
+  source: { generate: "typeset ASS sample + attached fonts" }
+  expect:
+    tier: T1
+    subtitle_render_hash: golden/subtitles-ass-animated-4k.txt
+    notes: "Scaling from PlayRes to display resolution must be correct, incl. border/shadow scaling."
+
+- id: subtitles-forced-autoselect
+  group: subtitles
+  title: "Japanese audio + English forced + English full — forced must be chosen"
+  spec: ["12#4"]
+  source: { generate: "mkvmerge multi-sub with forced flags" }
+  properties: { user_pref: { audio: jpn, subs: eng } }
+  expect:
+    tier: T1
+    selected_subtitle: { type: subtitle, language: eng, flag_forced: true }
+    notes: "Top-5 user delight item. Also test the inverse: English audio -> forced English selected."
+
+- id: subtitles-pgs-out-of-band
+  group: subtitles
+  title: "PGS to an HLS client — delivered out-of-band, NOT burned in"
+  spec: ["13#5", "13#1.1"]
+  source: { generate: "PGS track in MKV" }
+  expect:
+    tier: T1
+    subtitle_delivery: out_of_band
+    video_reencoded: false
+    reasons_absent: [SubtitleBurnInRequired]
+    notes: "Burn-in as a first response is a design failure. This vector enforces the ladder."
+
+- id: subtitles-cea608-embedded
+  group: subtitles
+  title: "CEA-608 roll-up captions in H.264 SEI, no other subtitle track"
+  spec: ["11#5"]
+  source: { origin: "US broadcast TS capture, FATE", license: redistributable }
+  expect:
+    tier: T1
+    subtitle_tracks_detected: { min: 1 }
+    notes: "Often the only captions on broadcast recordings. Must be discovered in-band."
+
+- id: subtitles-srt-cp1251
+  group: subtitles
+  title: "SRT in Windows-1251, no BOM"
+  spec: ["11#5"]
+  source: { generate: "encode a Cyrillic SRT as CP1251" }
+  expect:
+    tier: T1
+    charset_detected: "windows-1251"
+    notes: "uchardet path. Mojibake here is a compatibility failure."
+
+- { id: subtitles-ass-no-fonts,      group: subtitles, title: "ASS referencing fonts NOT attached (fallback)",  spec: ["11#5"], status: planned }
+- { id: subtitles-dual-track,        group: subtitles, title: "Two simultaneous subtitle tracks",                spec: ["11#5"], status: planned }
+- { id: subtitles-vobsub-idx-pair,   group: subtitles, title: "External .idx/.sub pair discovery",               spec: ["11#5"], status: planned }
+- { id: subtitles-sidecar-naming,    group: subtitles, title: "Sidecars in Subs/ with .en.forced.srt naming",    spec: ["11#5"], status: planned }
+- { id: subtitles-imsc-image,        group: subtitles, title: "IMSC 1.1 image profile",                          spec: ["11#5"], status: planned }
+- { id: subtitles-teletext,          group: subtitles, title: "Teletext subtitle page in DVB TS",                spec: ["11#5"], status: planned }
+- { id: subtitles-sdh-vs-plain,      group: subtitles, title: "SDH and non-SDH English — non-SDH preferred",     spec: ["12#4"], status: planned }
+- { id: subtitles-rtl-arabic,        group: subtitles, title: "RTL Arabic ASS with bidi + shaping",              spec: ["11#5"], status: planned }
+- { id: subtitles-karaoke-kfx,       group: subtitles, title: "ASS karaoke with \\k timing",                     spec: ["11#5"], status: planned }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# spectrum — resolution / rate / colour extremes
+# ─────────────────────────────────────────────────────────────────────────────
+
+- id: spectrum-8k-hevc
+  group: spectrum
+  title: "7680x4320 HEVC Main10"
+  spec: ["11#6.1"]
+  source: { generate: "8K encode from an open source clip" }
+  expect:
+    tier: T1
+    notes: "Hardware decode where available; software must not crash. Insufficient hardware -> T3 with a choice, never a silent failure."
+
+- id: spectrum-vfr-screen-capture
+  group: spectrum
+  title: "Variable frame rate screen capture, 1-60 fps, no DefaultDuration"
+  spec: ["11#6.2"]
+  source: { generate: "OBS-style VFR capture" }
+  expect:
+    tier: T1
+    cfr_converted: false
+    seek_accurate: true
+    notes: "Must not be 'corrected' to CFR on playback."
+
+- id: spectrum-telecine-32pulldown
+  group: spectrum
+  title: "Hard 3:2 pulldown 23.976 in 29.97 MPEG-2"
+  spec: ["11#6.2"]
+  source: { origin: "FATE samples", license: redistributable }
+  expect:
+    tier: T1
+    ivtc_offered: true
+
+- id: spectrum-anamorphic-dvd
+  group: spectrum
+  title: "720x480 NTSC with 16:9 DAR"
+  spec: ["11#6.1"]
+  source: { generate: "DVD-style anamorphic encode" }
+  expect:
+    tier: T1
+    display_aspect: { value: 1.7778, tolerance: 0.01 }
+    notes: "Displaying as 3:2 is a failure."
+
+- id: spectrum-nonmod2-dimensions
+  group: spectrum
+  title: "1279x719 (odd dimensions)"
+  spec: ["11#6.1"]
+  source: { generate: "ffmpeg -s 1279x719" }
+  expect:
+    tier: T1
+    notes: "Must not crash the scaler or produce chroma edge artefacts."
+
+- id: spectrum-limited-vs-full-range
+  group: spectrum
+  title: "Full-range (0-255) YUV tagged correctly"
+  spec: ["11#6.3"]
+  source: { generate: "ffmpeg -color_range pc" }
+  expect:
+    tier: T1
+    frame_hashes: golden/spectrum-full-range.txt
+    notes: "Mishandling range is the #1 cause of washed-out / crushed-blacks reports."
+
+- id: spectrum-hdr10plus-to-sdr
+  group: spectrum
+  title: "HDR10+ tone mapped to an SDR display"
+  spec: ["11#6.3", "13#3.2"]
+  source: { reuse: mkv-core-blockadditions-hdr10plus }
+  expect:
+    tier: T3
+    tone_map_curve: bt2390
+    dynamic_metadata_used: true
+    perceptual_score: { metric: ssimulacra2, min: 80, against: golden/spectrum-hdr10plus-sdr.png }
+
+- id: spectrum-dv-p7-fel
+  group: spectrum
+  title: "Dolby Vision Profile 7 FEL — base-layer HDR10 fallback, correctly labelled"
+  spec: ["11#6.3", "03#4.1"]
+  source: { generate: "P7 FEL sample" }
+  expect:
+    tier: T3
+    dv_profile_detected: "7"
+    dv_layer_used: base
+    message_contains: ["Profile 7", "base layer"]
+    notes: "FEL is not reconstructible in open source. The requirement is honest labelling, not a claim of support."
+
+- id: spectrum-33bit-pts-wrap
+  group: spectrum
+  title: "MPEG-TS 33-bit PTS wraparound"
+  spec: ["12#6"]
+  source: { generate: "synthetic TS with PTS near 2^33" }
+  expect:
+    tier: T1
+    av_sync_ms: { max_drift: 20 }
+    notes: "Wraps every ~26.5 h. Must unwrap, not resync-storm."
+
+- { id: spectrum-qcif-176x144,      group: spectrum, title: "176x144 3GP from an old phone",          spec: ["11#6.1"], status: planned }
+- { id: spectrum-dci-4096x2160,     group: spectrum, title: "DCI 4K (wider than UHD)",                spec: ["11#6.1"], status: planned }
+- { id: spectrum-vertical-1080x1920, group: spectrum, title: "Vertical phone video",                  spec: ["11#6.1"], status: planned }
+- { id: spectrum-120fps-hfr,        group: spectrum, title: "120 fps HFR, display-mode match",        spec: ["11#6.2"], status: planned }
+- { id: spectrum-pal-speedup,       group: spectrum, title: "PAL 25fps speedup detection",            spec: ["11#6.2"], status: planned }
+- { id: spectrum-360-equirect,      group: spectrum, title: "360 equirectangular with sv3d",          spec: ["11#6.1"], status: planned }
+- { id: spectrum-midstream-resolution, group: spectrum, title: "Resolution change at IDR in a TS",    spec: ["11#6.1"], status: planned }
+- { id: spectrum-24h-duration,      group: spectrum, title: "24 h file, seek to 23:59",               spec: ["11#6.4"], status: planned }
+- { id: spectrum-monochrome-400,    group: spectrum, title: "4:0:0 monochrome HEVC",                  spec: ["11#6.3"], status: planned }

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lumen S1 shell</title>
+<style>
+  /* The page itself must be fully transparent: mpv is rendering underneath, in the same window.
+     Any opaque background here would hide the video and turn the measurement into a test of how
+     fast a WebView paints a black rectangle. */
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    /* Pointer events pass through to the player except where the OSD is. */
+    pointer-events: none;
+    font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #fff;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* The OSD is deliberately expensive: a blurred translucent panel with a live-updating progress
+     bar and a text layer. A cheap overlay would pass on any machine and prove nothing — the
+     question is whether a real UI costs frames. */
+  #osd {
+    pointer-events: auto;
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    padding: 28px 40px 34px;
+    background: linear-gradient(to top, rgba(8,10,14,.92), rgba(8,10,14,0));
+    backdrop-filter: blur(18px) saturate(1.3);
+    -webkit-backdrop-filter: blur(18px) saturate(1.3);
+    transform: translateY(0);
+    transition: transform .18s ease-out, opacity .18s ease-out;
+    opacity: 1;
+  }
+  #osd.hidden { transform: translateY(100%); opacity: 0; }
+
+  #bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.24); overflow: hidden; }
+  #fill { height: 100%; width: 0%; background: #7aa2f7; box-shadow: 0 0 12px #7aa2f7; }
+  #row { display: flex; justify-content: space-between; margin-top: 14px; opacity: .85; }
+  #hint {
+    pointer-events: none;
+    position: absolute; top: 24px; left: 40px;
+    padding: 10px 16px; border-radius: 8px;
+    background: rgba(8,10,14,.7);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  #spin {
+    position: absolute; top: 24px; right: 40px;
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.2); border-top-color: #7aa2f7;
+    animation: spin 1s linear infinite;
+  }
+  /* A continuously animating element forces the WebView to keep compositing every frame rather
+     than going idle. An overlay that only repaints on interaction would understate the cost. */
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div id="spin"></div>
+  <div id="hint">S1 shell — press <b>O</b> to toggle the OSD and record its latency</div>
+  <div id="osd">
+    <div id="bar"><div id="fill"></div></div>
+    <div id="row"><span id="title">—</span><span id="clock">00:00</span></div>
+  </div>
+
+<script>
+const osd   = document.getElementById('osd');
+const fill  = document.getElementById('fill');
+const clock = document.getElementById('clock');
+const title = document.getElementById('title');
+
+title.textContent = (window.__LUMEN_CLIP__ || 'clip').split(/[\\/]/).pop();
+
+// A progress bar that moves every frame, so the compositor has real work rather than a static layer.
+let t0 = performance.now();
+function tick(now) {
+  const secs = (now - t0) / 1000;
+  fill.style.width = ((secs % 60) / 60 * 100).toFixed(2) + '%';
+  const m = Math.floor(secs / 60), s = Math.floor(secs % 60);
+  clock.textContent = String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// --- OSD latency ---------------------------------------------------------------------------------
+// Measured as: keypress -> the first frame actually presented with the new state.
+//
+// A single requestAnimationFrame callback fires *before* the frame is painted, so timing to it would
+// report a number roughly one frame too small and consistently flatter than reality. Waiting for the
+// second rAF puts the stamp after the first frame has been handed to the compositor.
+const samples = [];
+function measureToggle() {
+  const start = performance.now();
+  osd.classList.toggle('hidden');
+  // Force style/layout to be computed now rather than lazily, so the cost lands inside the window.
+  void osd.offsetHeight;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const ms = performance.now() - start;
+    samples.push(ms);
+    report();
+  }));
+}
+
+function report() {
+  // The median, not the mean: the first toggle includes one-off layer promotion and shader
+  // compilation, and a mean lets that single outlier dominate a short sample.
+  const sorted = [...samples].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const line = 'LUMEN_S1_OSD_LATENCY_MS=' + median.toFixed(1) +
+               '  (n=' + samples.length + ', worst=' + Math.max(...samples).toFixed(1) + ')';
+  console.log(line);
+  if (window.__TAURI__?.core?.invoke) {
+    window.__TAURI__.core.invoke('report_osd_latency', { ms: median, samples: samples.length })
+      .catch(() => {});
+  }
+}
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'o' || e.key === 'O') measureToggle();
+});
+
+// Toggle a few times unattended so a run still produces a number if nobody is at the keyboard.
+// Spread out, because back-to-back toggles measure a warm path that a viewer never sees.
+let auto = 0;
+const autoTimer = setInterval(() => {
+  measureToggle();
+  if (++auto >= 12) clearInterval(autoTimer);
+}, 3500);
+</script>
+</body>
+</html>
