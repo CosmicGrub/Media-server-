@@ -73,7 +73,7 @@ pub fn render_scan(scan: &Scan) -> String {
     }
     if !containers.is_empty() {
         let mut parts: Vec<(String, usize)> = containers.into_iter().collect();
-        parts.sort_by(|a, b| b.1.cmp(&a.1));
+        parts.sort_by_key(|p| std::cmp::Reverse(p.1));
         let text: Vec<String> = parts.iter().map(|(k, v)| format!("{k} {v}")).collect();
         s.push_str(&format!("  containers: {}\n", text.join(", ")));
     }
@@ -225,7 +225,7 @@ pub fn render_session(rep: &SessionReport) -> String {
     }
     if !codecs.is_empty() {
         let mut v: Vec<(String, usize)> = codecs.into_iter().collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
         let text: Vec<String> = v.iter().map(|(k, n)| format!("{k} {n}")).collect();
         s.push_str(&format!("\nvideo codecs played: {}\n", text.join(", ")));
     }

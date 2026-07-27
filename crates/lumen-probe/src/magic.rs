@@ -100,7 +100,10 @@ pub fn sniff(head: &[u8]) -> Vec<Candidate> {
         "fallback: probe as a headerless elementary stream",
     );
 
-    out.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    // Strongest evidence first. `sort_by_key` with `Reverse` rather than a hand-written comparator:
+    // both are stable sorts, so candidates of equal confidence keep the order they were pushed in,
+    // which is what makes the first ISOBMFF hit win over a later offset-0 match.
+    out.sort_by_key(|c| std::cmp::Reverse(c.confidence));
     out
 }
 
