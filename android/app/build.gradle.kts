@@ -17,9 +17,22 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
-        // arm64 only. Every foldable and every phone worth targeting is 64-bit ARM; adding x86_64
-        // would roughly double the APK for architectures that only exist in emulators.
-        ndk { abiFilters += listOf("arm64-v8a") }
+        // Required for the on-device tests in src/androidTest.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // arm64 only for anything shipped. Every foldable and every phone worth targeting is 64-bit
+        // ARM, and adding x86_64 would roughly double the APK for an architecture that exists only
+        // in emulators.
+        //
+        // The on-device CI job passes `-PemulatorAbi=x86_64` because CI runners have no arm64
+        // emulator image. That widens this build only; the released APK stays arm64-only. Harmless
+        // today because the app carries no native libraries and an APK without them installs on any
+        // ABI — but it stops being harmless the moment the Rust core lands, and a silent
+        // INSTALL_FAILED_NO_MATCHING_ABIS months from now is a bad way to discover that.
+        ndk {
+            val emulatorAbi = (project.findProperty("emulatorAbi") as String?)?.takeIf(String::isNotBlank)
+            abiFilters += listOfNotNull("arm64-v8a", emulatorAbi)
+        }
     }
 
     signingConfigs {
@@ -64,6 +77,18 @@ android {
     }
 
     sourceSets["main"].kotlin.srcDirs("src/main/kotlin")
+    sourceSets["test"].kotlin.srcDirs("src/test/kotlin")
+    sourceSets["androidTest"].kotlin.srcDirs("src/androidTest/kotlin")
+
+    testOptions {
+        unitTests {
+            // The unit tests here deliberately touch no Android APIs — the posture decision and the
+            // formatting helpers are free functions over primitives. This is a safety net for any
+            // that slip through, so a stray framework call returns a default instead of throwing
+            // "not mocked" and sending someone hunting for a bug that is not there.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -94,4 +119,13 @@ dependencies {
     implementation(libs.adaptive)
 
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
+
+    testImplementation(libs.junit)
+    testImplementation(libs.kotlin.test.junit)
+
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.kotlin.test.junit)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.junit)
 }

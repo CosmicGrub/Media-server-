@@ -55,6 +55,11 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
+      # Fast, no emulator: the posture decision and the formatting helpers are free functions over
+      # primitives precisely so they can be checked here, in seconds, on every push.
+      - name: Unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
 
@@ -81,3 +86,85 @@ jobs:
           path: android/app/build/outputs/apk/*/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload unit-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-unit-test-report
+          path: android/app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # A headless emulator. This is the only check that proves the APK installs and starts — a build
+  # that compiles tells you nothing about whether the Activity survives to RESUMED, and a crash on
+  # launch makes every other result irrelevant.
+  #
+  # Kept as a separate job because it is slow (booting an image takes minutes) and needs KVM, which
+  # only the Linux runners have.
+  emulator:
+    name: on-device tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: android
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 34 is what a Fold 5 ships with; 35 is what the app targets. Both, because the permission
+        # model and the window APIs differ between them and a pass on one is not a pass on the other.
+        api-level: [34, 35]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Without this the emulator falls back to software rendering and the boot times out.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Generate debug keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore app/debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Run on-device tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: google_apis
+          # The emulator has no arm64 image; x86_64 is the only option on a CI runner. The app ships
+          # arm64-only, so abiFilters is widened just for this job rather than in the shipped APK.
+          arch: x86_64
+          profile: pixel_6
+          # No window, no audio, no boot animation — this is the headless part.
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: ./gradlew --no-daemon connectedDebugAndroidTest -Pandroid.injected.testOnly=false -PemulatorAbi=x86_64
+
+      - name: Upload on-device test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-device-test-report-api${{ matrix.api-level }}
+          path: android/app/build/reports/androidTests/
+          if-no-files-found: ignore
+          retention-days: 7

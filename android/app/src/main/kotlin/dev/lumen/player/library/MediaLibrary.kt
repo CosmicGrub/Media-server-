@@ -33,25 +33,37 @@ data class MediaItem(
     /** Resolution as text, or null when MediaStore did not record it. */
     fun resolution(): String? = if (width > 0 && height > 0) "${width}x$height" else null
 
-    fun durationText(): String {
-        if (durationMs <= 0) return "—"
-        val total = durationMs / 1000
-        val h = total / 3600
-        val m = (total % 3600) / 60
-        val s = total % 60
-        return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
-    }
+    fun durationText(): String = formatDuration(durationMs)
 
-    fun sizeText(): String {
-        val units = listOf("B", "KB", "MB", "GB", "TB")
-        var v = sizeBytes.toDouble()
-        var i = 0
-        while (v >= 1024 && i < units.lastIndex) {
-            v /= 1024
-            i++
-        }
-        return if (i == 0) "$sizeBytes B" else "%.1f %s".format(v, units[i])
+    fun sizeText(): String = formatSize(sizeBytes)
+}
+
+/**
+ * Duration as `h:mm:ss`, or `m:ss` under an hour.
+ *
+ * A free function over a primitive rather than a method, so it unit-tests on a plain JVM —
+ * `MediaItem` holds an Android `Uri`, and constructing one outside a device drags in the whole
+ * framework for the sake of checking string formatting.
+ */
+internal fun formatDuration(durationMs: Long): String {
+    if (durationMs <= 0) return "—"
+    val total = durationMs / 1000
+    val h = total / 3600
+    val m = (total % 3600) / 60
+    val s = total % 60
+    return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
+}
+
+/** Byte count in the largest unit that keeps it above 1. */
+internal fun formatSize(sizeBytes: Long): String {
+    val units = listOf("B", "KB", "MB", "GB", "TB")
+    var v = sizeBytes.toDouble()
+    var i = 0
+    while (v >= 1024 && i < units.lastIndex) {
+        v /= 1024
+        i++
     }
+    return if (i == 0) "$sizeBytes B" else "%.1f %s".format(v, units[i])
 }
 
 /**
