@@ -1,0 +1,20 @@
+[package]
+name = "lumen-play"
+description = "Runnable player and library test harness: scan a collection, play it through mpv, and record what actually worked."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lumen"
+path = "src/main.rs"
+
+[dependencies]
+lumen-model.workspace = true
+lumen-probe.workspace = true
+lumen-match.workspace = true
+
+[lints]
+workspace = true
