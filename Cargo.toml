@@ -5,6 +5,7 @@ members = [
     "crates/lumen-caps",
     "crates/lumen-playback",
     "crates/lumen-identity",
+    "crates/lumen-probe",
 ]
 
 [workspace.package]
@@ -19,6 +20,7 @@ lumen-model = { path = "crates/lumen-model" }
 lumen-caps = { path = "crates/lumen-caps" }
 lumen-playback = { path = "crates/lumen-playback" }
 lumen-identity = { path = "crates/lumen-identity" }
+lumen-probe = { path = "crates/lumen-probe" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

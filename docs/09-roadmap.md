@@ -54,10 +54,33 @@ hardware ([`../crates/`](../crates/)):
 | `lumen-caps` | Client + **sink-level** capability model (gap G2) | 5 |
 | `lumen-playback` | **The decision ladder** and track auto-selection — ADR-0004's one implementation | 21 + 15 |
 | `lumen-identity` | Move-surviving content sketch — decision D5 | 12 |
+| `lumen-probe` | Content sniffing (G0/Rule 1), MKV + MP4 structural analysis, the recovery ladder (§5) | 71 + 10 |
 
-The ladder's property tests found **six real bugs** on first run, including plans that emitted a
-container the client could not open, an upscaling transcode, and a T4 with no explanation. That is
-the argument for writing the referee independently of the implementation.
+**159 tests total, 18 of them properties.** The properties have found **seven real bugs**: plans that
+emitted a container the client could not open; a fallback that degraded audio when video was the
+blocker; a transcode target picked without checking the client could decode it; a burn-in codec the
+chosen container could not carry; an upscaling burn-in transcode; in-band captions selected without
+checking the client could render them; a T4 with no explanation; and a panic on any 12–15 byte MP4
+header — a denial of service on a watched folder, since anyone who can drop a file into one controls
+its bytes.
+
+That last one is the argument for the whole approach: it was found by
+`truncation_at_any_offset_never_panics`, a property that asserts nothing more interesting than
+"returning at all".
+
+What `lumen-probe` answers, all without FFmpeg:
+
+| Question | Doc | Why it matters |
+|---|---|---|
+| Is `moov` before `mdat`? | 12 §3.1 | Non-faststart over HTTP needs a tail range request, not a full download |
+| Non-default `TimestampScale`? | 12 §2.2 | Hard-coding the 1 ms default breaks timing entirely |
+| Header stripping (`ContentCompAlgo=3`)? | 12 §2.7 | Unhandled, every frame decodes to garbage while appearing to play |
+| Attached fonts? | 12 §2.7 | Detected by filename, never by MIME — muxers emit wrong MIME constantly |
+| `Cues` absent, at the front, or at the tail? | 12 §2.3 | Decides between a scan, a fast path, and a range request |
+| Ordered chapters / segment linking? | 12 §2.4 | Must be resolved *before* playback, with cycle detection |
+| Encrypted, and under which scheme? | 12 §2.7, §3.6 | A named scheme, never a mysterious decode failure |
+| Edit lists present? | 12 §3.2 | The #1 A/V-sync bug source in MP4 |
+| `moov` missing entirely? | 12 §3.7 | Rung 4 reconstruction — interrupted phone recordings are irreplaceable |
 
 **Kill criteria.** If S1 fails on all three desktops → switch desktop to Qt 6. If S3 fails → iOS ships with VLCKit or
 not at all in v1. If S4 fails → decide consciously to be a GPL product and drop the App Store. If S5 fails → the
@@ -75,11 +98,12 @@ No server. No accounts. Open a file or a network share and play it.
 - Android shell: phone + Android TV, same feature set
 - Shader/enhancement presets (Anime4K, CAS, deband) — an early, visible differentiator
 - Frame-rate/display-mode matching
-- **The Universal Play Guarantee ([`11`](11-compatibility-charter.md) G0–G2) fully implemented.** The ladder,
-  tier model, reason taxonomy, and track auto-selection already exist in
-  [`../crates/lumen-playback`](../crates/lumen-playback). What remains: content-probing over extension trust, the
-  ten-rung recovery ladder ([`12`](12-container-conformance.md) §5), the full MKV and MP4 feature surface, and
-  64-bit rational timestamps end to end
+- **The Universal Play Guarantee ([`11`](11-compatibility-charter.md) G0–G2) fully implemented.** Already done:
+  the ladder, tier model, reason taxonomy, and track auto-selection
+  ([`../crates/lumen-playback`](../crates/lumen-playback)); content probing over extension trust, the MKV and MP4
+  structural surface, and the recovery-ladder policy ([`../crates/lumen-probe`](../crates/lumen-probe)).
+  What remains is wiring those decisions to a real demuxer: executing each recovery rung against libav, MP4 `moov`
+  reconstruction by scanning `mdat` (R22), and 64-bit rational timestamps end to end
 - **Conformance corpus green on both platforms in CI** — the full seed set in [`../conformance/corpus.yaml`](../conformance/corpus.yaml),
   not just the 20-file subset. This is the release gate, not a stretch goal.
 - LGPL build pipeline + license gate + SBOM + Legal screen

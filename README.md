@@ -95,7 +95,7 @@ on hard files. If resources are limited, stopping at Phase 2 or 3 and being exce
 depends on is implemented and tested.
 
 ```bash
-cargo test --workspace     # 78 tests, incl. 8 property tests over the playback ladder
+cargo test --workspace     # 159 tests, incl. 18 property tests
 ci/license-gate.sh         # ADR-0002 licence posture
 python3 conformance/runner/coverage.py
 ```
@@ -106,9 +106,16 @@ python3 conformance/runner/coverage.py
 | [`lumen-caps`](crates/lumen-caps) | Client and **sink-level** capability model | 5 |
 | [`lumen-playback`](crates/lumen-playback) | **The playback decision ladder** and track auto-selection | 21 + 15 |
 | [`lumen-identity`](crates/lumen-identity) | Move-surviving content sketch | 12 |
+| [`lumen-probe`](crates/lumen-probe) | Content sniffing, MKV/MP4 structural analysis, the recovery ladder | 71 + 10 |
 
-The ladder is deliberately the first thing built: ADR-0004 makes it the one piece that must never
-diverge across clients, and its property tests found six real bugs on their first run.
+Two deliberate choices about order. The **ladder** came first because ADR-0004 makes it the one piece
+that must never diverge across clients. The **probe layer** came second because guarantees G0 and G2
+rest on it: content sniffing over extension trust, and an escalation ladder that only DRM, an absent
+decoder, or genuinely undecodable data may exhaust.
+
+Both are property-tested, and the properties have found **seven real bugs** so far — including plans
+that emitted a container the client could not open, and a panic on any 12–15 byte MP4 header, which
+was a denial of service on a watched folder.
 
 Remaining Phase 0 spikes and their status: [docs/09-roadmap.md](docs/09-roadmap.md) §2.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the four rules that govern changes here.
