@@ -79,7 +79,36 @@ is sequenced so each phase ships something usable on its own, starting with a de
 on hard files. If resources are limited, stopping at Phase 2 or 3 and being excellent there is a real product;
 40% of ten features on six platforms is not. See [docs/09-roadmap.md](docs/09-roadmap.md).
 
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| [`docs/`](docs/) | Architecture, research, and the compatibility specification (00–13 + ADRs) |
+| [`crates/`](crates/) | The shared Rust core — see below |
+| [`conformance/`](conformance/) | The machine-readable corpus proving docs 11–13 |
+| [`native/`](native/) | LGPL-only build recipes for FFmpeg / mpv / libplacebo (ADR-0002) |
+| [`ci/`](ci/) | Blocking gates, incl. `license-gate.sh` |
+
 ## Status
 
-Research and architecture only. No implementation yet — Phase 0 spikes are the next step
-([docs/09-roadmap.md](docs/09-roadmap.md) §2).
+**Phase 0 in progress.** Research and architecture complete; the shared core that everything else
+depends on is implemented and tested.
+
+```bash
+cargo test --workspace     # 78 tests, incl. 8 property tests over the playback ladder
+ci/license-gate.sh         # ADR-0002 licence posture
+python3 conformance/runner/coverage.py
+```
+
+| Crate | What it is | Tests |
+|---|---|---|
+| [`lumen-model`](crates/lumen-model) | Containers, codecs, streams, colour/HDR, remux carriage rules | 24 |
+| [`lumen-caps`](crates/lumen-caps) | Client and **sink-level** capability model | 5 |
+| [`lumen-playback`](crates/lumen-playback) | **The playback decision ladder** and track auto-selection | 21 + 15 |
+| [`lumen-identity`](crates/lumen-identity) | Move-surviving content sketch | 12 |
+
+The ladder is deliberately the first thing built: ADR-0004 makes it the one piece that must never
+diverge across clients, and its property tests found six real bugs on their first run.
+
+Remaining Phase 0 spikes and their status: [docs/09-roadmap.md](docs/09-roadmap.md) §2.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the four rules that govern changes here.

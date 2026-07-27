@@ -1,0 +1,48 @@
+# cargo-deny policy — the Rust half of ADR-0002's licence gate.
+#
+# The native AV stack is checked by ci/license-gate.sh; this covers the Cargo dependency graph.
+# Copyleft licences on a Rust dependency would propagate to our own code exactly as a GPL FFmpeg
+# build would, so they are denied rather than reviewed case by case.
+
+[licenses]
+# Permissive plus LGPL (which we already accept for the native stack, dynamically linked).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",          # our own licence: file-level copyleft, app-store compatible
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "BSL-1.0",
+]
+# Anything not on the allow list fails, including unknown/unlicensed crates.
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# LGPL is acceptable only where we control the linkage. Add crates here individually, with a note,
+# rather than putting LGPL on the global allow list.
+name = "lumen-identity"
+allow = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[[bans.deny]]
+# Roll-your-own crypto has no place in a network service that indexes people's private files.
+name = "openssl"
+wrappers = []
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

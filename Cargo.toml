@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/lumen-model",
+    "crates/lumen-caps",
+    "crates/lumen-playback",
+    "crates/lumen-identity",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MPL-2.0"
+repository = "https://github.com/CosmicGrub/Media-server-"
+
+[workspace.dependencies]
+lumen-model = { path = "crates/lumen-model" }
+lumen-caps = { path = "crates/lumen-caps" }
+lumen-playback = { path = "crates/lumen-playback" }
+lumen-identity = { path = "crates/lumen-identity" }
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

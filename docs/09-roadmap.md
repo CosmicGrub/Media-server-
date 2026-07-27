@@ -32,6 +32,33 @@ overruns is itself the answer.**
 | S7 | Wasmtime plugin host: a TMDB provider as a Wasm component | Is the plugin model practical? | Metadata fetched through the sandbox, allowlist enforced |
 | S8 | 🔴 Legal review kickoff: App Store + LGPL, Dolby/DTS decoder distribution | Is the iOS target and the business model viable? | Written opinion or a clear "needs restructuring" |
 
+### Phase 0 status
+
+| Spike | Status | Artifact |
+|---|---|---|
+| S1 desktop compositing | not started | needs a GPU runner |
+| S2 Android core + libmpv | not started | needs the NDK |
+| S3 Apple XCFramework | not started | **blocked on S8** — do not write iOS code before counsel reports |
+| **S4 LGPL-only build** | **recipes written, build pending** | [`../native/`](../native/) — `ffmpeg.config`, `mpv.config`, [`../ci/license-gate.sh`](../ci/license-gate.sh) (passing, with a verified negative test), [`../deny.toml`](../deny.toml) |
+| S5 audio passthrough | not started | needs a physical AVR |
+| S6 scanner throughput | not started | needs a corpus |
+| S7 Wasm plugin host | not started | — |
+| S8 legal review | **not started — start this week** | this gates S3 and the whole Apple target |
+
+**Shipped ahead of the spikes**, because it is the piece everything else depends on and it needed no
+hardware ([`../crates/`](../crates/)):
+
+| Crate | What it is | Tests |
+|---|---|---|
+| `lumen-model` | Containers, codecs, streams, colour/HDR, remux carriage rules | 24 |
+| `lumen-caps` | Client + **sink-level** capability model (gap G2) | 5 |
+| `lumen-playback` | **The decision ladder** and track auto-selection — ADR-0004's one implementation | 21 + 15 |
+| `lumen-identity` | Move-surviving content sketch — decision D5 | 12 |
+
+The ladder's property tests found **six real bugs** on first run, including plans that emitted a
+container the client could not open, an upscaling transcode, and a T4 with no explanation. That is
+the argument for writing the referee independently of the implementation.
+
 **Kill criteria.** If S1 fails on all three desktops → switch desktop to Qt 6. If S3 fails → iOS ships with VLCKit or
 not at all in v1. If S4 fails → decide consciously to be a GPL product and drop the App Store. If S5 fails → the
 positioning changes and you must say so before writing marketing copy.
@@ -48,9 +75,11 @@ No server. No accounts. Open a file or a network share and play it.
 - Android shell: phone + Android TV, same feature set
 - Shader/enhancement presets (Anime4K, CAS, deband) — an early, visible differentiator
 - Frame-rate/display-mode matching
-- **The Universal Play Guarantee ([`11`](11-compatibility-charter.md) G0–G2) fully implemented**: content-probing
-  over extension trust, the 10-rung recovery ladder ([`12`](12-container-conformance.md) §5), the complete MKV and
-  MP4 feature surface, track auto-selection rules, and 64-bit rational timestamps end to end
+- **The Universal Play Guarantee ([`11`](11-compatibility-charter.md) G0–G2) fully implemented.** The ladder,
+  tier model, reason taxonomy, and track auto-selection already exist in
+  [`../crates/lumen-playback`](../crates/lumen-playback). What remains: content-probing over extension trust, the
+  ten-rung recovery ladder ([`12`](12-container-conformance.md) §5), the full MKV and MP4 feature surface, and
+  64-bit rational timestamps end to end
 - **Conformance corpus green on both platforms in CI** — the full seed set in [`../conformance/corpus.yaml`](../conformance/corpus.yaml),
   not just the 20-file subset. This is the release gate, not a stretch goal.
 - LGPL build pipeline + license gate + SBOM + Legal screen

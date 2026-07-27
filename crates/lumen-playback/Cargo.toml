@@ -1,0 +1,18 @@
+[package]
+name = "lumen-playback"
+description = "The playback decision ladder and track auto-selection. One implementation, every client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lumen-model.workspace = true
+lumen-caps.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
