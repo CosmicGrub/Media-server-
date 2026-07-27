@@ -56,8 +56,10 @@ hardware ([`../crates/`](../crates/)):
 | `lumen-identity` | Move-surviving content sketch — decision D5 | 12 |
 | `lumen-probe` | Content sniffing (G0/Rule 1), MKV + MP4 structural analysis, the recovery ladder (§5) | 71 + 10 |
 | `lumen-match` | Filename parsing and candidate ranking — `docs/05` §4.4, research **R8** | 41 + 19 |
+| `lumen-meta` | Provider abstraction, artwork selection, field merge with provenance — `docs/14` §1–2 | 38 |
+| `lumen-subs` | Subtitle acquisition ladder, ASR/MT gating, sync correction — `docs/14` §3–5 | 62 |
 
-**219 tests total, 29 of them properties, plus an 83-row labelled filename corpus.** The properties have found **seven real bugs**: plans that
+**319 tests total, 29 of them properties, plus an 83-row labelled filename corpus.** The properties have found **seven real bugs**: plans that
 emitted a container the client could not open; a fallback that degraded audio when video was the
 blocker; a transcode target picked without checking the client could decode it; a burn-in codec the
 chosen container could not carry; an upscaling burn-in transcode; in-band captions selected without

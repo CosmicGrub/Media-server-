@@ -7,6 +7,8 @@ members = [
     "crates/lumen-identity",
     "crates/lumen-probe",
     "crates/lumen-match",
+    "crates/lumen-meta",
+    "crates/lumen-subs",
 ]
 
 [workspace.package]
@@ -23,6 +25,8 @@ lumen-playback = { path = "crates/lumen-playback" }
 lumen-identity = { path = "crates/lumen-identity" }
 lumen-probe = { path = "crates/lumen-probe" }
 lumen-match = { path = "crates/lumen-match" }
+lumen-meta = { path = "crates/lumen-meta" }
+lumen-subs = { path = "crates/lumen-subs" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

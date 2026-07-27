@@ -115,6 +115,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-meta"
+version = "0.1.0"
+dependencies = [
+ "lumen-model",
+ "proptest",
+]
+
+[[package]]
 name = "lumen-model"
 version = "0.1.0"
 
@@ -129,6 +137,14 @@ dependencies = [
 
 [[package]]
 name = "lumen-probe"
+version = "0.1.0"
+dependencies = [
+ "lumen-model",
+ "proptest",
+]
+
+[[package]]
+name = "lumen-subs"
 version = "0.1.0"
 dependencies = [
  "lumen-model",

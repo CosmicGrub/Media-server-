@@ -95,7 +95,7 @@ on hard files. If resources are limited, stopping at Phase 2 or 3 and being exce
 depends on is implemented and tested.
 
 ```bash
-cargo test --workspace     # 219 tests, incl. 29 property tests
+cargo test --workspace     # 319 tests, incl. 29 property tests
 ci/license-gate.sh         # ADR-0002 licence posture
 python3 conformance/runner/coverage.py
 ```
@@ -108,6 +108,8 @@ python3 conformance/runner/coverage.py
 | [`lumen-identity`](crates/lumen-identity) | Move-surviving content sketch | 12 |
 | [`lumen-probe`](crates/lumen-probe) | Content sniffing, MKV/MP4 structural analysis, the recovery ladder | 71 + 10 |
 | [`lumen-match`](crates/lumen-match) | Filename parsing and candidate ranking (research R8) | 41 + 19 |
+| [`lumen-meta`](crates/lumen-meta) | Provider abstraction, artwork selection, field merge with provenance | 38 |
+| [`lumen-subs`](crates/lumen-subs) | Subtitle acquisition ladder, ASR/translation gating, sync correction | 62 |
 
 Two deliberate choices about order. The **ladder** came first because ADR-0004 makes it the one piece
 that must never diverge across clients. The **probe layer** came second because guarantees G0 and G2
@@ -115,7 +117,7 @@ rest on it: content sniffing over extension trust, and an escalation ladder that
 decoder, or genuinely undecodable data may exhaust.
 
 Everything is property-tested, and the properties plus the labelled filename corpus have found
-**fifteen real bugs** so far — including plans that emitted a container the client could not open, a
+**eighteen real bugs** so far — including plans that emitted a container the client could not open, a
 panic on any 12–15 byte MP4 header (a denial of service on a watched folder), and an asymmetric title
 similarity that made candidate ranking depend on argument order.
 
