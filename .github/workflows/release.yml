@@ -12,8 +12,15 @@ on:
   push:
     tags: ['v*']
   # A release pipeline that is only exercised at tag time is one that breaks at tag time, when it is
-  # least convenient. Changing this file revalidates it against the open pull request, so a mistake
+  # least convenient. Changing this file revalidates it against an open pull request, so a mistake
   # surfaces on the commit that caused it rather than during a release.
+  #
+  # NOT YET EXERCISED END TO END. `workflow_dispatch` requires this file to be on the default
+  # branch, and this session's git proxy rejects tag pushes, so neither route was available when it
+  # was written. Once it is on `main`, verify it before relying on it:
+  #     gh workflow run release.yml --ref main
+  # The per-platform `cargo build --release` it performs is covered by rust.yml on all three
+  # operating systems; what is unverified is the staging, mpv bundling and packaging around it.
   pull_request:
     paths:
       - '.github/workflows/release.yml'

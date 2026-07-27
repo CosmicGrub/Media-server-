@@ -9,30 +9,36 @@ library is also the first real test of that code on data that is not a fixture.
 
 ## Install
 
-**Windows — prebuilt bundle, nothing to install.** Unzip
-`lumen-windows-x86_64.zip` anywhere and run `lumen.exe` from that folder. It carries `mpv.exe`
-(mpv 0.41.0, with FFmpeg and libplacebo statically linked) beside it, so the folder is
-self-contained and portable — a USB stick works. Nothing touches the registry; deleting the folder
-undoes everything.
+**Download a build.** `.github/workflows/release.yml` produces one per platform — Windows,
+Linux, and both Mac architectures — on every `v*` tag, and on demand via workflow dispatch. Grab
+the artifact for your platform from the Actions run and unpack it.
 
-Build it yourself, from Linux or Windows:
+The **Windows** bundle is self-contained: it carries `mpv.exe` (statically linked FFmpeg and
+libplacebo) beside `lumen.exe`, so the folder runs from a USB stick with nothing installed. Nothing
+touches the registry; deleting the folder undoes everything.
 
-```bash
-# Cross-compiling from Linux needs these once:
-apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-x86-64-dev
-rustup target add x86_64-pc-windows-gnu
-
-./crates/lumen-play/package-windows.sh --with-mpv   # -> dist/lumen-windows-x86_64.zip
-```
-
-**Anywhere else**, mpv is the one prerequisite:
+**Linux and macOS** bundles ship the binary alone, because mpv there is dynamically linked against
+a long dependency chain and shipping that correctly means shipping a distribution — which the
+package manager already is:
 
 ```bash
 #   macOS     brew install mpv
 #   Linux     apt install mpv     (or dnf / pacman / zypper)
+```
 
+**Or build it yourself:**
+
+```bash
 cargo build --release -p lumen-play
 ./target/release/lumen doctor
+```
+
+Cross-compiling a Windows bundle from Linux, which is how the first one was made:
+
+```bash
+apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-x86-64-dev
+rustup target add x86_64-pc-windows-gnu
+./crates/lumen-play/package-windows.sh --with-mpv   # -> dist/lumen-windows-x86_64.zip
 ```
 
 `lumen` finds mpv beside its own executable first, then on `PATH`, then in the usual install
@@ -124,7 +130,12 @@ that substring matching gets wrong silently.
 
 ## Status
 
-76 tests, plus an end-to-end run of the Windows binary against real encoded media (H.264 in
+CI runs tests, clippy and rustfmt on Linux, macOS and Windows for every push, plus the ADR-0002
+licence gate. The platform matrix is not decoration: the mpv IPC transport is a Unix socket on one
+and a named pipe on the other, and the environment probe shells out to different tools per OS.
+
+76 tests in this crate and 453 across the workspace, plus an end-to-end run of the Windows binary
+against real encoded media (H.264 in
 Matroska and MP4, MPEG-4 part 2 in AVI, and a deliberately corrupt file) under Wine: five files,
 four played, one correctly reported as `unrecognized file format`, every resolution and codec
 attributed to the right file, exit code 1.
