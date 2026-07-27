@@ -50,6 +50,10 @@ Options
   --json <path>       write the machine-readable report here
   --                  everything after this is passed to mpv verbatim
 
+Other
+  --help              this text
+  --version           version and target platform
+
 Exit codes: 0 all played, 1 at least one file failed, 2 usage or setup error.";
 
 fn main() -> ExitCode {
@@ -67,6 +71,18 @@ fn main() -> ExitCode {
         },
         Some("--help" | "-h" | "help") => {
             println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        // Expected of anything shipped, and the first thing anyone asks a binary that misbehaves.
+        // Reports the target it was built for, not the host running it: a bug report saying
+        // "lumen 0.1.0" is far less useful than one naming the architecture.
+        Some("--version" | "-V" | "version") => {
+            println!(
+                "lumen {} ({} {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
             ExitCode::SUCCESS
         }
         _ => {
