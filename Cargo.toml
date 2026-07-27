@@ -9,7 +9,12 @@ members = [
     "crates/lumen-match",
     "crates/lumen-meta",
     "crates/lumen-subs",
+    "spikes/s1-compositing",
 ]
+
+# The S1 shell needs WebKitGTK and the platform WebView SDKs. Pulling that into the workspace would
+# make every tested crate unbuildable on a machine without them, so it builds separately.
+exclude = ["spikes/s1-compositing/ui"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,32 @@
+# Unverified template — see ../README.md. Never built; versions will need pinning to whatever Tauri
+# v2 release is current when you first compile it.
+#
+# Not a workspace member on purpose: Tauri's dependency tree needs WebKitGTK (Linux) and the platform
+# WebView SDKs, and pulling that into `cargo test` at the repository root would make the tested
+# crates unbuildable on any machine without them. The root manifest excludes this path.
+
+[package]
+name = "lumen-s1-shell"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+publish = false
+description = "Composited stage of the S1 compositing spike"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+
+# X11 window id extraction for `--wid` embedding. Linux only; there is no Wayland equivalent.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+gdk-x11 = "0.18"
+
+[profile.release]
+# The spike measures a release build. A debug WebView paints far slower, and a result from one would
+# understate what the shipped product can do — the opposite of a useful conservative bias.
+opt-level = 3
+lto = true
+codegen-units = 1

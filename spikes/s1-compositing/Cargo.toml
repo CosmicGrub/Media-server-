@@ -1,0 +1,13 @@
+[package]
+name = "s1-compositing"
+description = "Phase 0 spike S1: can a WebView UI composite over hardware video without tearing or lag?"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

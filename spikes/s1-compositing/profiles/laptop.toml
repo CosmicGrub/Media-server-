@@ -1,0 +1,42 @@
+# S1 compositing spike — LAPTOP profile
+#
+# Assumes: battery, hybrid or integrated graphics, aggressive thermal management, HiDPI.
+# Run with:  cargo run -p s1-compositing -- run --profile profiles/laptop.toml --clip <file>
+#
+# Three things a desktop run can never surface, and all three have bitten real players:
+#
+#   1. Hybrid graphics park the discrete GPU on battery. The frame rate halves without a single
+#      frame being reported "late", so a delayed-frame count alone shows nothing.
+#   2. Thermal throttling arrives minutes in. Ninety seconds of clean playback is not a pass.
+#   3. Compositing CPU cost is battery life and fan noise, not just a number.
+
+name = "laptop"
+description = "Battery-capable laptop with hybrid or integrated graphics. Judged on sustained behaviour across power states, not peak performance."
+
+# ── Pass/fail thresholds ─────────────────────────────────────────────────────────────────────────
+baseline_max_delayed_per_min  = 8.0
+# Looser than the desktop: an iGPU legitimately has less headroom, and holding it to a dGPU budget
+# would report a hardware limit as a compositing failure.
+max_added_delayed_per_min     = 5.0
+# Stricter than the desktop, because the failure mode here is a *rate collapse* rather than dropped
+# frames — a compositor falling to half-rate vsync reports zero late frames.
+min_fps_ratio                 = 0.95
+max_avsync_ms                 = 50.0
+# Tighter than the desktop. This is battery and fan noise, and it is the number a user feels.
+max_added_cpu_frac            = 0.60
+max_osd_latency_ms            = 120.0
+
+# ── Run shape ────────────────────────────────────────────────────────────────────────────────────
+run_seconds                   = 120
+warmup_ms                     = 5000
+sample_interval_ms            = 500
+
+# ── Laptop-specific checks ───────────────────────────────────────────────────────────────────────
+# Repeats the whole baseline/composited pair unplugged. The single most valuable laptop measurement.
+test_on_battery               = true
+# A sustained pass, to catch throttling that a two-minute run misses entirely.
+thermal_soak_minutes          = 10
+check_refresh_match           = true
+# Hybrid machines often render on the iGPU regardless. Report which GPU actually drove it rather
+# than assuming.
+expect_discrete_gpu           = false
