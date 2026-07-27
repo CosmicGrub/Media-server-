@@ -285,26 +285,66 @@ fn setup() -> ExitCode {
     // PowerShell does the work: it is present on every supported Windows, handles TLS and redirects,
     // and `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
     // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
+    // PowerShell does the work: present on every supported Windows, handles TLS and redirects, and
+    // `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
+    // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
+    //
+    // SourceForge first because that is the source mpv.io itself links to for Windows, and its URL
+    // shape is stable. GitHub is the fallback: its API is rate-limited unauthenticated, which is
+    // fine for one call but not something to depend on first.
     let script = r#"
 $ErrorActionPreference = 'Stop'
 $dest = $args[0]
 $tmp  = Join-Path $env:TEMP ("lumen-mpv-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
+$ProgressPreference = 'SilentlyContinue'
+
+function Get-Url {
+  try {
+    Write-Host 'Looking up the latest mpv build (sourceforge)...'
+    $listing = Invoke-WebRequest -UseBasicParsing -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
+    $vers = [regex]::Matches($listing.Content, 'mpv-(\d+\.\d+\.\d+)-x86_64\.7z') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
+    if ($vers) {
+      $v = $vers[-1]
+      Write-Host ("  mpv " + $v)
+      return "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
+    }
+  } catch { Write-Host '  sourceforge lookup failed, trying github' }
+  try {
+    $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest' -Headers @{ 'User-Agent' = 'lumen' }
+    $a = $rel.assets | Where-Object { $_.name -like 'mpv-x86_64-2*' -and $_.name -like '*.7z' -and $_.name -notlike '*v3*' } | Select-Object -First 1
+    if ($a) { Write-Host ("  " + $a.name); return $a.browser_download_url }
+  } catch { }
+  return $null
+}
+
 try {
-  Write-Host 'Locating the latest build...'
-  $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest' -Headers @{ 'User-Agent' = 'lumen' }
-  $asset = $rel.assets | Where-Object { $_.name -like 'mpv-x86_64-2*' -and $_.name -like '*.7z' -and $_.name -notlike '*v3*' } | Select-Object -First 1
-  if (-not $asset) { throw 'no matching x86_64 asset in the latest release' }
-  $archive = Join-Path $tmp $asset.name
-  Write-Host ("Downloading " + $asset.name + " (" + [math]::Round($asset.size/1MB,1) + " MB)...")
-  Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archive -UseBasicParsing
+  $url = Get-Url
+  if (-not $url) { throw 'could not find an mpv download' }
+  $archive = Join-Path $tmp 'mpv.7z'
+  Write-Host 'Downloading (about 30 MB)...'
+  Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+  if ((Get-Item $archive).Length -lt 1MB) { throw 'the download is too small to be an mpv build' }
+
   Write-Host 'Extracting...'
-  # tar.exe is libarchive and reads 7-Zip. 7z.exe is tried first if the user happens to have it.
-  if (Get-Command 7z -ErrorAction SilentlyContinue) { & 7z x $archive ("-o" + $tmp) -y | Out-Null }
-  else { & tar -xf $archive -C $tmp }
+  $extracted = $false
+  # 7z if the user has it; otherwise tar.exe, which is libarchive and reads 7-Zip.
+  foreach ($try in @(
+      { & 7z x $archive ('-o' + $tmp) -y | Out-Null },
+      { & tar -xf $archive -C $tmp })) {
+    try { & $try; if (Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse) { $extracted = $true; break } }
+    catch { }
+  }
+  if (-not $extracted) {
+    throw 'could not unpack the archive. Install 7-Zip (https://7-zip.org) and run setup again, or extract mpv.exe by hand.'
+  }
+
   $found = Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse | Select-Object -First 1
-  if (-not $found) { throw 'mpv.exe was not in the archive' }
   Copy-Item $found.FullName (Join-Path $dest 'mpv.exe') -Force
+  # Shader compilation on the older D3D paths wants this; it ships in the upstream archive.
+  $d3d = Get-ChildItem -Path $tmp -Filter 'd3dcompiler_*.dll' -Recurse | Select-Object -First 1
+  if ($d3d) { Copy-Item $d3d.FullName $dest -Force }
   Write-Host ('Installed mpv.exe into ' + $dest)
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
