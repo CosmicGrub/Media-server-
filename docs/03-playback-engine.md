@@ -291,7 +291,16 @@ libmpv does not apply. The web tier is:
 ## 10. Conformance corpus (build this in week 2)
 
 Automated per-platform playback tests against a curated set of genuinely hard files. Store as small clipped samples
-(a few seconds each) with expected-outcome manifests. Minimum set:
+(a few seconds each) with expected-outcome manifests.
+
+> **This section is the seed list.** It has been superseded and expanded by the full compatibility specification:
+> [`11-compatibility-charter.md`](11-compatibility-charter.md) (the guarantee, the complete format matrix, the
+> quality/resolution spectrum), [`12-container-conformance.md`](12-container-conformance.md) (the exhaustive MP4 and
+> MKV surface), [`13-remux-transcode-matrix.md`](13-remux-transcode-matrix.md) (remux legality and transcode
+> matrices), and the machine-readable corpus in [`../conformance/`](../conformance/) — ~181 target vectors with
+> per-platform expected tiers. Build against those; the 20 below are the highest-value starting subset.
+
+Minimum set:
 
 | # | File characteristic | Tests |
 |---|---|---|

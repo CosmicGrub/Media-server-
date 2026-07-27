@@ -48,7 +48,11 @@ No server. No accounts. Open a file or a network share and play it.
 - Android shell: phone + Android TV, same feature set
 - Shader/enhancement presets (Anime4K, CAS, deband) — an early, visible differentiator
 - Frame-rate/display-mode matching
-- Conformance corpus 1–20 green on both platforms in CI
+- **The Universal Play Guarantee ([`11`](11-compatibility-charter.md) G0–G2) fully implemented**: content-probing
+  over extension trust, the 10-rung recovery ladder ([`12`](12-container-conformance.md) §5), the complete MKV and
+  MP4 feature surface, track auto-selection rules, and 64-bit rational timestamps end to end
+- **Conformance corpus green on both platforms in CI** — the full seed set in [`../conformance/corpus.yaml`](../conformance/corpus.yaml),
+  not just the 20-file subset. This is the release gate, not a stretch goal.
 - LGPL build pipeline + license gate + SBOM + Legal screen
 
 **Why this ships alone:** "mpv's engine with a good UI, on desktop and Android TV, that plays remuxes bit-perfectly
@@ -146,7 +150,9 @@ local player + library on desktop and Android" is a real, defensible product. "4
 ## 11. Milestone definition of done
 
 Every phase must satisfy all of these before it's called done:
-1. Conformance corpus green on every shipped platform
+1. **Conformance corpus at expected tier or better on every shipped platform** ([`../conformance/`](../conformance/)).
+   No waivers. A platform limitation is expressed as a documented `overrides:` entry matching the published
+   capability matrix ([`04`](04-platform-strategy.md) §7) — never as a skipped vector.
 2. Non-functional targets from [`02-architecture.md`](02-architecture.md) §7 met and tracked in CI
 3. License gate green, SBOM published, Legal screen accurate
 4. Zero known data-loss bugs

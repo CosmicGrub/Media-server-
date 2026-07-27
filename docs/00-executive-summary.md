@@ -104,6 +104,10 @@ only defensible design. See [`06-plugin-system.md`](06-plugin-system.md).
 | [`08-legal-licensing.md`](08-legal-licensing.md) | FFmpeg/mpv licensing, codec patents, App Store conflicts, metadata provider ToS, DRM |
 | [`09-roadmap.md`](09-roadmap.md) | Phasing, milestones, team shape, effort estimates, kill criteria |
 | [`10-research-plan.md`](10-research-plan.md) | The open questions, spikes to run, sources to read, conformance corpus |
+| [`11-compatibility-charter.md`](11-compatibility-charter.md) | **The Universal Play Guarantee.** Playback tiers, the complete container/codec/subtitle matrix, the full quality and resolution spectrum, and the honest list of what cannot work |
+| [`12-container-conformance.md`](12-container-conformance.md) | **"Every MP4 and MKV plays perfectly."** The exhaustive Matroska and ISOBMFF feature surface, track auto-selection rules, and the universal recovery ladder |
+| [`13-remux-transcode-matrix.md`](13-remux-transcode-matrix.md) | Remux legality per codec×container, transcode decision matrices for video/audio/subtitles, segmented delivery, offline optimize jobs |
+| [`../conformance/`](../conformance/) | The machine-readable corpus that proves 11–13, with per-platform expected tiers |
 | [`adr/`](adr/) | Architecture Decision Records for the load-bearing choices |
 
 ## 7. Honest risks

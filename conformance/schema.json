@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lumen.invalid/conformance/schema.json",
+  "title": "Lumen conformance corpus manifest",
+  "type": "object",
+  "required": ["version", "vectors"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "defaults": { "$ref": "#/$defs/vectorBody" },
+    "vectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/vector" }
+    }
+  },
+
+  "$defs": {
+    "tier": { "enum": ["T0", "T1", "T2", "T3", "T4", "T5"] },
+
+    "platform": {
+      "enum": ["windows", "macos", "linux", "android", "androidtv", "ios", "tvos", "web"]
+    },
+
+    "group": {
+      "enum": [
+        "mkv-core", "mkv-chapters", "mkv-damage",
+        "mp4-core", "mp4-fragmented", "mp4-damage",
+        "codec-video", "codec-audio", "subtitles", "spectrum"
+      ]
+    },
+
+    "tolerantNumber": {
+      "type": "object",
+      "required": ["value"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "number" },
+        "tolerance": { "type": "number", "minimum": 0, "default": 0 }
+      }
+    },
+
+    "source": {
+      "type": "object",
+      "description": "Exactly one acquisition method must be present: file, generate, origin, or reuse.",
+      "properties": {
+        "file": { "type": "string", "description": "Path relative to conformance/, tracked in git-lfs." },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "generate": { "type": "string", "description": "Reproducible command or recipe reference." },
+        "origin": { "type": "string", "description": "Provenance for third-party vectors." },
+        "reuse": { "type": "string", "description": "id of another vector whose media this reuses." },
+        "license": {
+          "enum": ["redistributable", "cc-by", "cc0", "public-domain", "generated"],
+          "description": "Nothing enters the corpus without a redistributable license or a generation recipe."
+        },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      },
+      "anyOf": [
+        { "required": ["file"] },
+        { "required": ["generate"] },
+        { "required": ["origin"] },
+        { "required": ["reuse"] }
+      ],
+      "dependentRequired": { "file": ["sha256"] },
+      "additionalProperties": false
+    },
+
+    "streamExpectation": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["video", "audio", "subtitle", "attachment", "data"] },
+        "codec": { "type": "string" },
+        "profile": { "type": "string" },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "bit_depth": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "pix_fmt": { "type": "string" },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "sample_rate": { "type": "integer", "minimum": 1 },
+        "language": { "type": "string" },
+        "flag_forced": { "type": "boolean" },
+        "flag_default": { "type": "boolean" },
+        "flag_original": { "type": "boolean" }
+      }
+    },
+
+    "expectations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "plays": { "type": "boolean", "default": true },
+        "tier": { "$ref": "#/$defs/tier" },
+
+        "recovery_rung": {
+          "type": "integer", "minimum": 0, "maximum": 10,
+          "description": "Max acceptable rung from docs/12 §5. Catches regressions where a file still plays but only via a slow fallback."
+        },
+
+        "streams": { "type": "array", "items": { "$ref": "#/$defs/streamExpectation" } },
+
+        "duration_s": { "$ref": "#/$defs/tolerantNumber" },
+        "first_frame_pts_s": { "$ref": "#/$defs/tolerantNumber" },
+        "virtual_timeline_duration_s": { "$ref": "#/$defs/tolerantNumber" },
+        "display_aspect": { "$ref": "#/$defs/tolerantNumber" },
+
+        "frame_hashes": { "type": "string", "description": "Path to a golden per-frame hash list." },
+        "subtitle_render_hash": { "type": "string" },
+        "perceptual_score": {
+          "type": "object",
+          "required": ["metric", "min", "against"],
+          "additionalProperties": false,
+          "properties": {
+            "metric": { "enum": ["ssimulacra2", "vmaf", "butteraugli", "psnr"] },
+            "min": { "type": "number" },
+            "against": { "type": "string" }
+          }
+        },
+
+        "av_sync_ms": {
+          "type": "object",
+          "required": ["max_drift"],
+          "additionalProperties": false,
+          "properties": { "max_drift": { "type": "number", "minimum": 0 } }
+        },
+        "dropped_frames": {
+          "type": "object", "required": ["max"], "additionalProperties": false,
+          "properties": { "max": { "type": "integer", "minimum": 0 } }
+        },
+        "bytes_read_before_first_frame": {
+          "type": "object", "required": ["max"], "additionalProperties": false,
+          "properties": { "max": { "type": "integer", "minimum": 0 } }
+        },
+        "timeout_s": { "type": "number", "minimum": 1 },
+
+        "reasons_absent": {
+          "type": "array", "items": { "type": "string" },
+          "description": "RejectReason variants (docs/03 §6) that must NOT appear. This is how 'no needless transcoding' is enforced."
+        },
+        "reasons_present": { "type": "array", "items": { "type": "string" } },
+        "message_contains": { "type": "array", "items": { "type": "string" } },
+
+        "decode_path": { "enum": ["hardware", "software", "either"] },
+        "audio_path": {
+          "enum": ["passthrough", "decode_to_lpcm", "core_extraction", "exclusive_bitperfect",
+                   "dsd_native_or_dop", "pcm_conversion", "downmix", "transcode"]
+        },
+        "subtitle_delivery": { "enum": ["in_band", "out_of_band", "burned_in"] },
+        "sink_reports": { "type": "string", "description": "Expected AVR/sink format readout, for passthrough vectors." },
+
+        "video_reencoded": { "type": "boolean" },
+        "reencoded": { "type": "boolean" },
+        "resampled": { "type": "boolean" },
+        "cfr_converted": { "type": "boolean" },
+        "deinterlaced": { "type": "boolean" },
+        "field_order_detected": { "type": "boolean" },
+        "film_grain_applied": { "type": "boolean" },
+        "ivtc_offered": { "type": "boolean" },
+        "seekable": { "type": "boolean" },
+        "seek_accurate": { "type": "boolean" },
+        "seek_clean": { "type": "boolean" },
+        "dynamic_metadata_used": { "type": "boolean" },
+
+        "output_sample_rate": { "type": "integer", "minimum": 1 },
+        "resolution_changes": { "type": "integer", "minimum": 0 },
+        "chapters_count": { "type": "integer", "minimum": 0 },
+        "editions_exposed": { "type": "integer", "minimum": 0 },
+        "selected_edition": { "type": "integer", "minimum": 1 },
+        "subtitle_tracks_detected": {
+          "type": "object", "additionalProperties": false,
+          "properties": { "min": { "type": "integer" }, "max": { "type": "integer" } }
+        },
+        "selected_audio": { "$ref": "#/$defs/streamExpectation" },
+        "selected_subtitle": { "$ref": "#/$defs/streamExpectation" },
+        "cropped_geometry": {
+          "type": "object", "required": ["width", "height"], "additionalProperties": false,
+          "properties": { "width": { "type": "integer" }, "height": { "type": "integer" } }
+        },
+        "metadata_present": { "type": "array", "items": { "type": "string" } },
+        "charset_detected": { "type": "string" },
+        "duration_reported": { "enum": ["exact", "approximate", "unknown"] },
+        "dv_profile_detected": { "type": "string" },
+        "dv_layer_used": { "enum": ["base", "enhancement", "combined"] },
+        "tone_map_curve": { "enum": ["bt2390", "spline", "mobius", "reinhard", "hable", "st2094-40", "st2094-10"] },
+        "notes": { "type": "string" }
+      }
+    },
+
+    "vectorBody": {
+      "type": "object",
+      "properties": {
+        "severity": { "enum": ["blocking", "high", "medium"], "default": "blocking" },
+        "platforms": { "type": "array", "items": { "$ref": "#/$defs/platform" }, "minItems": 1 },
+        "expect": { "$ref": "#/$defs/expectations" },
+        "properties": { "type": "object", "description": "Free-form: what makes this vector interesting." },
+        "overrides": {
+          "type": "object",
+          "description": "Per-platform expectation overrides. An override is a documented limitation that must match the published capability matrix (docs/04 §7), never a waiver.",
+          "propertyNames": { "$ref": "#/$defs/platform" },
+          "additionalProperties": { "$ref": "#/$defs/expectations" }
+        }
+      }
+    },
+
+    "vector": {
+      "allOf": [
+        { "$ref": "#/$defs/vectorBody" },
+        {
+          "type": "object",
+          "required": ["id", "group", "title", "spec"],
+          "properties": {
+            "id": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
+            "group": { "$ref": "#/$defs/group" },
+            "title": { "type": "string", "minLength": 4 },
+            "spec": {
+              "type": "array", "minItems": 1,
+              "items": { "type": "string", "pattern": "^[0-9]{2}#[0-9](\\.[0-9]+)?$" },
+              "description": "Doc anchors this vector proves, e.g. \"12#2.4\"."
+            },
+            "status": { "enum": ["defined", "planned"], "default": "defined" },
+            "source": { "$ref": "#/$defs/source" },
+            "notes": { "type": "string" }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "planned" } }, "required": ["status"] },
+          "then": true,
+          "else": { "required": ["source", "expect"] }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

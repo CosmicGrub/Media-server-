@@ -27,6 +27,11 @@ decision it unblocks.
 | R13 | Do **hardware tone-mapping** paths (Vulkan/libplacebo, OpenCL) hold real-time 4K on a $100 Arc A310 / a 5-year-old iGPU? | Benchmark transcode with HDR→SDR on representative hardware |
 | R14 | What does the **display-mode switching** API look like on each platform, and how reliable is it? | Per-platform spike: `AVDisplayManager` (tvOS), `Display.Mode` (Android), DXGI/`SetDisplayConfig` (Win), DRM/KMS + Wayland (Linux) |
 | R15 | Which **embedding model** gives the best quality/size for subtitle semantic search on CPU? | Benchmark `bge-small`, `all-MiniLM-L6-v2`, `gte-small` on a labelled scene-retrieval set; measure latency on a Raspberry Pi 5 and an N100 |
+| R22 | How much of the **MP4 `moov` reconstruction** (untrunc technique) can be done generically vs. per-codec? | Prototype against 20 truncated recordings from phones/cameras/interrupted downloads; measure recovery rate per codec ([`12`](12-container-conformance.md) §3.7) |
+| R23 | What is the correct resolution order when **container colour metadata disagrees with in-band VUI**? | Survey real files from common muxers; determine which source is right more often. Current assumption: prefer in-band, warn, expose an override ([`12`](12-container-conformance.md) §2.6) |
+| R24 | Which **Matroska segment-linking** structures appear in the wild vs. only in test suites? | Survey a large anime/remux corpus; prioritise implementation by real frequency ([`12`](12-container-conformance.md) §2.4) |
+| R25 | Does **CPU-only H.264 encoding without x264** (LGPL constraint) produce acceptable quality for live transcode? | Benchmark `libavcodec` native H.264, SVT-AV1, and hardware encoders against x264 on VMAF/SSIMULACRA2 at matched bitrates. Feeds the ADR-0002 escape hatch. |
+| R26 | Real-world **Direct Play rate** per client on a representative library? | Instrument the ladder against a 5,000-file survey library; this is the headline metric from [`13`](13-remux-transcode-matrix.md) §8 |
 
 ## 3. Should-answer-before-P3 (server)
 
@@ -104,7 +109,10 @@ Blu-ray sections, doom9 (still the best place for codec and remux depth), the mp
 
 ## 7. Deliverables from this research phase
 
-- [ ] Conformance corpus assembled (20 clips + manifests) and committed
+- [x] Conformance corpus **specified** — manifest schema and seed vectors committed in [`../conformance/`](../conformance/)
+- [ ] Conformance corpus **assembled** — media acquired/generated for every `status: defined` vector, checksums recorded
+- [ ] `status: planned` vectors promoted to defined (see `runner/coverage.py` for the current gap per group)
+- [ ] Conformance runner implemented and wired into CI on all platforms
 - [ ] Competitor comparison matrix filled in for all 20 files × 5 products × 4 platforms
 - [ ] LGPL feature-delta report (R1)
 - [ ] Sink-probing capability report per OS (R12)
