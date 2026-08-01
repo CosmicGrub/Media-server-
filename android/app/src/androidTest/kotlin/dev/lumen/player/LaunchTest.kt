@@ -4,8 +4,10 @@ import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.rule.GrantPermissionRule
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -19,6 +21,23 @@ import org.junit.runner.RunWith
  */
 @RunWith(AndroidJUnit4::class)
 class LaunchTest {
+
+    /**
+     * Media access, granted before anything launches.
+     *
+     * Without this the first run of these tests failed with "Activity never becomes requested state
+     * RESUMED (last transition = PAUSED)" — and that was correct behaviour, not a flake. The app
+     * requests the permission from a `LaunchedEffect` on first composition, so the system dialog
+     * covers the Activity and holds it at PAUSED until someone answers. Nobody answers on a headless
+     * emulator.
+     *
+     * Granting it up front tests the path a returning user actually takes. The denied path is a
+     * different question and cannot be checked with `ActivityScenario`, which itself blocks until
+     * RESUMED — the fix that came out of it was to make the denied state recoverable at all.
+     */
+    @get:Rule
+    val permission: GrantPermissionRule =
+        GrantPermissionRule.grant(android.Manifest.permission.READ_MEDIA_VIDEO)
 
     @Test
     fun theActivityReachesResumedWithoutCrashing() {

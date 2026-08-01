@@ -58,6 +58,9 @@ fun PlayerScreen(
     vm: PlayerViewModel,
     contentPadding: androidx.compose.foundation.layout.PaddingValues =
         androidx.compose.foundation.layout.PaddingValues(0.dp),
+    /// Re-requests media access, or opens settings when the permission is permanently denied.
+    /// Supplied by the host so this screen holds no permission mechanics.
+    onRequestAccess: () -> Unit = {},
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val posture by rememberPosture()
@@ -69,11 +72,11 @@ fun PlayerScreen(
     val isWide = config.screenWidthDp >= 600
 
     when (val p = posture) {
-        is Posture.Tabletop -> TabletopLayout(vm, state, p, contentPadding)
-        is Posture.Book -> BookLayout(vm, state, contentPadding)
+        is Posture.Tabletop -> TabletopLayout(vm, state, p, contentPadding, onRequestAccess)
+        is Posture.Book -> BookLayout(vm, state, contentPadding, onRequestAccess)
         Posture.Flat ->
-            if (isWide) WideLayout(vm, state, contentPadding)
-            else TallLayout(vm, state, contentPadding)
+            if (isWide) WideLayout(vm, state, contentPadding, onRequestAccess)
+            else TallLayout(vm, state, contentPadding, onRequestAccess)
     }
 }
 
@@ -91,6 +94,7 @@ private fun TabletopLayout(
     state: UiState,
     p: Posture.Tabletop,
     contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
 ) {
     val density = LocalDensity.current
     val topHeightDp = with(density) { p.hingeTopPx.toDp() }
@@ -115,7 +119,7 @@ private fun TabletopLayout(
                 .padding(horizontal = 12.dp)
         ) {
             NowPlayingBar(state, vm)
-            LibraryList(state, vm, Modifier.fillMaxSize())
+            LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
         }
     }
 }
@@ -123,13 +127,22 @@ private fun TabletopLayout(
 /** Half-open held like a book: video one side, library the other. */
 @UnstableApi
 @Composable
-private fun BookLayout(vm: PlayerViewModel, state: UiState, contentPadding: PaddingValues) =
-    WideLayout(vm, state, contentPadding)
+private fun BookLayout(
+    vm: PlayerViewModel,
+    state: UiState,
+    contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+) = WideLayout(vm, state, contentPadding, onRequestAccess)
 
 /** Inner display, flat. Nearly square, so the two panes sit side by side. */
 @UnstableApi
 @Composable
-private fun WideLayout(vm: PlayerViewModel, state: UiState, contentPadding: PaddingValues) {
+private fun WideLayout(
+    vm: PlayerViewModel,
+    state: UiState,
+    contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+) {
     Row(Modifier.fillMaxSize()) {
         Box(
             Modifier
@@ -149,7 +162,7 @@ private fun WideLayout(vm: PlayerViewModel, state: UiState, contentPadding: Padd
                 .padding(12.dp)
         ) {
             NowPlayingBar(state, vm)
-            LibraryList(state, vm, Modifier.fillMaxSize())
+            LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
         }
     }
 }
@@ -157,7 +170,12 @@ private fun WideLayout(vm: PlayerViewModel, state: UiState, contentPadding: Padd
 /** Cover screen. Too narrow for anything but a stack. */
 @UnstableApi
 @Composable
-private fun TallLayout(vm: PlayerViewModel, state: UiState, contentPadding: PaddingValues) {
+private fun TallLayout(
+    vm: PlayerViewModel,
+    state: UiState,
+    contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+) {
     Column(Modifier.fillMaxSize()) {
         Box(
             Modifier
@@ -177,7 +195,7 @@ private fun TallLayout(vm: PlayerViewModel, state: UiState, contentPadding: Padd
                 .padding(horizontal = 12.dp)
         ) {
             NowPlayingBar(state, vm)
-            LibraryList(state, vm, Modifier.fillMaxSize())
+            LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
         }
     }
 }
@@ -242,14 +260,18 @@ private fun NowPlayingBar(state: UiState, vm: PlayerViewModel) {
 private fun LibraryList(
     state: UiState,
     vm: PlayerViewModel,
+    onRequestAccess: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     when {
+        // `onRequestAccess`, not `vm.refresh()`. Refresh only re-queries MediaStore, which without
+        // the permission returns nothing and leaves this screen exactly as it was — a button that
+        // appears to do nothing, and no route back into the app for anyone who denied once.
         !state.permissionGranted -> Box(modifier, contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("Media access is needed to list your videos.")
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = { vm.refresh() }) { Text("Retry") }
+                Button(onClick = onRequestAccess) { Text("Grant access") }
             }
         }
 
