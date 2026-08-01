@@ -158,7 +158,10 @@ jobs:
           # No window, no audio, no boot animation — this is the headless part.
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: ./gradlew --no-daemon connectedDebugAndroidTest -Pandroid.injected.testOnly=false -PemulatorAbi=x86_64
+          # `cd android` is load-bearing: the emulator-runner action runs `script` from the
+          # repository root and does NOT inherit the job's `defaults.run.working-directory`, so a
+          # bare `./gradlew` fails with "not found" after the emulator has already booted.
+          script: cd android && ./gradlew --no-daemon connectedDebugAndroidTest -PemulatorAbi=x86_64
 
       - name: Upload on-device test report
         if: always()
