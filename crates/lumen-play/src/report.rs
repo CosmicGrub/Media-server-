@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::json::quote;
-use crate::scan::{MediaKind, Scan, ScannedFile, group};
+use crate::scan::{MediaKind, Scan, ScannedFile, duplicate_groups, group};
 use crate::session::{FileResult, Outcome, SessionReport};
 
 fn human_size(bytes: u64) -> String {
@@ -89,6 +89,33 @@ pub fn render_scan(scan: &Scan) -> String {
         }
         if flagged.len() > 40 {
             s.push_str(&format!("  ... and {} more (--json for all)\n", flagged.len() - 40));
+        }
+    }
+
+    // Same bytes under different names. Invisible to any filename-based check, which is exactly why
+    // a library accumulates them.
+    let dupes = duplicate_groups(scan);
+    if !dupes.is_empty() {
+        let wasted: u64 =
+            dupes.iter().map(|g| g.iter().skip(1).map(|&i| scan.files[i].size).sum::<u64>()).sum();
+        s.push_str(&format!(
+            "\nduplicate content ({} {}, {} recoverable)\n",
+            dupes.len(),
+            if dupes.len() == 1 { "group" } else { "groups" },
+            human_size(wasted)
+        ));
+        for g in dupes.iter().take(15) {
+            for (n, &i) in g.iter().enumerate() {
+                let marker = if n == 0 { "  " } else { "  = " };
+                s.push_str(&format!(
+                    "{marker}{}\n",
+                    ellipsize(&scan.files[i].path.to_string_lossy(), 84)
+                ));
+            }
+            s.push('\n');
+        }
+        if dupes.len() > 15 {
+            s.push_str(&format!("  ... and {} more groups\n", dupes.len() - 15));
         }
     }
 
@@ -272,8 +299,8 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
         .map(|f| {
             format!(
                 "    {{\"path\":{},\"size\":{},\"kind\":{:?},\"container\":{},\"confidence\":{},\
-                 \"evidence\":{},\"extension_mismatch\":{},\"unidentified\":{},\"title\":{},\"year\":{},\
-                 \"notes\":[{}]}}",
+                 \"evidence\":{},\"extension_mismatch\":{},\"unidentified\":{},\"identity\":{},\
+                 \"title\":{},\"year\":{},\"notes\":[{}]}}",
                 quote(&f.path.to_string_lossy()),
                 f.size,
                 format!("{:?}", f.kind),
@@ -282,6 +309,7 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
                 opt_str(f.evidence),
                 f.extension_mismatch,
                 f.unidentified,
+                opt_str(f.identity.map(lumen_identity::ContentSketch::to_hex).as_deref()),
                 quote(&f.parsed.title),
                 opt_num(f.parsed.year),
                 f.notes().iter().map(|n| quote(n)).collect::<Vec<_>>().join(",")

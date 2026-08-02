@@ -40,6 +40,7 @@ Options
   --seconds <n>       play only n seconds of each file (default 20 for `test`)
   --limit <n>         stop after n playable files
   --depth <n>         maximum directory depth
+  --identify          compute a content identity per file and report duplicates
   --include-samples   keep files that look like sample clips
   --shuffle           play in random order
   --windowed          do not go fullscreen
@@ -139,6 +140,7 @@ fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
     }
 
     let opts = ScanOptions {
+        identify: flag(args, "--identify"),
         include_samples: flag(args, "--include-samples"),
         limit: value(args, "--limit").and_then(|v| v.parse().ok()),
         max_depth: value(args, "--depth").and_then(|v| v.parse().ok()),

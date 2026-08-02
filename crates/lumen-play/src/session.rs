@@ -691,6 +691,7 @@ mod tests {
             evidence: None,
             extension_mismatch: false,
             unidentified: false,
+            identity: None,
             parsed: lumen_match::parse("a.mkv"),
         }
     }

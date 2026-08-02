@@ -54,6 +54,7 @@ library that stutters on a machine with no hardware decoder is a driver finding,
 
 ```bash
 lumen scan  ~/Media                      # what is in there, and what looks wrong
+lumen scan  ~/Media --identify           # also find duplicate content
 lumen items ~/Media                      # the collection, grouped into films and seasons
 lumen play  ~/Media                      # watch it
 lumen test  ~/Media --seconds 20         # open every file briefly, report which fail
@@ -84,6 +85,11 @@ Beyond pass/fail, four things a play-through by hand would not surface:
 - **Unseekable files.** Plays forward, cannot be navigated: a lost Matroska Cues element or an
   unusable MP4 `moov`. A play-through test never notices, because playing forward still works. You
   find out the first time you try to skip.
+- **Duplicate content** (with `--identify`). The same bytes under two different release names —
+  invisible to any filename-based check, which is exactly why a library accumulates them. Identity
+  is content-derived, so it survives rename, move and remount. Off by default: it reads up to 3 MiB
+  a file against the sniffer's 4 KiB, which over a network share is the difference between seconds
+  and an afternoon.
 - **HDR.** Decided by the transfer function (`pq`, `hlg`), not the primaries — BT.2020 with a
   conventional gamma curve is wide-gamut SDR, and conflating the two would misreport a distinction
   this product exists to get right.
@@ -94,6 +100,7 @@ Beyond pass/fail, four things a play-through by hand would not surface:
 --seconds <n>       play only n seconds of each file (default 20 for `test`)
 --limit <n>         stop after n playable files
 --depth <n>         maximum directory depth
+--identify          content identity per file; finds duplicates (extra I/O)
 --include-samples   keep files that look like sample clips
 --shuffle           play in random order
 --windowed          do not go fullscreen
@@ -124,7 +131,8 @@ cannot race a property read. See Status below for the bug this replaced.
 freely, so a property read at the wrong moment would swallow the `end-file` event carrying the reason
 a file failed, and the outcome would silently become "unknown".
 
-Zero dependencies beyond the workspace's own crates, including a hand-written JSON reader — mpv's
+One external dependency, reached transitively: `lumen-identity` uses `xxhash-rust` for the content
+sketch. Everything else is the workspace's own crates plus a hand-written JSON reader — mpv's
 events carry file paths, and a path is exactly the kind of string full of braces, commas and quotes
 that substring matching gets wrong silently.
 
