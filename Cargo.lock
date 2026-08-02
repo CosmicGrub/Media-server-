@@ -130,9 +130,11 @@ version = "0.1.0"
 name = "lumen-play"
 version = "0.1.0"
 dependencies = [
+ "lumen-caps",
  "lumen-identity",
  "lumen-match",
  "lumen-model",
+ "lumen-playback",
  "lumen-probe",
 ]
 

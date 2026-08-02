@@ -93,6 +93,37 @@ Beyond pass/fail, four things a play-through by hand would not surface:
 - **HDR.** Decided by the transfer function (`pq`, `hlg`), not the primaries — BT.2020 with a
   conventional gamma curve is wide-gamut SDR, and conflating the two would misreport a distinction
   this product exists to get right.
+- **Fidelity tier per file, on two endpoints.** See below.
+
+## Fidelity: how well it played, and what it would cost elsewhere
+
+"It played" is the floor, not the charter. Every file that opens is put through the real decision
+ladder (`lumen-playback`) against two declared capability profiles (`lumen-caps`), and the run
+reports the T0–T5 tier from `docs/11` §1.1 that each would reach:
+
+```
+fidelity (7 files) — modelled from what each file demuxed, not measured
+  native   T0 3  T1 3  T3 1
+  browser  T1 5  T3 2
+  1 play untouched on a native client and cannot in a browser
+
+below T2 natively (1) — adapted even on a fully capable client
+  Old Movie (1998)  T3
+      This device has no decoder for Mpeg4Part2.
+```
+
+The two profiles are the ends of the range a multi-platform product has to live across: a native
+client with Matroska, hardware HEVC/AV1, an HD AVR and an HDR display; and a browser, which is
+fMP4/WebM only, stereo PCM, SDR, text subtitles. A UHD remux that reaches T0 on the first and T3 on
+the second is not a defect — it is the fact you need before promising the file plays "everywhere".
+
+**Modelled, not measured, and labelled that way.** The stream description is a real demux of a real
+file, so the input is observation. The endpoint is a declared profile, so the output is what those
+capabilities *would* yield, not what any particular device did. Every degraded outcome carries the
+ladder's own reasons (guarantee G1, `docs/11`), so a tier is never a number without a cause.
+
+Files that did not open get `null` rather than `T5`: a tier for a file that never demuxed would be
+fiction, and `null` says so where a default would not.
 
 ## Options
 
@@ -131,6 +162,10 @@ cannot race a property read. See Status below for the bug this replaced.
 freely, so a property read at the wrong moment would swallow the `end-file` event carrying the reason
 a file failed, and the outcome would silently become "unknown".
 
+**The fidelity assessment uses mpv's own track selection, not ours.** This file really played, and
+describing a selection that did not happen would be a worse answer than the one in front of us.
+`lumen-playback`'s automatic selector stands in only when mpv marked nothing selected at all.
+
 One external dependency, reached transitively: `lumen-identity` uses `xxhash-rust` for the content
 sketch. Everything else is the workspace's own crates plus a hand-written JSON reader — mpv's
 events carry file paths, and a path is exactly the kind of string full of braces, commas and quotes
@@ -142,13 +177,20 @@ CI runs tests, clippy and rustfmt on Linux, macOS and Windows for every push, pl
 licence gate. The platform matrix is not decoration: the mpv IPC transport is a Unix socket on one
 and a named pipe on the other, and the environment probe shells out to different tools per OS.
 
-76 tests in this crate and 453 across the workspace, plus an end-to-end run of the Windows binary
-against real encoded media (H.264 in
-Matroska and MP4, MPEG-4 part 2 in AVI, and a deliberately corrupt file) under Wine: five files,
-four played, one correctly reported as `unrecognized file format`, every resolution and codec
-attributed to the right file, exit code 1.
+96 tests in this crate and 474 across the workspace, plus end-to-end runs against real encoded media.
 
-That last point was a bug the real run caught, and it is worth knowing about:
+The Windows binary under Wine (H.264 in Matroska and MP4, MPEG-4 part 2 in AVI, and a deliberately
+corrupt file): five files, four played, one correctly reported as `unrecognized file format`, every
+resolution and codec attributed to the right file, exit code 1.
+
+The Linux binary against an eight-file corpus encoded for the purpose — H.264/AAC in Matroska and
+MP4, H.264/FLAC, H.264/AC-3, VP9/Opus in WebM, HEVC 10-bit PQ with TrueHD in Matroska, MPEG-4 part 2
+with AC-3 in AVI, and a corrupt file: seven played, one correctly failed, and the fidelity model
+answered as it should on each. The HEVC/PQ/TrueHD remux reached T0 natively and T3 in a browser; the
+XviD-in-AVI file reached T3 on both, correctly attributed to the absent MPEG-4 part 2 decoder rather
+than to the container.
+
+Three bugs the real runs caught, all invisible to unit tests:
 
 - mpv given a playlist **on the command line** starts playing before this process can connect, so
   the first `start-file` event is gone before anything is listening.
@@ -161,6 +203,16 @@ wrong, and invisible without checking the output against known inputs. The playl
 over IPC after connecting, and results are keyed on `playlist_entry_id`, which rides on the events
 themselves and cannot race.
 
-**Not yet exercised:** real GPU decoding and rendering. The Wine verification ran with `--vo=null`
-on a machine with no GPU, so hardware decode paths, `gpu-next`, HDR tone mapping and frame pacing
-are still untested. `LUMEN_DEBUG_EVENTS=1` dumps the raw mpv event stream if something looks wrong.
+The Linux corpus run caught a second one, in the scanner rather than the player: **every WebM file
+was being identified as Matroska.** WebM and Matroska share the EBML magic and are separated only by
+the header's `DocType`, so both come back as candidates with equal confidence — and the tie-break
+used `max_by_key`, which returns the *last* maximum, quietly reversing the order `sniff` had
+deliberately sorted them into. The cost was not cosmetic: a browser opens WebM and cannot open
+Matroska, so every `.webm` in a library was reported as needing a remux it does not need. The probe
+now reads the `DocType`, and the scanner takes the first candidate rather than the last-strongest.
+
+**Not yet exercised:** real GPU decoding and rendering. Every verification so far ran with
+`--vo=null` on a machine with no GPU, so hardware decode paths, `gpu-next`, HDR tone mapping and
+frame pacing are still untested. The fidelity tiers are likewise modelled against declared profiles
+rather than measured on the devices they name. `LUMEN_DEBUG_EVENTS=1` dumps the raw mpv event stream
+if something looks wrong.

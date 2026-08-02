@@ -263,8 +263,12 @@ fn classify(path: &Path, size: u64, identify: bool) -> ScannedFile {
     // `sniff` always ends its list with a `Weak` raw-elementary-stream fallback, because the demuxer
     // is entitled to try that on anything. For classification it means the opposite of a match:
     // treating it as identification would make every text file in the tree a video.
-    let best =
-        candidates.iter().filter(|c| c.confidence > Confidence::Weak).max_by_key(|c| c.confidence);
+    //
+    // `find` rather than `max_by_key`: `sniff` returns candidates strongest-first and breaks ties in
+    // a meaningful order, and `max_by_key` returns the *last* maximum, which quietly reversed that.
+    // It cost every WebM file its identity — WebM and Matroska both match the EBML magic with equal
+    // confidence, and the tie went to the wrong one.
+    let best = candidates.iter().find(|c| c.confidence > Confidence::Weak);
     let container = best.map(|c| c.container);
     let ext_container = ext.as_deref().and_then(container_for_ext);
 
@@ -596,6 +600,24 @@ mod tests {
         assert!(same_family(Container::Matroska, Container::WebM));
         assert!(!same_family(Container::Matroska, Container::Mp4));
         assert!(!same_family(Container::Avi, Container::Mp4));
+    }
+
+    #[test]
+    fn a_webm_file_keeps_its_own_identity_rather_than_being_called_matroska() {
+        // WebM and Matroska share the EBML magic and are separated only by the header's `DocType`,
+        // so both come back with equal confidence and the tie-break decides. It used to go the wrong
+        // way, and the cost was not cosmetic: a browser opens WebM and cannot open Matroska, so
+        // every `.webm` in a library was reported as needing a remux it does not need.
+        let d = TempDir::new("webm");
+        let mut bytes = vec![0x1A, 0x45, 0xDF, 0xA3, 0x87, 0x42, 0x82, 0x84];
+        bytes.extend_from_slice(b"webm");
+        bytes.extend(std::iter::repeat_n(0u8, 100_000));
+        d.file("Doc.2012.720p.WEBRip.VP9.webm", &bytes);
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        let f = &s.files[0];
+        assert_eq!(f.container, Some(Container::WebM));
+        assert!(!f.extension_mismatch);
     }
 
     #[test]

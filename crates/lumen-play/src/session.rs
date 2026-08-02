@@ -89,6 +89,13 @@ pub struct FileResult {
     pub seekable: Option<bool>,
     pub audio_channels: Option<String>,
     pub track_counts: TrackCounts,
+    /// Every track the demuxer exposed, not only the selected one. The per-file properties above
+    /// describe what played; this describes what was *there*, which is what a fidelity decision
+    /// needs — a file whose second audio track is TrueHD is a different proposition from one that
+    /// only carries AAC, even when mpv chose the AAC either way.
+    pub tracks: Vec<TrackInfo>,
+    /// Fidelity tiers this file reaches, modelled from what the demuxer reported.
+    pub fidelity: Option<crate::fidelity::Fidelity>,
     /// Frames the video output presented late, over this file.
     pub delayed_frames: Option<u64>,
     pub dropped_frames: Option<u64>,
@@ -99,6 +106,37 @@ pub struct TrackCounts {
     pub video: usize,
     pub audio: usize,
     pub subtitle: usize,
+}
+
+/// One entry of mpv's `track-list`.
+///
+/// Deliberately stringly-typed at this layer: this is a transcription of what mpv said, and the
+/// translation into the workspace's codec enums happens in `fidelity`, where it can be tested
+/// against known names without a running mpv.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackInfo {
+    /// `video`, `audio` or `sub`.
+    pub kind: String,
+    pub id: u32,
+    /// FFmpeg's short codec name — `h264`, `dts`, `hdmv_pgs_subtitle`.
+    pub codec: Option<String>,
+    /// Codec profile where the build reports one. This is what separates DTS-HD MA from its DTS
+    /// core, and Main 10 from Main — distinctions the tier depends on.
+    pub codec_profile: Option<String>,
+    pub lang: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+    pub forced: bool,
+    pub external: bool,
+    pub selected: bool,
+    pub hearing_impaired: bool,
+    pub visual_impaired: bool,
+    pub channels: Option<u8>,
+    pub sample_rate: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub bitrate_bps: Option<u64>,
 }
 
 impl FileResult {
@@ -122,6 +160,8 @@ impl FileResult {
             seekable: None,
             audio_channels: None,
             track_counts: TrackCounts::default(),
+            tracks: Vec::new(),
+            fidelity: None,
             delayed_frames: None,
             dropped_frames: None,
         }
@@ -402,6 +442,12 @@ pub fn run(
                     // A file that loaded has, at minimum, opened. If it later errors the reason
                     // overwrites this; if the run is cut short, "played" is still the honest answer.
                     report.results[i].outcome = Outcome::Played;
+                    // Assessed after the outcome is set, because a file that has not played is
+                    // deliberately given no tier — and here, where the scanned file is in hand: the
+                    // ladder wants the sniffed container and the file size, neither of which mpv
+                    // reports.
+                    report.results[i].fidelity =
+                        crate::fidelity::assess(&report.results[i], files[i]);
                     progress(&report.results[i], i + 1, total);
                 }
             }
@@ -468,7 +514,52 @@ fn collect_properties(mpv: &mut Mpv, r: &mut FileResult) {
     r.audio_channels = mpv.get_string("audio-params/channel-count");
     if let Some(list) = mpv.get("track-list") {
         r.track_counts = count_tracks(&list);
+        r.tracks = parse_tracks(&list);
     }
+}
+
+/// Transcribe mpv's `track-list` into [`TrackInfo`].
+///
+/// Fields older mpv builds do not emit — `codec-profile` arrived in 0.38 — simply come back `None`
+/// rather than failing the entry, because a missing profile string must not cost us the track.
+pub fn parse_tracks(list: &Value) -> Vec<TrackInfo> {
+    fn flag(t: &Value, key: &str) -> bool {
+        t.get(key).and_then(Value::as_bool).unwrap_or(false)
+    }
+    fn text(t: &Value, key: &str) -> Option<String> {
+        t.get(key).and_then(Value::as_str).map(str::to_owned)
+    }
+    fn num(t: &Value, key: &str) -> Option<f64> {
+        t.get(key).and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0)
+    }
+
+    list.as_array()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|t| {
+            let kind = text(t, "type")?;
+            Some(TrackInfo {
+                kind,
+                id: num(t, "id").unwrap_or(0.0) as u32,
+                codec: text(t, "codec"),
+                codec_profile: text(t, "codec-profile"),
+                lang: text(t, "lang"),
+                title: text(t, "title"),
+                default: flag(t, "default"),
+                forced: flag(t, "forced"),
+                external: flag(t, "external"),
+                selected: flag(t, "selected"),
+                hearing_impaired: flag(t, "hearing-impaired"),
+                visual_impaired: flag(t, "visual-impaired"),
+                channels: num(t, "demux-channel-count").map(|v| v.min(255.0) as u8),
+                sample_rate: num(t, "demux-samplerate").map(|v| v as u32),
+                width: num(t, "demux-w").map(|v| v as u32),
+                height: num(t, "demux-h").map(|v| v as u32),
+                fps: num(t, "demux-fps"),
+                bitrate_bps: num(t, "demux-bitrate").map(|v| v as u64),
+            })
+        })
+        .collect()
 }
 
 /// Map mpv's playlist entry ids onto our own indices.

@@ -6,6 +6,9 @@
 
 use std::collections::BTreeMap;
 
+use lumen_playback::Tier;
+
+use crate::fidelity::{Fidelity, ProfileOutcome};
 use crate::json::quote;
 use crate::scan::{MediaKind, Scan, ScannedFile, duplicate_groups, group};
 use crate::session::{FileResult, Outcome, SessionReport};
@@ -244,6 +247,8 @@ pub fn render_session(rep: &SessionReport) -> String {
         }
     }
 
+    s.push_str(&render_fidelity(rep));
+
     let mut codecs: BTreeMap<String, usize> = BTreeMap::new();
     for r in rep.results.iter().filter(|r| r.outcome == Outcome::Played) {
         if let Some(c) = &r.video_codec {
@@ -273,6 +278,72 @@ pub fn render_session(rep: &SessionReport) -> String {
     s
 }
 
+/// How far each file's fidelity would go, per capability profile.
+///
+/// The section pass/fail cannot carry. "It played" on this machine says nothing about the phone or
+/// the browser tab, and the files that direct-play here and cannot anywhere else are precisely the
+/// ones a multi-platform product has to plan for.
+///
+/// Labelled as modelled, not measured, in the heading — the stream description is observed, the
+/// endpoint is a declared profile, and presenting a projection as a measurement would be the quiet
+/// overclaim `docs/11` §G1 forbids.
+pub fn render_fidelity(rep: &SessionReport) -> String {
+    let assessed: Vec<&Fidelity> = rep.results.iter().filter_map(|r| r.fidelity.as_ref()).collect();
+    if assessed.is_empty() {
+        return String::new();
+    }
+
+    let mut s = format!(
+        "\nfidelity ({} files) — modelled from what each file demuxed, not measured\n",
+        assessed.len()
+    );
+    s.push_str(&format!("  native   {}\n", histogram(assessed.iter().map(|f| &f.native))));
+    s.push_str(&format!("  browser  {}\n", histogram(assessed.iter().map(|f| &f.browser))));
+
+    let native_only = assessed.iter().filter(|f| f.native_only()).count();
+    if native_only > 0 {
+        s.push_str(&format!(
+            "  {native_only} play untouched on a native client and cannot in a browser\n"
+        ));
+    }
+
+    // Anything worse than T2 on a fully capable native client is the interesting case: the endpoint
+    // is as good as it gets and the file still costs fidelity, so the cause is in the file.
+    let mut degraded: Vec<&FileResult> = rep
+        .results
+        .iter()
+        .filter(|r| r.fidelity.as_ref().is_some_and(|f| f.native.tier > Tier::T2Preserved))
+        .collect();
+    degraded.sort_by_key(|r| std::cmp::Reverse(r.fidelity.as_ref().map(|f| f.native.tier)));
+    if !degraded.is_empty() {
+        s.push_str(&format!(
+            "\nbelow T2 natively ({}) — adapted even on a fully capable client\n",
+            degraded.len()
+        ));
+        for r in degraded.iter().take(15) {
+            let Some(f) = &r.fidelity else { continue };
+            s.push_str(&format!("  {}  {}\n", ellipsize(&r.label, 56), f.native.tier.as_key()));
+            // The first rejection is the one that cost the tier; the rest are detail.
+            if let Some(why) = f.native.reasons.first() {
+                s.push_str(&format!("      {why}\n"));
+            }
+        }
+        if degraded.len() > 15 {
+            s.push_str(&format!("  ... and {} more\n", degraded.len() - 15));
+        }
+    }
+    s
+}
+
+/// `T0 12  T1 3  T3 1`, best tier first.
+fn histogram<'a>(outcomes: impl Iterator<Item = &'a ProfileOutcome>) -> String {
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for o in outcomes {
+        *counts.entry(o.tier.as_key()).or_default() += 1;
+    }
+    counts.iter().map(|(k, n)| format!("{k} {n}")).collect::<Vec<_>>().join("  ")
+}
+
 fn opt_str(v: Option<&str>) -> String {
     v.map_or_else(|| "null".into(), quote)
 }
@@ -286,6 +357,21 @@ fn f64_or_null(v: Option<f64>) -> String {
         Some(x) if x.is_finite() => format!("{x:.3}"),
         _ => "null".into(),
     }
+}
+
+/// The modelled tiers for one file. `null` when the file did not open — a tier for a file that never
+/// demuxed would be fiction, and `null` says that where a default `"T5"` would not.
+fn fidelity_json(f: Option<&Fidelity>) -> String {
+    let Some(f) = f else { return "null".into() };
+    let one = |o: &ProfileOutcome| {
+        format!(
+            "{{\"tier\":{},\"direct\":{},\"reasons\":[{}]}}",
+            quote(o.tier.as_key()),
+            o.direct,
+            o.reasons.iter().map(|r| quote(r)).collect::<Vec<_>>().join(",")
+        )
+    };
+    format!("{{\"modelled\":true,\"native\":{},\"browser\":{}}}", one(&f.native), one(&f.browser))
 }
 
 /// The full machine-readable record of a scan and, if one ran, a playback session.
@@ -352,7 +438,7 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
                          \"height\":{},\"fps\":{},\"duration\":{},\"hwdec\":{},\"seekable\":{},\
                          \"pixel_format\":{},\"primaries\":{},\"gamma\":{},\"hdr\":{},\
                          \"tracks\":{{\"video\":{},\"audio\":{},\"subtitle\":{}}},\
-                         \"delayed_frames\":{},\"dropped_frames\":{}}}",
+                         \"fidelity\":{},\"delayed_frames\":{},\"dropped_frames\":{}}}",
                         quote(&r.path.to_string_lossy()),
                         quote(outcome),
                         opt_str(detail.as_deref()),
@@ -373,6 +459,7 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
                         r.track_counts.video,
                         r.track_counts.audio,
                         r.track_counts.subtitle,
+                        fidelity_json(r.fidelity.as_ref()),
                         opt_num(r.delayed_frames),
                         opt_num(r.dropped_frames)
                     )
@@ -614,8 +701,78 @@ mod tests {
             seekable: None,
             audio_channels: None,
             track_counts: crate::session::TrackCounts::default(),
+            tracks: Vec::new(),
+            fidelity: None,
             delayed_frames: None,
             dropped_frames: None,
         }
+    }
+
+    fn outcome(tier: Tier, direct: bool, reason: &str) -> ProfileOutcome {
+        ProfileOutcome {
+            profile: "test",
+            tier,
+            direct,
+            reasons: if reason.is_empty() { Vec::new() } else { vec![reason.into()] },
+        }
+    }
+
+    #[test]
+    fn the_fidelity_section_is_absent_when_nothing_was_assessed() {
+        // A run against a build that reported no track list must not print an empty table implying
+        // every file is fine.
+        let rep = SessionReport { results: vec![blank()], ..Default::default() };
+        assert!(render_fidelity(&rep).is_empty());
+    }
+
+    #[test]
+    fn the_fidelity_section_names_the_files_that_cost_fidelity_and_why() {
+        let mut good = blank();
+        good.label = "Clean Remux".into();
+        good.outcome = Outcome::Played;
+        good.fidelity = Some(Fidelity {
+            native: outcome(Tier::T0BitExact, true, ""),
+            browser: outcome(Tier::T3Adapted, false, "the browser cannot decode HEVC."),
+        });
+
+        let mut bad = blank();
+        bad.label = "Odd Codec File".into();
+        bad.outcome = Outcome::Played;
+        bad.fidelity = Some(Fidelity {
+            native: outcome(Tier::T3Adapted, false, "no decoder for this codec."),
+            browser: outcome(Tier::T5Blocked, false, "nothing playable."),
+        });
+
+        let rep = SessionReport { results: vec![good, bad], ..Default::default() };
+        let text = render_fidelity(&rep);
+
+        assert!(text.contains("not measured"), "a projection must never read as a measurement");
+        assert!(text.contains("T0 1"), "the native histogram must count the clean file");
+        assert!(text.contains("below T2 natively (1)"));
+        assert!(text.contains("Odd Codec File"), "the file that cost fidelity must be named");
+        assert!(text.contains("no decoder for this codec."), "with its reason — guarantee G1");
+        assert!(
+            !text.contains("Clean Remux"),
+            "a file that reached T0 natively does not belong in the degraded list"
+        );
+        assert!(text.contains("1 play untouched on a native client and cannot in a browser"));
+    }
+
+    #[test]
+    fn fidelity_is_null_in_json_for_a_file_that_did_not_open() {
+        assert_eq!(fidelity_json(None), "null");
+        let f = Fidelity {
+            native: outcome(Tier::T1FullFidelity, true, ""),
+            browser: outcome(Tier::T3Adapted, false, "quote \"inside\" a reason"),
+        };
+        let text = format!("{{\"fidelity\":{}}}", fidelity_json(Some(&f)));
+        let v = parse(&text).expect("the reason text must be escaped, not pasted");
+        let fid = v.get("fidelity").unwrap();
+        assert_eq!(fid.get("modelled").and_then(crate::json::Value::as_bool), Some(true));
+        assert_eq!(fid.get("native").unwrap().get("tier").unwrap().as_str(), Some("T1"));
+        assert_eq!(
+            fid.get("browser").unwrap().get("reasons").unwrap().as_array().unwrap()[0].as_str(),
+            Some("quote \"inside\" a reason")
+        );
     }
 }

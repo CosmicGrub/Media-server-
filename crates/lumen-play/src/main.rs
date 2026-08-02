@@ -13,6 +13,7 @@
 //! `test` is the mode worth running first on a large collection: it walks a thousand files in an
 //! evening rather than a fortnight, and the output is a list of exactly which ones failed and why.
 
+mod fidelity;
 mod ipc;
 mod json;
 mod mpvbin;
