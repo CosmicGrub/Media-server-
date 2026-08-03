@@ -18,6 +18,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.util.UnstableApi
 import dev.lumen.player.player.PlayerViewModel
@@ -26,8 +27,18 @@ import dev.lumen.player.ui.PlayerScreen
 @UnstableApi
 class MainActivity : ComponentActivity() {
 
+    /**
+     * Display settings outlive the composition on purpose.
+     *
+     * Folding, unfolding and rotating all recreate the composition, and on a Fold 5 that happens
+     * several times an hour. A preference stored in composition state would reset every time the
+     * device changed shape — which is precisely when the user most wants it to have been remembered.
+     */
+    private lateinit var displayOptions: dev.lumen.player.ui.DisplayOptionsStore
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        displayOptions = dev.lumen.player.ui.DisplayOptionsStore(this)
         // Edge to edge, because letterboxing on the inner display is exactly what a foldable build
         // exists to avoid.
         enableEdgeToEdge()
@@ -84,11 +95,24 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    val display by displayOptions.settings.collectAsStateWithLifecycle()
+
+                    // Both of these are properties of the window rather than of the composition, so
+                    // they are applied here and re-applied whenever the setting changes.
+                    androidx.compose.runtime.LaunchedEffect(display.orientation) {
+                        activity.requestedOrientation = display.orientation.request()
+                    }
+                    androidx.compose.runtime.LaunchedEffect(display.viewMode) {
+                        setSystemBarsHidden(display.viewMode.hidesSystemBars)
+                    }
+
                     Scaffold(Modifier.fillMaxSize()) { insets ->
                         // The video itself goes edge to edge — letterboxing a film to avoid a
                         // status bar defeats the point — so only the surrounding chrome is inset.
                         PlayerScreen(
                             vm = vm,
+                            settings = display,
+                            onSettingsChange = displayOptions::update,
                             contentPadding = insets,
                             onRequestAccess = onRequestAccess,
                         )
@@ -96,6 +120,22 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Hide or restore the status and navigation bars.
+     *
+     * `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE` is the part that matters: without it, hiding the
+     * navigation bar on a gesture-navigation device leaves no way back except the hardware buttons
+     * the Fold 5 does not have. With it, a swipe from the edge brings the bars back temporarily and
+     * they retreat on their own.
+     */
+    private fun setSystemBarsHidden(hidden: Boolean) {
+        val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        val bars = androidx.core.view.WindowInsetsCompat.Type.systemBars()
+        if (hidden) controller.hide(bars) else controller.show(bars)
     }
 
     /**

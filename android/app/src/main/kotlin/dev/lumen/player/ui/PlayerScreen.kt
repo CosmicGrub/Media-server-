@@ -2,13 +2,14 @@ package dev.lumen.player.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.layout.Arrangement as LayoutArrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,10 +24,17 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
@@ -41,23 +49,21 @@ import dev.lumen.player.player.PlayerViewModel
 import dev.lumen.player.player.UiState
 
 /**
- * The whole UI, laid out by fold posture.
+ * The whole UI, laid out by fold posture and by what the user asked for.
  *
- * Three layouts, because a Fold 5 is three devices:
- *
- *  - **Tabletop** (half-open, horizontal hinge): video above the crease, library below it. The
- *    layout that makes a foldable worth targeting — the phone stands on a table and plays hands-free.
- *  - **Wide** (inner display, flat): video and library side by side. The inner screen is nearly
- *    square, so a full-width 16:9 video would leave a third of the display empty.
- *  - **Tall** (cover screen): video on top, library filling the rest. At 23.1:9 there is no room
- *    for anything beside the video.
+ * A Fold 5 is several devices — cover screen, inner display, half open on a table, and each of those
+ * turned on its side — so the arrangement is chosen rather than fixed. But the arrangement is only
+ * half the answer: the first version of this screen put the library beside the video in every one of
+ * those shapes with no way to dismiss it, so the video never got the panel it was on. [ViewMode] is
+ * the user's half, and it wins.
  */
 @UnstableApi
 @Composable
 fun PlayerScreen(
     vm: PlayerViewModel,
-    contentPadding: androidx.compose.foundation.layout.PaddingValues =
-        androidx.compose.foundation.layout.PaddingValues(0.dp),
+    settings: DisplaySettings,
+    onSettingsChange: ((DisplaySettings) -> DisplaySettings) -> Unit,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
     /// Re-requests media access, or opens settings when the permission is permanently denied.
     /// Supplied by the host so this screen holds no permission mechanics.
     onRequestAccess: () -> Unit = {},
@@ -66,17 +72,78 @@ fun PlayerScreen(
     val posture by rememberPosture()
     val config = LocalConfiguration.current
 
-    // The inner display is about 6:5; the cover screen about 23:9. 600dp is the conventional
-    // breakpoint for "this is a tablet-shaped surface", and on a Fold 5 it separates the two
-    // displays cleanly.
-    val isWide = config.screenWidthDp >= 600
+    val tabletop = posture as? Posture.Tabletop
+    val arrangement = arrangementFor(
+        isTabletop = tabletop != null,
+        widthDp = config.screenWidthDp,
+        heightDp = config.screenHeightDp,
+        mode = settings.viewMode,
+    )
 
-    when (val p = posture) {
-        is Posture.Tabletop -> TabletopLayout(vm, state, p, contentPadding, onRequestAccess)
-        is Posture.Book -> BookLayout(vm, state, contentPadding, onRequestAccess)
-        Posture.Flat ->
-            if (isWide) WideLayout(vm, state, contentPadding, onRequestAccess)
-            else TallLayout(vm, state, contentPadding, onRequestAccess)
+    var sheetOpen by remember { mutableStateOf(false) }
+    var hint by remember { mutableStateOf<String?>(null) }
+    // The hint is a message, not a state: it says what just changed and then gets out of the way.
+    LaunchedEffect(hint) {
+        if (hint != null) {
+            kotlinx.coroutines.delay(1400)
+            hint = null
+        }
+    }
+
+    val video: @Composable (Modifier) -> Unit = { modifier ->
+        VideoSurface(
+            vm = vm,
+            settings = settings,
+            onZoom = { factor -> onSettingsChange { it.withZoom(factor) } },
+            onPan = { dx, dy -> onSettingsChange { it.withPan(dx, dy) } },
+            onCycleFit = {
+                onSettingsChange { s -> s.copy(fit = s.fit.next()) }
+                hint = "Scaling: ${settings.fit.next().label}"
+            },
+            modifier = modifier,
+        )
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        when (arrangement) {
+            Arrangement.Tabletop -> TabletopLayout(
+                vm, state, tabletop!!, settings, contentPadding, onRequestAccess, video
+            )
+            Arrangement.SideBySide ->
+                SideBySideLayout(vm, state, settings, contentPadding, onRequestAccess, video)
+            Arrangement.Stacked ->
+                StackedLayout(vm, state, settings, contentPadding, onRequestAccess, video)
+            Arrangement.VideoOnly -> Box(
+                Modifier.fillMaxSize().background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) { video(Modifier.fillMaxSize()) }
+        }
+
+        // Always in the same corner, in every arrangement and every posture. A control that moves
+        // when the device folds is one that has to be found again each time.
+        ViewModeButton(
+            mode = settings.viewMode,
+            onCycle = {
+                onSettingsChange { it.copy(viewMode = it.viewMode.next()) }
+                hint = settings.viewMode.next().name
+            },
+            onOpenOptions = { sheetOpen = true },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = contentPadding.calculateTopPadding())
+                .padding(12.dp),
+        )
+
+        hint?.let { GestureHint(it, Modifier.align(Alignment.TopCenter)) }
+    }
+
+    if (sheetOpen) {
+        DisplayOptionsSheet(
+            settings = settings,
+            arrangement = arrangement,
+            onChange = onSettingsChange,
+            onDismiss = { sheetOpen = false },
+        )
     }
 }
 
@@ -86,6 +153,10 @@ fun PlayerScreen(
  * The hinge bounds arrive in pixels from `WindowInfoTracker` and have to become dp for Compose.
  * Nothing is drawn across the crease: on a Fold 5 it is a visible, slightly recessed line, and a
  * control placed on it is one that is hard to read and unreliable to press.
+ *
+ * This arrangement survives every view mode, because the geometry is the point — the top screen is
+ * the picture whether or not a library sits below it. In Theater and Immersive the bottom half keeps
+ * the now-playing bar and loses the list, which is what makes the posture usable one-handed.
  */
 @UnstableApi
 @Composable
@@ -93,8 +164,10 @@ private fun TabletopLayout(
     vm: PlayerViewModel,
     state: UiState,
     p: Posture.Tabletop,
+    settings: DisplaySettings,
     contentPadding: PaddingValues,
     onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
 ) {
     val density = LocalDensity.current
     val topHeightDp = with(density) { p.hingeTopPx.toDp() }
@@ -102,14 +175,9 @@ private fun TabletopLayout(
 
     Column(Modifier.fillMaxSize()) {
         Box(
-            Modifier
-                .fillMaxWidth()
-                .height(topHeightDp)
-                .background(Color.Black),
+            Modifier.fillMaxWidth().height(topHeightDp).background(Color.Black),
             contentAlignment = Alignment.Center,
-        ) {
-            VideoSurface(vm, Modifier.fillMaxSize())
-        }
+        ) { video(Modifier.fillMaxSize()) }
         // The crease itself. Left empty on purpose — see above.
         Spacer(Modifier.fillMaxWidth().height(hingeHeightDp))
         Column(
@@ -119,43 +187,35 @@ private fun TabletopLayout(
                 .padding(horizontal = 12.dp)
         ) {
             NowPlayingBar(state, vm)
-            LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
+            if (settings.viewMode.showsLibrary) {
+                LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
+            }
         }
     }
 }
 
-/** Half-open held like a book: video one side, library the other. */
+/** Two panes across. The split is the user's, not a constant. */
 @UnstableApi
 @Composable
-private fun BookLayout(
+private fun SideBySideLayout(
     vm: PlayerViewModel,
     state: UiState,
+    settings: DisplaySettings,
     contentPadding: PaddingValues,
     onRequestAccess: () -> Unit,
-) = WideLayout(vm, state, contentPadding, onRequestAccess)
-
-/** Inner display, flat. Nearly square, so the two panes sit side by side. */
-@UnstableApi
-@Composable
-private fun WideLayout(
-    vm: PlayerViewModel,
-    state: UiState,
-    contentPadding: PaddingValues,
-    onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
 ) {
     Row(Modifier.fillMaxSize()) {
         Box(
             Modifier
-                .weight(0.62f)
+                .weight(settings.splitFraction)
                 .fillMaxHeight()
                 .background(Color.Black),
             contentAlignment = Alignment.Center,
-        ) {
-            VideoSurface(vm, Modifier.fillMaxSize())
-        }
+        ) { video(Modifier.fillMaxSize()) }
         Column(
             Modifier
-                .weight(0.38f)
+                .weight(1f - settings.splitFraction)
                 .fillMaxHeight()
                 .padding(top = contentPadding.calculateTopPadding())
                 .padding(bottom = contentPadding.calculateBottomPadding())
@@ -167,30 +227,38 @@ private fun WideLayout(
     }
 }
 
-/** Cover screen. Too narrow for anything but a stack. */
+/**
+ * Two panes stacked. The cover screen, and the inner display turned to a shape too short for a list
+ * beside the picture.
+ *
+ * The video box is a share of the height rather than a hardcoded 16:9. The 16:9 box was wrong in
+ * both directions at once: a 2.39:1 film was letterboxed inside it *and* the box was letterboxed
+ * inside a 23:9 screen, so a scope film played in a band across the middle of a tall black
+ * rectangle. A share of the height plus the chosen scaling mode gives one letterbox at most, and the
+ * share is adjustable because no single number is right for both a phone screen and a tablet one.
+ */
 @UnstableApi
 @Composable
-private fun TallLayout(
+private fun StackedLayout(
     vm: PlayerViewModel,
     state: UiState,
+    settings: DisplaySettings,
     contentPadding: PaddingValues,
     onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
 ) {
     Column(Modifier.fillMaxSize()) {
         Box(
             Modifier
                 .fillMaxWidth()
-                // 16:9 rather than fillMaxHeight: on a 23:9 screen a proportional split would leave
-                // the video a sliver and the list unusable.
-                .aspectRatio(16f / 9f)
+                .weight(settings.splitFraction)
                 .background(Color.Black),
             contentAlignment = Alignment.Center,
-        ) {
-            VideoSurface(vm, Modifier.fillMaxSize())
-        }
+        ) { video(Modifier.fillMaxSize()) }
         Column(
             Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
+                .weight(1f - settings.splitFraction)
                 .padding(bottom = contentPadding.calculateBottomPadding())
                 .padding(horizontal = 12.dp)
         ) {
@@ -206,23 +274,73 @@ private fun TallLayout(
  * There is no Compose-native video surface, so this is an `AndroidView`. The `update` block is what
  * keeps it correct across a fold: the composition is re-run with the same player instance, so the
  * surface is re-attached rather than recreated and playback continues through the transition.
+ *
+ * Two layers of sizing, and they are not interchangeable:
+ *
+ *  - **Fit and aspect** are applied by `PlayerView` to the video surface itself, so the subtitle and
+ *    control overlays stay unscaled and legible. Scaling those with the picture is how subtitles end
+ *    up cropped off the side of a zoomed frame.
+ *  - **Pinch zoom and pan** are a Compose `graphicsLayer` on top, because Media3 has no such concept.
+ *    `clipToBounds` keeps a zoomed picture inside its pane instead of drawing over the library.
  */
 @UnstableApi
 @Composable
-private fun VideoSurface(vm: PlayerViewModel, modifier: Modifier = Modifier) {
-    AndroidView(
-        modifier = modifier,
-        factory = { ctx ->
-            PlayerView(ctx).apply {
-                useController = true
-                controllerAutoShow = true
-                setShowNextButton(false)
-                setShowPreviousButton(false)
+private fun VideoSurface(
+    vm: PlayerViewModel,
+    settings: DisplaySettings,
+    onZoom: (Float) -> Unit,
+    onPan: (Float, Float) -> Unit,
+    onCycleFit: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier
+            .clipToBounds()
+            .pointerInput(Unit) {
+                detectTransformGestures { _, panChange, zoomChange, _ ->
+                    if (zoomChange != 1f) onZoom(zoomChange)
+                    if (panChange.x != 0f || panChange.y != 0f) onPan(panChange.x, panChange.y)
+                }
             }
-        },
-        update = { view -> view.player = vm.player },
-        onRelease = { view -> view.player = null },
-    )
+            // A separate `pointerInput` from the transform one: a single node cannot both consume
+            // taps and track transforms without one starving the other.
+            .pointerInput(Unit) {
+                detectTapGestures(onDoubleTap = { onCycleFit() })
+            }
+    ) {
+        AndroidView(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = settings.zoom
+                    scaleY = settings.zoom
+                    translationX = settings.panX
+                    translationY = settings.panY
+                },
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    useController = true
+                    controllerAutoShow = true
+                    setShowNextButton(false)
+                    setShowPreviousButton(false)
+                }
+            },
+            update = { view ->
+                view.player = vm.player
+                view.resizeMode = settings.fit.resizeMode()
+                // The forced ratio goes on `PlayerView`'s own content frame — Media3's supported
+                // mechanism for this — rather than on a Compose wrapper, so the picture is reshaped
+                // without reshaping the subtitle and control overlays drawn on top of it.
+                //
+                // A non-positive value is how `AspectRatioFrameLayout` is told to go back to the
+                // video's own ratio; there is no separate clear call, which is what `Source` maps to.
+                view.findViewById<androidx.media3.ui.AspectRatioFrameLayout>(
+                    androidx.media3.ui.R.id.exo_content_frame
+                )?.setAspectRatio(settings.aspect.ratio ?: 0f)
+            },
+            onRelease = { view -> view.player = null },
+        )
+    }
 }
 
 @Composable
@@ -292,7 +410,7 @@ private fun LibraryList(
             }
         }
 
-        else -> LazyColumn(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        else -> LazyColumn(modifier, verticalArrangement = LayoutArrangement.spacedBy(4.dp)) {
             items(state.items, key = { it.id }) { item ->
                 LibraryRow(item, isPlaying = item.id == state.nowPlaying?.id) { vm.play(item) }
             }
