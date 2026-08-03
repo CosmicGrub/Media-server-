@@ -236,6 +236,31 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # The AVD's userdata partition is created on the root filesystem, and a hosted runner does not
+      # have much of it spare. This job failed for two runs with
+      #
+      #   FATAL | Not enough space to create userdata partition.
+      #           Available: 7344.32 MB, need 7372.80 MB.
+      #
+      # — twenty-eight megabytes short. The emulator died on the spot and the runner then polled a
+      # device that would never exist until the boot timeout expired, which is why it presented as a
+      # boot timeout and was misdiagnosed as one. The image had simply grown past the threshold
+      # between one runner release and the next; nothing in this repository changed.
+      #
+      # The NDK is the biggest single thing here and this build has no native code, so it goes. The
+      # rest are toolchains a Kotlin build never touches. Free space is printed either side so the
+      # next disk failure is diagnosable from the log rather than from a fatal line 1300 lines up.
+      - name: Free disk space for the AVD
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android/sdk/ndk \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /usr/local/lib/node_modules || true
+          echo "after:"; df -h / | tail -1
+
       - name: Generate debug keystore
         run: |
           keytool -genkeypair -v \
@@ -260,12 +285,15 @@ jobs:
           emulator-options: >-
             -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
             -no-snapshot-save -camera-back none
-          # The action's default is 600 s, and API 34 has booted in as much as 10.5 minutes on this
-          # matrix — close enough to the limit that a slow runner crosses it. That is exactly what
-          # happened on run #7: API 34 timed out while API 35 passed in under six minutes on the same
-          # commit. Raised rather than removed, because a genuinely hung emulator should still fail
-          # instead of burning the job's 45-minute budget.
-          emulator-boot-timeout: 1200
+          # The default userdata partition is 7372.80 MB, which is what did not fit. Nothing here
+          # needs seven gigabytes of writable guest storage: the APK is three megabytes and the tests
+          # write nothing. Asking for a size that comfortably fits is a better fix than freeing disk
+          # alone, because it stops the job depending on how large the runner image happens to be
+          # this week.
+          disk-size: 4096M
+          # Back to the action's 600 s default. The raise to 1200 s was made on a wrong diagnosis —
+          # the emulator was not booting slowly, it was dying instantly and never appearing at all,
+          # so the longer window bought nothing and made each failure take twice as long to report.
           disable-animations: true
           # `cd android` is load-bearing: the emulator-runner action runs `script` from the
           # repository root and does NOT inherit the job's `defaults.run.working-directory`, so a
