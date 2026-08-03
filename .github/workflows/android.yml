@@ -1,10 +1,16 @@
 name: Android APK
 
-# Builds a sideloadable APK and attaches it to the run as a downloadable artifact.
+# Builds a sideloadable APK, attaches it to the run as a downloadable artifact, and publishes it to
+# a rolling `android-latest` release so the phone itself can fetch it.
 #
 # This exists because the Android SDK cannot be fetched in every environment — dl.google.com is
 # frequently blocked on locked-down networks — while a GitHub runner has it preinstalled. Push the
-# branch and collect the APK from the run's Artifacts section; no Android Studio required.
+# branch and collect the APK from the release or the run's Artifacts section; no Android Studio
+# required.
+#
+# The release matters for a reason the artifact cannot serve: an Actions artifact is a **zip**, and
+# Android cannot install a zip. A release asset is the `.apk` itself, so opening the link in the
+# phone's browser goes straight to the installer with no PC, no cable, and no unzipping.
 
 on:
   push:
@@ -95,6 +101,99 @@ jobs:
           path: android/app/build/reports/tests/
           if-no-files-found: ignore
           retention-days: 7
+
+  # Publish the APK where a phone can reach it in one tap.
+  #
+  # An Actions artifact is a zip, and Android cannot install a zip — getting the app onto a device
+  # from one means a PC, a download, an unzip, and a cable. A release asset is the `.apk` itself, so
+  # the link opens the installer directly from the phone's browser.
+  #
+  # The tag is deliberately rolling rather than versioned: this is the current build of a branch
+  # under active development, not a version anyone should pin to. It is marked as a prerelease for
+  # the same reason.
+  publish:
+    name: publish to android-latest
+    needs: build
+    # Only from the development branch and the default branch. A release that moved on every feature
+    # branch would make the "latest" link mean nothing.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/claude/multiplatform-media-player-server-b7dwe7'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: apks
+
+      # Named for a human reading a download list on a phone, where the build directory structure
+      # that produced them is invisible and `app-release.apk` says nothing about what it is.
+      #
+      # The names carry no commit hash on purpose. A rolling release wants one permanent URL, so the
+      # asset name has to stay put and `--clobber` has to be able to replace it; a hash in the name
+      # would mint a new link every push and leave the old builds piling up beside it. Which build
+      # this is lives in the title and the notes instead.
+      - name: Name the assets for a human
+        id: assets
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          cp apks/release/app-release.apk lumen.apk
+          cp apks/debug/app-debug.apk lumen-debug.apk
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          ls -lh lumen.apk lumen-debug.apk
+
+      - name: Publish or update the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.assets.outputs.short }}
+        run: |
+          set -euo pipefail
+          NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
+
+          **Sideload straight from the phone:** open this page in the phone's browser, tap
+          \`lumen.apk\`, and allow installation from that browser when Android asks.
+
+          **Or over USB from a PC**, with developer options and USB debugging on:
+          \`\`\`
+          adb install -r lumen.apk
+          \`\`\`
+
+          Signed with the standard Android debug key, which is what makes it installable without a
+          Play listing. It is not a production signing key, and this is a development build rather
+          than anything that should be distributed."
+
+          if gh release view android-latest >/dev/null 2>&1; then
+            # `gh release edit --target` cannot move the tag of a published release — the API ignores
+            # target_commitish once a release is out of draft — so the tag is moved directly. Without
+            # this the release would keep pointing at whichever commit first created it while serving
+            # assets from a much later one.
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/android-latest" \
+              -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release edit android-latest \
+              --title "Lumen Android — build ${SHORT}" --notes "$NOTES" --prerelease
+          else
+            gh release create android-latest \
+              --target "$GITHUB_SHA" \
+              --title "Lumen Android — build ${SHORT}" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
+          # `--clobber` rather than deleting the release: deleting it would break every link already
+          # shared, which is the one thing a rolling "latest" URL exists to avoid.
+          gh release upload android-latest lumen.apk lumen-debug.apk --clobber
+
+      - name: Say where it landed
+        run: |
+          echo "### APK published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/android-latest>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Open that on the phone and tap \`lumen.apk\`." >> "$GITHUB_STEP_SUMMARY"
 
   # A headless emulator. This is the only check that proves the APK installs and starts — a build
   # that compiles tells you nothing about whether the Activity survives to RESUMED, and a crash on
