@@ -254,8 +254,18 @@ jobs:
           # arm64-only, so abiFilters is widened just for this job rather than in the shipped APK.
           arch: x86_64
           profile: pixel_6
-          # No window, no audio, no boot animation — this is the headless part.
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          # No window, no audio, no boot animation — this is the headless part. `-no-snapshot-save`
+          # keeps the emulator from spending its shutdown writing a snapshot nothing will read: each
+          # job gets a fresh runner, so the snapshot is discarded with the machine.
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -no-snapshot-save -camera-back none
+          # The action's default is 600 s, and API 34 has booted in as much as 10.5 minutes on this
+          # matrix — close enough to the limit that a slow runner crosses it. That is exactly what
+          # happened on run #7: API 34 timed out while API 35 passed in under six minutes on the same
+          # commit. Raised rather than removed, because a genuinely hung emulator should still fail
+          # instead of burning the job's 45-minute budget.
+          emulator-boot-timeout: 1200
           disable-animations: true
           # `cd android` is load-bearing: the emulator-runner action runs `script` from the
           # repository root and does NOT inherit the job's `defaults.run.working-directory`, so a
