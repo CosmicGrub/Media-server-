@@ -9,6 +9,7 @@ import androidx.media3.common.MediaItem as ExoMediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -76,6 +77,16 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     val subtitlesDisabled: StateFlow<Boolean> = _subtitlesDisabled.asStateFlow()
 
     /**
+     * The playing video's pixel dimensions, for Picture-in-Picture's aspect ratio.
+     *
+     * Read synchronously from a plain Activity callback (`onUserLeaveHint`, not a composable), which
+     * is why this is a `StateFlow` with a `.value` rather than something that only makes sense inside
+     * composition.
+     */
+    private val _videoSize = MutableStateFlow(PipAspectRatio.FALLBACK)
+    val videoSize: StateFlow<Pair<Int, Int>> = _videoSize.asStateFlow()
+
+    /**
      * Set once this ViewModel is done with.
      *
      * The connection callback can arrive after that — a service bind is not cancellable — and a
@@ -107,10 +118,19 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
             // if it described the new one — that is how a subtitle picker ends up offering a
             // language the file playing does not have.
             _tracks.value = Tracks.EMPTY
+            // Likewise the aspect ratio: entering PiP between the transition and the new file's
+            // first decoded frame must use a safe fallback, not the previous film's shape.
+            _videoSize.value = PipAspectRatio.FALLBACK
         }
 
         override fun onTracksChanged(tracks: Tracks) {
             _tracks.value = tracks
+        }
+
+        override fun onVideoSizeChanged(videoSize: VideoSize) {
+            if (videoSize.width > 0 && videoSize.height > 0) {
+                _videoSize.value = videoSize.width to videoSize.height
+            }
         }
 
         override fun onTrackSelectionParametersChanged(

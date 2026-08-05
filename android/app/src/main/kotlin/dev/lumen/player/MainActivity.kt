@@ -1,8 +1,11 @@
 package dev.lumen.player
 
 import android.Manifest
+import android.app.PictureInPictureParams
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
+import android.util.Rational
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -13,14 +16,16 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.util.UnstableApi
+import dev.lumen.player.player.PipAspectRatio
 import dev.lumen.player.player.PlayerViewModel
 import dev.lumen.player.ui.PlayerScreen
 
@@ -36,6 +41,26 @@ class MainActivity : ComponentActivity() {
      */
     private lateinit var displayOptions: dev.lumen.player.ui.DisplayOptionsStore
 
+    /**
+     * Obtained directly rather than via Compose's `viewModel()`, so that `onUserLeaveHint` and
+     * `onPictureInPictureModeChanged` — plain `Activity` callbacks, not composables — can reach the
+     * same instance the screen is showing. `ViewModelProvider` caches by scope regardless of which
+     * API asks for it, so this is not a second ViewModel; it is the same one, reached from two places.
+     */
+    private val vm: PlayerViewModel by lazy {
+        ViewModelProvider(
+            this,
+            ViewModelProvider.AndroidViewModelFactory.getInstance(application),
+        )[PlayerViewModel::class.java]
+    }
+
+    /**
+     * Whether Picture-in-Picture is currently active, as a Compose state the screen reads to hide
+     * everything but the picture — a tiny floating window has no room for a library list, and the
+     * system already draws its own play/pause affordance from the media session.
+     */
+    private val isInPip = mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         displayOptions = dev.lumen.player.ui.DisplayOptionsStore(this)
@@ -48,8 +73,6 @@ class MainActivity : ComponentActivity() {
             // nobody wants in a dark room.
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    val vm: PlayerViewModel = viewModel()
-
                     val activity = this@MainActivity
                     val permission = requiredMediaPermission()
                     var askedOnce by androidx.compose.runtime.saveable.rememberSaveable {
@@ -109,12 +132,14 @@ class MainActivity : ComponentActivity() {
                     Scaffold(Modifier.fillMaxSize()) { insets ->
                         // The video itself goes edge to edge — letterboxing a film to avoid a
                         // status bar defeats the point — so only the surrounding chrome is inset.
+                        val inPip by isInPip
                         PlayerScreen(
                             vm = vm,
                             settings = display,
                             onSettingsChange = displayOptions::update,
                             contentPadding = insets,
                             onRequestAccess = onRequestAccess,
+                            isInPip = inPip,
                         )
                     }
                 }
@@ -130,6 +155,52 @@ class MainActivity : ComponentActivity() {
      * the Fold 5 does not have. With it, a swipe from the edge brings the bars back temporarily and
      * they retreat on their own.
      */
+    /**
+     * The system is about to leave this Activity — the user pressed Home, or switched apps.
+     *
+     * This is the documented hook for entering PiP automatically: unlike a button the user has to
+     * find, it means a film keeps playing the instant someone does the thing they would naturally do
+     * to glance at something else, which is the entire value Picture-in-Picture offers. Only offered
+     * while something is actually playing — entering a floating window to look at an idle library
+     * list would be a worse experience than simply leaving the app.
+     *
+     * On API 31+ `setAutoEnterEnabled` on the params below makes this redundant for the swipe-to-
+     * home gesture specifically, but `onUserLeaveHint` still fires for other paths (a notification
+     * pull-down, an incoming call) and is required at all on API 24–30, where auto-enter does not
+     * exist. Kept unconditionally rather than branched by version, since calling it is harmless where
+     * the system already handled the transition itself.
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (vm.state.value.isPlaying) enterPip()
+    }
+
+    private fun enterPip() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        // Clamped here, not trusted as already-clamped from the ViewModel: `videoSize` is the file's
+        // raw pixel dimensions, and an anamorphic scope frame is exactly the shape that would make
+        // `Rational` below throw if it reached the platform unclamped.
+        val (rawW, rawH) = vm.videoSize.value
+        val (w, h) = PipAspectRatio.clamp(rawW, rawH)
+        val params = PictureInPictureParams.Builder()
+            .setAspectRatio(Rational(w, h))
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) setAutoEnterEnabled(true)
+            }
+            .build()
+        // A device that declares `android:supportsPictureInPicture` but denies it at runtime — a
+        // manufacturer policy, a low-RAM mode — must not crash the app over a convenience feature.
+        runCatching { enterPictureInPictureMode(params) }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration,
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        isInPip.value = isInPictureInPictureMode
+    }
+
     private fun setSystemBarsHidden(hidden: Boolean) {
         val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
         controller.systemBarsBehavior =

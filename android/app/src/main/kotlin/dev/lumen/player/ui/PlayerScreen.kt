@@ -73,18 +73,27 @@ fun PlayerScreen(
     /// Re-requests media access, or opens settings when the permission is permanently denied.
     /// Supplied by the host so this screen holds no permission mechanics.
     onRequestAccess: () -> Unit = {},
+    /// True while the window is a floating Picture-in-Picture rectangle. Everything but the video
+    /// itself is suppressed in that state — there is no room for a library list in a PiP window, no
+    /// room to read the gesture hints, and the system already draws its own play/pause affordance
+    /// from the media session, so `PlayerView`'s own controller would only be a second, cramped copy.
+    isInPip: Boolean = false,
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val posture by rememberPosture()
     val config = LocalConfiguration.current
 
     val tabletop = posture as? Posture.Tabletop
-    val arrangement = arrangementFor(
-        isTabletop = tabletop != null,
-        widthDp = config.screenWidthDp,
-        heightDp = config.screenHeightDp,
-        mode = settings.viewMode,
-    )
+    val arrangement = if (isInPip) {
+        Arrangement.VideoOnly
+    } else {
+        arrangementFor(
+            isTabletop = tabletop != null,
+            widthDp = config.screenWidthDp,
+            heightDp = config.screenHeightDp,
+            mode = settings.viewMode,
+        )
+    }
 
     var sheetOpen by remember { mutableStateOf(false) }
     var tracksOpen by remember { mutableStateOf(false) }
@@ -109,6 +118,10 @@ fun PlayerScreen(
                 onSettingsChange { s -> s.copy(fit = s.fit.next()) }
                 hint = "Scaling: ${settings.fit.next().label}"
             },
+            // A PiP window is a few centimetres across on most phones. mpv's own gesture handling —
+            // scrub, brightness, volume, pinch — reading a drag that small is a source of accidental
+            // input, not a control anyone can use, so it is switched off rather than left to misfire.
+            gesturesEnabled = !isInPip,
             modifier = modifier,
         )
     }
@@ -127,6 +140,10 @@ fun PlayerScreen(
                 contentAlignment = Alignment.Center,
             ) { video(Modifier.fillMaxSize()) }
         }
+
+        // Every floating control disappears in PiP rather than being drawn tiny: a window a few
+        // centimetres across has no room to show them legibly, let alone to hit them accurately.
+        if (isInPip) return@Box
 
         // Its own button rather than folded into ViewModeButton's sheet: track choice is a decision
         // about *this file*, made and remade during playback, and a control buried a level down
@@ -322,6 +339,7 @@ private fun VideoSurface(
     onZoom: (Float) -> Unit,
     onPan: (Float, Float) -> Unit,
     onCycleFit: () -> Unit,
+    gesturesEnabled: Boolean = true,
     modifier: Modifier = Modifier,
 ) {
     // Null until the playback service has been reached. `PlayerView` accepts that and shows its
@@ -344,7 +362,8 @@ private fun VideoSurface(
     Box(
         modifier
             .clipToBounds()
-            .pointerInput(player) {
+            .pointerInput(player, gesturesEnabled) {
+                if (!gesturesEnabled) return@pointerInput
                 val width = size.width.toFloat()
                 val height = size.height.toFloat()
                 playerDragGestures(
@@ -387,7 +406,8 @@ private fun VideoSurface(
             // Taps stay in their own `pointerInput`. Tap detection gives up the moment movement
             // passes the touch slop, so it cannot compete with the drag detector above — which is
             // exactly why these two can coexist when two drag detectors could not.
-            .pointerInput(player) {
+            .pointerInput(player, gesturesEnabled) {
+                if (!gesturesEnabled) return@pointerInput
                 val width = size.width.toFloat()
                 detectTapGestures(
                     onDoubleTap = { offset ->
@@ -424,6 +444,9 @@ private fun VideoSurface(
             },
             update = { view ->
                 view.player = player
+                // The system draws its own play/pause affordance on a PiP window from the media
+                // session; PlayerView's controller would only be a second copy with no room to fit.
+                view.useController = gesturesEnabled
                 view.resizeMode = settings.fit.resizeMode()
                 // The forced ratio goes on `PlayerView`'s own content frame — Media3's supported
                 // mechanism for this — rather than on a Compose wrapper, so the picture is reshaped
