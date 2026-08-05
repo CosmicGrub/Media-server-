@@ -3,7 +3,6 @@ package dev.lumen.player.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement as LayoutArrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,17 +14,24 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BrightnessMedium
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -296,19 +302,82 @@ private fun VideoSurface(
     // Null until the playback service has been reached. `PlayerView` accepts that and shows its
     // placeholder, which is the honest thing to draw while there is genuinely no player yet.
     val player by vm.player.collectAsStateWithLifecycle()
+    val levels = rememberScreenLevels()
+    var feedback by remember { mutableStateOf<GestureFeedback?>(null) }
+    // Where the scrub started. Read once per gesture: reading the live position on every frame would
+    // make the target chase the seek that the gesture itself is causing.
+    var scrubFrom by remember { mutableLongStateOf(0L) }
+    var scrubTo by remember { mutableLongStateOf(0L) }
+
+    LaunchedEffect(feedback) {
+        if (feedback != null) {
+            kotlinx.coroutines.delay(900)
+            feedback = null
+        }
+    }
+
     Box(
         modifier
             .clipToBounds()
-            .pointerInput(Unit) {
-                detectTransformGestures { _, panChange, zoomChange, _ ->
-                    if (zoomChange != 1f) onZoom(zoomChange)
-                    if (panChange.x != 0f || panChange.y != 0f) onPan(panChange.x, panChange.y)
-                }
+            .pointerInput(player) {
+                val width = size.width.toFloat()
+                val height = size.height.toFloat()
+                playerDragGestures(
+                    isZoomed = { settings.zoom > 1f },
+                    onZoom = onZoom,
+                    onPan = onPan,
+                    onDragStart = { _, axis ->
+                        if (axis == DragAxis.Horizontal) {
+                            scrubFrom = player?.currentPosition ?: 0L
+                            scrubTo = scrubFrom
+                        }
+                    },
+                    onDrag = { zone, axis, dx, dy ->
+                        when (axis) {
+                            DragAxis.Horizontal -> {
+                                scrubTo = PlayerGestures.scrubTarget(
+                                    scrubTo, dx, width, player?.duration ?: 0L
+                                )
+                                feedback = GestureFeedback.Seek(scrubTo, scrubTo - scrubFrom)
+                            }
+                            DragAxis.Vertical -> {
+                                val delta = PlayerGestures.levelDelta(dy, height)
+                                feedback = if (zone == GestureZone.Left) {
+                                    GestureFeedback.Brightness(levels.nudgeBrightness(delta))
+                                } else {
+                                    GestureFeedback.Volume(levels.nudgeVolume(delta))
+                                }
+                            }
+                            DragAxis.Undecided -> {}
+                        }
+                    },
+                    // The seek happens once, at the end. Seeking on every frame of the drag makes a
+                    // decoder re-key dozens of times a second and the picture stutters into place
+                    // rather than following the finger.
+                    onDragEnd = { axis ->
+                        if (axis == DragAxis.Horizontal) player?.seekTo(scrubTo)
+                    },
+                )
             }
-            // A separate `pointerInput` from the transform one: a single node cannot both consume
-            // taps and track transforms without one starving the other.
-            .pointerInput(Unit) {
-                detectTapGestures(onDoubleTap = { onCycleFit() })
+            // Taps stay in their own `pointerInput`. Tap detection gives up the moment movement
+            // passes the touch slop, so it cannot compete with the drag detector above — which is
+            // exactly why these two can coexist when two drag detectors could not.
+            .pointerInput(player) {
+                val width = size.width.toFloat()
+                detectTapGestures(
+                    onDoubleTap = { offset ->
+                        val p = player ?: return@detectTapGestures
+                        val zone = PlayerGestures.zoneFor(offset.x, width)
+                        val target =
+                            PlayerGestures.doubleTapSeekMs(zone, p.currentPosition, p.duration)
+                        if (target == null) {
+                            vm.togglePlayPause()
+                        } else {
+                            p.seekTo(target)
+                            feedback = GestureFeedback.Seek(target, target - p.currentPosition)
+                        }
+                    },
+                )
             }
     ) {
         AndroidView(
@@ -342,6 +411,64 @@ private fun VideoSurface(
                 )?.setAspectRatio(settings.aspect.ratio ?: 0f)
             },
             onRelease = { view -> view.player = null },
+        )
+
+        feedback?.let { GestureFeedbackOverlay(it, Modifier.align(Alignment.Center)) }
+    }
+}
+
+/**
+ * What a drag is doing, drawn over the picture while it happens.
+ *
+ * A gesture with no feedback is indistinguishable from one that missed — the whole reason a phone
+ * player shows *something* the instant a thumb touches the screen, before the effect it is having is
+ * otherwise visible at all.
+ */
+@Composable
+private fun GestureFeedbackOverlay(feedback: GestureFeedback, modifier: Modifier = Modifier) {
+    Card(
+        modifier.padding(24.dp),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = Color.Black.copy(alpha = 0.65f)
+        ),
+    ) {
+        Column(
+            Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            when (feedback) {
+                is GestureFeedback.Seek -> {
+                    val sign = if (feedback.deltaMs >= 0) "+" else "-"
+                    Text(
+                        PlayerViewModel.formatDuration(feedback.targetMs),
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall,
+                    )
+                    Text(
+                        "$sign${PlayerViewModel.formatDuration(kotlin.math.abs(feedback.deltaMs))}",
+                        color = Color.White.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+                is GestureFeedback.Brightness ->
+                    LevelRow(Icons.Filled.BrightnessMedium, feedback.level)
+                is GestureFeedback.Volume ->
+                    LevelRow(Icons.Filled.VolumeUp, feedback.level)
+            }
+        }
+    }
+}
+
+@Composable
+private fun LevelRow(icon: androidx.compose.ui.graphics.vector.ImageVector, level: Float) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.size(10.dp))
+        LinearProgressIndicator(
+            progress = { level.coerceIn(0f, 1f) },
+            modifier = Modifier.size(width = 120.dp, height = 6.dp),
+            color = Color.White,
+            trackColor = Color.White.copy(alpha = 0.25f),
         )
     }
 }
