@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem as ExoMediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
@@ -55,6 +56,26 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     private var controller: MediaController? = null
 
     /**
+     * What the current file offers to choose between.
+     *
+     * Owned here rather than read straight off the player at the moment a sheet opens, because
+     * `Player.getCurrentTracks()` only has an answer once the player has actually parsed the file —
+     * empty for a beat after every `play()` call — and the picker needs to react to that arrival
+     * rather than see a permanently empty list on a slow-opening file.
+     */
+    private val _tracks = MutableStateFlow(Tracks.EMPTY)
+    val tracks: StateFlow<Tracks> = _tracks.asStateFlow()
+
+    /**
+     * Whether the user has explicitly turned subtitles off, as opposed to the file simply not
+     * offering a track the platform would auto-select. Tracked from the player's own selection
+     * parameters rather than inferred from [tracks], because "off" is a standing instruction that
+     * must survive a track list arriving, changing, or briefly going empty between files.
+     */
+    private val _subtitlesDisabled = MutableStateFlow(false)
+    val subtitlesDisabled: StateFlow<Boolean> = _subtitlesDisabled.asStateFlow()
+
+    /**
      * Set once this ViewModel is done with.
      *
      * The connection callback can arrive after that — a service bind is not cancellable — and a
@@ -82,6 +103,21 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
 
         override fun onMediaItemTransition(item: ExoMediaItem?, reason: Int) {
             savePosition()
+            // A stale track list from the previous file must not be shown, even for one frame, as
+            // if it described the new one — that is how a subtitle picker ends up offering a
+            // language the file playing does not have.
+            _tracks.value = Tracks.EMPTY
+        }
+
+        override fun onTracksChanged(tracks: Tracks) {
+            _tracks.value = tracks
+        }
+
+        override fun onTrackSelectionParametersChanged(
+            parameters: androidx.media3.common.TrackSelectionParameters
+        ) {
+            _subtitlesDisabled.value =
+                parameters.disabledTrackTypes.contains(androidx.media3.common.C.TRACK_TYPE_TEXT)
         }
     }
 
@@ -225,6 +261,48 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     fun togglePlayPause() {
         val controller = _player.value ?: return
         if (controller.isPlaying) controller.pause() else controller.play()
+    }
+
+    /**
+     * Switch to a specific audio or subtitle track.
+     *
+     * Also clears the "subtitles off" instruction when `groupIndex` names a text track — picking a
+     * subtitle is unambiguous consent to show one, and leaving the disabled flag set would have the
+     * platform hide the very track the user just chose.
+     */
+    fun selectTrack(groupIndex: Int, trackIndex: Int) {
+        val controller = _player.value ?: return
+        val group = _tracks.value.groups.getOrNull(groupIndex)
+        val override = TrackSelection.overrideFor(_tracks.value, groupIndex, trackIndex) ?: return
+        var params = controller.trackSelectionParameters.buildUpon().addOverride(override)
+        if (group?.type == androidx.media3.common.C.TRACK_TYPE_TEXT) {
+            params = params.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false)
+        }
+        controller.trackSelectionParameters = params.build()
+    }
+
+    /**
+     * Turn subtitles off.
+     *
+     * `setTrackTypeDisabled`, not an override that selects nothing — an override still leaves the
+     * type enabled, so the platform would be free to fall back to a default track the moment one
+     * became available (a language switch, a stream change) and silently undo the choice.
+     */
+    fun disableSubtitles() {
+        val controller = _player.value ?: return
+        controller.trackSelectionParameters = controller.trackSelectionParameters
+            .buildUpon()
+            .setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, true)
+            .build()
+    }
+
+    /** The inverse of [disableSubtitles], once the user picks a track again. */
+    fun enableSubtitles() {
+        val controller = _player.value ?: return
+        controller.trackSelectionParameters = controller.trackSelectionParameters
+            .buildUpon()
+            .setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false)
+            .build()
     }
 
     fun dismissError() {

@@ -87,7 +87,10 @@ fun PlayerScreen(
     )
 
     var sheetOpen by remember { mutableStateOf(false) }
+    var tracksOpen by remember { mutableStateOf(false) }
     var hint by remember { mutableStateOf<String?>(null) }
+    val tracks by vm.tracks.collectAsStateWithLifecycle()
+    val subtitlesDisabled by vm.subtitlesDisabled.collectAsStateWithLifecycle()
     // The hint is a message, not a state: it says what just changed and then gets out of the way.
     LaunchedEffect(hint) {
         if (hint != null) {
@@ -125,6 +128,18 @@ fun PlayerScreen(
             ) { video(Modifier.fillMaxSize()) }
         }
 
+        // Its own button rather than folded into ViewModeButton's sheet: track choice is a decision
+        // about *this file*, made and remade during playback, and a control buried a level down
+        // behind an unrelated icon is exactly how "the player picked the wrong audio" happens — the
+        // control exists, nobody finds it.
+        TrackPickerButton(
+            onOpen = { tracksOpen = true },
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = contentPadding.calculateTopPadding())
+                .padding(12.dp),
+        )
+
         // Always in the same corner, in every arrangement and every posture. A control that moves
         // when the device folds is one that has to be found again each time.
         ViewModeButton(
@@ -149,6 +164,16 @@ fun PlayerScreen(
             arrangement = arrangement,
             onChange = onSettingsChange,
             onDismiss = { sheetOpen = false },
+        )
+    }
+
+    if (tracksOpen) {
+        TrackSheet(
+            choices = dev.lumen.player.player.TrackSelection.choicesFor(tracks),
+            subtitlesDisabled = subtitlesDisabled,
+            onSelect = { g, t -> vm.selectTrack(g, t) },
+            onSubtitlesOff = { vm.disableSubtitles() },
+            onDismiss = { tracksOpen = false },
         )
     }
 }
