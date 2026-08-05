@@ -293,6 +293,9 @@ private fun VideoSurface(
     onCycleFit: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // Null until the playback service has been reached. `PlayerView` accepts that and shows its
+    // placeholder, which is the honest thing to draw while there is genuinely no player yet.
+    val player by vm.player.collectAsStateWithLifecycle()
     Box(
         modifier
             .clipToBounds()
@@ -326,7 +329,7 @@ private fun VideoSurface(
                 }
             },
             update = { view ->
-                view.player = vm.player
+                view.player = player
                 view.resizeMode = settings.fit.resizeMode()
                 // The forced ratio goes on `PlayerView`'s own content frame — Media3's supported
                 // mechanism for this — rather than on a Compose wrapper, so the picture is reshaped
@@ -358,6 +361,20 @@ private fun NowPlayingBar(state: UiState, vm: PlayerViewModel) {
                     .joinToString("  ·  "),
                 style = MaterialTheme.typography.bodySmall,
             )
+        }
+        // "Resumed from 42:10". A player that silently starts a film forty minutes in is
+        // indistinguishable from one that lost your place and picked a random spot; saying so is
+        // what turns it from a surprise into a feature, and tapping starts from the beginning.
+        state.notice?.let { message ->
+            Card(Modifier.fillMaxWidth().padding(top = 8.dp).clickable {
+                vm.clearResumePoint()
+                vm.dismissNotice()
+            }) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(message, style = MaterialTheme.typography.bodySmall)
+                    Text("tap to start from the beginning", style = MaterialTheme.typography.labelSmall)
+                }
+            }
         }
         state.error?.let { message ->
             Card(Modifier.fillMaxWidth().padding(top = 8.dp).clickable { vm.dismissError() }) {
