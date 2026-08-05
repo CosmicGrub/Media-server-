@@ -186,6 +186,33 @@ fun DisplayOptionsSheet(
                 style = MaterialTheme.typography.bodySmall,
             )
 
+            SectionHeader("Subtitle size")
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Slider(
+                    value = settings.subtitleScale,
+                    onValueChange = { v -> onChange { it.withSubtitleScale(v) } },
+                    valueRange = DisplaySettings.MIN_SUBTITLE_SCALE..DisplaySettings.MAX_SUBTITLE_SCALE,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.size(12.dp))
+                Text(
+                    String.format(java.util.Locale.US, "%.1f×", settings.subtitleScale),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            ChipRow(
+                options = listOf(true, false),
+                selected = settings.subtitleBackground,
+                label = { if (it) "Background" else "No background" },
+                onSelect = { v -> onChange { it.copy(subtitleBackground = v) } },
+            )
+            Text(
+                "Applies to plain-text subtitles. Styled formats (ASS, PGS) keep the styling the " +
+                    "file itself carries — a scale and a background here would fight a positioned, " +
+                    "coloured subtitle rather than improve it.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = LayoutArrangement.spacedBy(8.dp)) {
                 TextButton(onClick = { onChange { it.reset() } }, enabled = settings.isModified()) {

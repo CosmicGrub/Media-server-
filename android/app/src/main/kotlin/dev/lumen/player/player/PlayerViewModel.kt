@@ -316,15 +316,6 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
             .build()
     }
 
-    /** The inverse of [disableSubtitles], once the user picks a track again. */
-    fun enableSubtitles() {
-        val controller = _player.value ?: return
-        controller.trackSelectionParameters = controller.trackSelectionParameters
-            .buildUpon()
-            .setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false)
-            .build()
-    }
-
     fun dismissError() {
         _state.value = _state.value.copy(error = null)
     }

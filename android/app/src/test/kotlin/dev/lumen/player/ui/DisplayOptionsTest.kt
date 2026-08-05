@@ -118,6 +118,33 @@ class DisplayOptionsTest {
     }
 
     @Test
+    fun `subtitle scale is clamped at both ends`() {
+        val s = DisplaySettings()
+        assertEquals(
+            DisplaySettings.MAX_SUBTITLE_SCALE,
+            s.withSubtitleScale(10f).subtitleScale,
+            0.0001f,
+        )
+        assertEquals(
+            DisplaySettings.MIN_SUBTITLE_SCALE,
+            s.withSubtitleScale(0f).subtitleScale,
+            0.0001f,
+        )
+        assertEquals(1.5f, s.withSubtitleScale(1.5f).subtitleScale, 0.0001f)
+    }
+
+    @Test
+    fun `reset also returns subtitle styling to its defaults`() {
+        val fiddled = DisplaySettings()
+            .withSubtitleScale(2f)
+            .copy(subtitleBackground = false)
+        assertTrue(fiddled.isModified())
+        val back = fiddled.reset()
+        assertEquals(1f, back.subtitleScale, 0.0001f)
+        assertTrue(back.subtitleBackground)
+    }
+
+    @Test
     fun `zoom snaps back to exactly one and drops the pan with it`() {
         // Pinching is imprecise. A residual 1.02 looks like a rendering bug rather than a setting,
         // and a pan left behind at 1.0 leaves the picture stuck off-centre with no way to recover it.

@@ -138,6 +138,11 @@ data class DisplaySettings(
     /** Pan offset in pixels, meaningful only while zoomed in. */
     val panX: Float = 0f,
     val panY: Float = 0f,
+    /** Multiplier on the default subtitle text size. */
+    val subtitleScale: Float = 1f,
+    /** The dark box behind subtitle text. Off is the look most plain-text subtitles were authored
+     *  for; some players default it on for legibility over a bright frame, so both are offered. */
+    val subtitleBackground: Boolean = true,
 ) {
     /**
      * The split is clamped rather than free. A pane dragged to nothing is a pane the user cannot
@@ -161,6 +166,9 @@ data class DisplaySettings(
     fun withPan(dx: Float, dy: Float): DisplaySettings =
         if (zoom <= 1f) this else copy(panX = panX + dx, panY = panY + dy)
 
+    fun withSubtitleScale(scale: Float) =
+        copy(subtitleScale = scale.coerceIn(MIN_SUBTITLE_SCALE, MAX_SUBTITLE_SCALE))
+
     /** True when anything has been changed from the defaults — what the reset button keys off. */
     fun isModified(): Boolean = this != DisplaySettings(viewMode = viewMode)
 
@@ -173,6 +181,8 @@ data class DisplaySettings(
         const val MAX_SPLIT = 0.85f
         const val MIN_ZOOM = 1f
         const val MAX_ZOOM = 4f
+        const val MIN_SUBTITLE_SCALE = 0.5f
+        const val MAX_SUBTITLE_SCALE = 2.5f
     }
 }
 
@@ -254,6 +264,8 @@ class DisplayOptionsStore(context: Context) {
             .putString(KEY_ASPECT, s.aspect.name)
             .putString(KEY_ORIENTATION, s.orientation.name)
             .putFloat(KEY_SPLIT, s.splitFraction)
+            .putFloat(KEY_SUB_SCALE, s.subtitleScale)
+            .putBoolean(KEY_SUB_BG, s.subtitleBackground)
             .apply()
     }
 
@@ -264,6 +276,9 @@ class DisplayOptionsStore(context: Context) {
         orientation = prefs.getString(KEY_ORIENTATION, null).toEnum(OrientationLock.Auto),
         splitFraction = prefs.getFloat(KEY_SPLIT, DisplaySettings.DEFAULT_SPLIT)
             .coerceIn(DisplaySettings.MIN_SPLIT, DisplaySettings.MAX_SPLIT),
+        subtitleScale = prefs.getFloat(KEY_SUB_SCALE, 1f)
+            .coerceIn(DisplaySettings.MIN_SUBTITLE_SCALE, DisplaySettings.MAX_SUBTITLE_SCALE),
+        subtitleBackground = prefs.getBoolean(KEY_SUB_BG, true),
     )
 
     private companion object {
@@ -273,6 +288,8 @@ class DisplayOptionsStore(context: Context) {
         const val KEY_ASPECT = "aspect"
         const val KEY_ORIENTATION = "orientation"
         const val KEY_SPLIT = "split"
+        const val KEY_SUB_SCALE = "sub_scale"
+        const val KEY_SUB_BG = "sub_bg"
     }
 }
 

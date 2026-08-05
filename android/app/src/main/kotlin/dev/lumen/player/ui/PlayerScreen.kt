@@ -457,6 +457,30 @@ private fun VideoSurface(
                 view.findViewById<androidx.media3.ui.AspectRatioFrameLayout>(
                     androidx.media3.ui.R.id.exo_content_frame
                 )?.setAspectRatio(settings.aspect.ratio ?: 0f)
+
+                // `setApplyEmbeddedStyles` is deliberately left at Media3's default (on): ASS and
+                // PGS carry their own position and colour, often used to place a forced subtitle
+                // where it will not cover the picture, and forcing an override here would fight that
+                // rather than improve it. `setStyle`/text size below is the fallback style Media3
+                // uses for cues with no embedded styling of their own — plain SRT and VTT, which is
+                // exactly the case a size and background toggle are for.
+                view.subtitleView?.setFractionalTextSize(
+                    androidx.media3.ui.SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * settings.subtitleScale
+                )
+                view.subtitleView?.setStyle(
+                    androidx.media3.ui.CaptionStyleCompat(
+                        android.graphics.Color.WHITE,
+                        if (settings.subtitleBackground) {
+                            android.graphics.Color.argb(160, 0, 0, 0)
+                        } else {
+                            android.graphics.Color.TRANSPARENT
+                        },
+                        android.graphics.Color.TRANSPARENT,
+                        androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                        android.graphics.Color.BLACK,
+                        /* typeface = */ null,
+                    )
+                )
             },
             onRelease = { view -> view.player = null },
         )
