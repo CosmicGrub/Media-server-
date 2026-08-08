@@ -112,14 +112,22 @@ jobs:
   # under active development, not a version anyone should pin to. It is marked as a prerelease for
   # the same reason.
   publish:
-    name: publish to android-latest
+    name: publish to android-latest-tabs9fe
     needs: build
-    # Only from the development branch and the default branch. A release that moved on every feature
-    # branch would make the "latest" link mean nothing.
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/claude/multiplatform-media-player-server-b7dwe7'
+    # This branch (`device/galaxy-tab-s9-fe`) is its own fork now, not a landing page tracking the
+    # shared development branch, so it publishes on every push to itself rather than being gated on
+    # `main` or the development branch's name.
+    if: github.ref == 'refs/heads/device/galaxy-tab-s9-fe'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
+    env:
+      # A fork-specific rolling tag. Keeping this distinct from `android-latest` (the shared
+      # development build) and from the other device forks' own tags is what lets all of them
+      # publish from the same repository without three branches fighting to move the same tag out
+      # from under each other on every push.
+      RELEASE_TAG: android-latest-tabs9fe
 
     steps:
       - uses: actions/checkout@v4
@@ -153,9 +161,12 @@ jobs:
           SHORT: ${{ steps.assets.outputs.short }}
         run: |
           set -euo pipefail
-          NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
+          NOTES="Rolling build of the Galaxy Tab S9 FE fork (\`${GITHUB_REF_NAME}\`) at \`${SHORT}\`.
 
-          **Sideload straight from the phone:** open this page in the phone's browser, tap
+          Installs side-by-side with the shared development build and the other device forks —
+          this one's applicationId is \`dev.lumen.player.tabs9fe\`, not \`dev.lumen.player\`.
+
+          **Sideload straight from the tablet:** open this page in the tablet's browser, tap
           \`lumen.apk\`, and allow installation from that browser when Android asks.
 
           **Or over USB from a PC**, with developer options and USB debugging on:
@@ -167,33 +178,33 @@ jobs:
           Play listing. It is not a production signing key, and this is a development build rather
           than anything that should be distributed."
 
-          if gh release view android-latest >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # `gh release edit --target` cannot move the tag of a published release — the API ignores
             # target_commitish once a release is out of draft — so the tag is moved directly. Without
             # this the release would keep pointing at whichever commit first created it while serving
             # assets from a much later one.
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/android-latest" \
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
               -f sha="$GITHUB_SHA" -F force=true > /dev/null
-            gh release edit android-latest \
-              --title "Lumen Android — build ${SHORT}" --notes "$NOTES" --prerelease
+            gh release edit "$RELEASE_TAG" \
+              --title "Lumen Android (Tab S9 FE) — build ${SHORT}" --notes "$NOTES" --prerelease
           else
-            gh release create android-latest \
+            gh release create "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
-              --title "Lumen Android — build ${SHORT}" \
+              --title "Lumen Android (Tab S9 FE) — build ${SHORT}" \
               --notes "$NOTES" \
               --prerelease
           fi
           # `--clobber` rather than deleting the release: deleting it would break every link already
           # shared, which is the one thing a rolling "latest" URL exists to avoid.
-          gh release upload android-latest lumen.apk lumen-debug.apk --clobber
+          gh release upload "$RELEASE_TAG" lumen.apk lumen-debug.apk --clobber
 
       - name: Say where it landed
         run: |
           echo "### APK published" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/android-latest>" >> "$GITHUB_STEP_SUMMARY"
+          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Open that on the phone and tap \`lumen.apk\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Open that on the tablet and tap \`lumen.apk\`." >> "$GITHUB_STEP_SUMMARY"
 
   # A headless emulator. This is the only check that proves the APK installs and starts — a build
   # that compiles tells you nothing about whether the Activity survives to RESUMED, and a crash on

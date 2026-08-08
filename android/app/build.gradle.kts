@@ -9,7 +9,11 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.lumen.player"
+        // Distinct from the shared-development build (`dev.lumen.player`) on purpose: this is the
+        // `device/galaxy-tab-s9-fe` fork, and a divergent applicationId is what lets it install
+        // side-by-side with the mainline build and the other device forks on the same tablet,
+        // rather than colliding over one package slot.
+        applicationId = "dev.lumen.player.tabs9fe"
         // 24 covers everything still receiving updates while keeping the modern MediaCodec surface.
         // A Fold 5 runs 34+, so nothing here is constrained by the floor.
         minSdk = 24
