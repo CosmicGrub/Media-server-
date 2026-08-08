@@ -10,16 +10,24 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Cast
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
@@ -27,6 +35,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
 import dev.lumen.player.player.PipAspectRatio
 import dev.lumen.player.player.PlayerViewModel
+import dev.lumen.player.remote.RemoteScreen
+import dev.lumen.player.remote.RemoteViewModel
 import dev.lumen.player.ui.PlayerScreen
 
 @UnstableApi
@@ -52,6 +62,15 @@ class MainActivity : ComponentActivity() {
             this,
             ViewModelProvider.AndroidViewModelFactory.getInstance(application),
         )[PlayerViewModel::class.java]
+    }
+
+    /** Same pattern as [vm]: obtained via `ViewModelProvider` so it survives configuration changes
+     * (fold, rotation) rather than reconnecting to the desktop on every one of them. */
+    private val remoteVm: RemoteViewModel by lazy {
+        ViewModelProvider(
+            this,
+            ViewModelProvider.AndroidViewModelFactory.getInstance(application),
+        )[RemoteViewModel::class.java]
     }
 
     /**
@@ -129,18 +148,52 @@ class MainActivity : ComponentActivity() {
                         setSystemBarsHidden(display.viewMode.hidesSystemBars)
                     }
 
+                    // Which player this screen shows. A plain boolean rather than pulling in
+                    // Navigation-Compose for one additional destination — this app has stayed with
+                    // ViewModel-held state and a `when` for its whole life, and a second screen is
+                    // not the reason to change that.
+                    var showRemote by rememberSaveable { mutableStateOf(false) }
+
                     Scaffold(Modifier.fillMaxSize()) { insets ->
                         // The video itself goes edge to edge — letterboxing a film to avoid a
                         // status bar defeats the point — so only the surrounding chrome is inset.
                         val inPip by isInPip
-                        PlayerScreen(
-                            vm = vm,
-                            settings = display,
-                            onSettingsChange = displayOptions::update,
-                            contentPadding = insets,
-                            onRequestAccess = onRequestAccess,
-                            isInPip = inPip,
-                        )
+                        if (showRemote) {
+                            RemoteScreen(
+                                vm = remoteVm,
+                                contentPadding = insets,
+                                onClose = { showRemote = false },
+                            )
+                        } else {
+                            Box(Modifier.fillMaxSize()) {
+                                PlayerScreen(
+                                    vm = vm,
+                                    settings = display,
+                                    onSettingsChange = displayOptions::update,
+                                    contentPadding = insets,
+                                    onRequestAccess = onRequestAccess,
+                                    isInPip = inPip,
+                                )
+                                // Opposite corner from PlayerScreen's own view-mode button, and
+                                // hidden in PiP for the same reason that button is: a floating
+                                // window the size of a playing card has no room for a second
+                                // control nobody can read at that size. Not shown while immersive
+                                // either — the whole point of that mode is nothing but the picture.
+                                if (!inPip && !display.viewMode.hidesSystemBars) {
+                                    SmallFloatingActionButton(
+                                        onClick = { showRemote = true },
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                                            .copy(alpha = 0.75f),
+                                        modifier = Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .padding(bottom = insets.calculateBottomPadding())
+                                            .padding(16.dp),
+                                    ) {
+                                        Icon(Icons.Filled.Cast, contentDescription = "Control a desktop player")
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
