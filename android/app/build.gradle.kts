@@ -9,7 +9,12 @@ android {
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "dev.lumen.player"
+        // Distinct from the shared-development build (`dev.lumen.player`) on purpose: this is the
+        // `device/galaxy-z-fold-5` fork, and a divergent applicationId is what lets it install
+        // side-by-side with the mainline build and with the other device forks on the same phone,
+        // rather than fighting over one signature/package slot the way `applicationIdSuffix` does
+        // for debug builds within a single source tree.
+        applicationId = "dev.lumen.player.fold5"
         // 24 covers everything still receiving updates while keeping the modern MediaCodec surface.
         // A Fold 5 runs 34+, so nothing here is constrained by the floor.
         minSdk = 24
