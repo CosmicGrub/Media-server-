@@ -15,12 +15,19 @@ on:
   # least convenient. Changing this file revalidates it against an open pull request, so a mistake
   # surfaces on the commit that caused it rather than during a release.
   #
-  # NOT YET EXERCISED END TO END. `workflow_dispatch` requires this file to be on the default
-  # branch, and this session's git proxy rejects tag pushes, so neither route was available when it
-  # was written. Once it is on `main`, verify it before relying on it:
+  # NOT YET EXERCISED END TO END. `workflow_dispatch` requires the workflow to already be
+  # registered on the repository's default branch — confirmed by trying it from this branch
+  # (`gh api ... /actions/workflows/release.yml/dispatches` → 404, since it only exists here) — and
+  # this session's git proxy rejects tag pushes, so neither route is available yet. Once it is on
+  # `main`, verify it before relying on it:
   #     gh workflow run release.yml --ref main
   # The per-platform `cargo build --release` it performs is covered by rust.yml on all three
-  # operating systems; what is unverified is the staging, mpv bundling and packaging around it.
+  # operating systems, including the two properties this file's own steps additionally check for
+  # Windows specifically (target-feature=+crt-static needing no VC++ Redistributable, and the
+  # bundled mpv's codec coverage) — rust.yml exercises both of those for real on windows-latest too,
+  # against a debug build fetched via the actual `lumen setup` path rather than this file's release
+  # build. What is still unverified here, specifically, is the staging, packaging and zip layout
+  # this file performs around all of that.
   pull_request:
     paths:
       - '.github/workflows/release.yml'

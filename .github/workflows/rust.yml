@@ -80,6 +80,51 @@ jobs:
           mkdir -p empty-lib
           cargo run -q -p lumen-play -- scan empty-lib
 
+      # `lumen setup`'s download path (real sourceforge/github fetch, real 7z extraction) has never
+      # actually run anywhere before this — it is only reachable when mpv is not already on the
+      # machine, and every other CI job either has mpv preinstalled (the apt package on Linux, in
+      # release.yml's case a separately-downloaded copy) or skips this entirely. A bare
+      # windows-latest runner has no mpv, which makes it the one place this path gets exercised for
+      # real rather than assumed to work because the PowerShell inside it reads correctly.
+      #
+      # Also checks the thing "appropriate codecs included" actually means: the fetched mpv's own
+      # reported decoder list, not the upstream build's reputation. TrueHD and DTS-HD MA (FFmpeg
+      # calls its DTS decoder `dca`) don't decode on the Android build because that is gated on OEM
+      # hardware/software licensing that mostly does not exist on a phone — this desktop build has no
+      # such gate, since FFmpeg's own software decoders cover all of them, and this is what checks
+      # that rather than assuming it.
+      - name: Fetch mpv via lumen setup and verify codec coverage (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          cargo run -q -p lumen-play -- setup
+          if ($LASTEXITCODE -ne 0) { throw "lumen setup failed with exit code $LASTEXITCODE" }
+
+          $mpv = 'target/debug/mpv.exe'
+          if (-not (Test-Path $mpv)) { throw 'lumen setup reported success but target/debug/mpv.exe is missing' }
+
+          Write-Host '== lumen doctor now finds it =='
+          cargo run -q -p lumen-play -- doctor
+
+          $video = (& $mpv --vd=help 2>&1 | Out-String)
+          $audio = (& $mpv --ad=help 2>&1 | Out-String)
+          Write-Host "== video decoders =="
+          Write-Host $video
+          Write-Host "== audio decoders =="
+          Write-Host $audio
+
+          $requiredVideo = 'h264', 'hevc', 'vp9', 'av1', 'mpeg2video', 'vc1'
+          $requiredAudio = 'ac3', 'eac3', 'dca', 'truehd', 'flac', 'aac', 'opus', 'mp3'
+          $missing = @()
+          foreach ($c in $requiredVideo) { if ($video -notmatch [regex]::Escape($c)) { $missing += "video:$c" } }
+          foreach ($c in $requiredAudio) { if ($audio -notmatch [regex]::Escape($c)) { $missing += "audio:$c" } }
+          if ($missing.Count -gt 0) {
+            throw "fetched mpv is missing expected decoders: $($missing -join ', ')"
+          }
+          Write-Host 'OK -- full video and audio codec set present, including TrueHD and DTS-HD MA (dca)'
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
