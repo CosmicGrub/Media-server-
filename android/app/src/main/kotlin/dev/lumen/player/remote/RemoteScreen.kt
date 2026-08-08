@@ -98,7 +98,7 @@ private fun ConnectForm(state: RemoteUiState, onConnect: (String, Int) -> Unit, 
     var host by remember { mutableStateOf(state.lastHost) }
     var port by remember { mutableStateOf(state.lastPort) }
 
-    Column(verticalAlignment = Alignment.Start) {
+    Column {
         Text(
             "Connect to a desktop running “lumen serve” on the same network.",
             style = MaterialTheme.typography.bodyMedium,
