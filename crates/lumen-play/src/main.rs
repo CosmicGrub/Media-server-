@@ -17,6 +17,7 @@ mod fidelity;
 mod ipc;
 mod json;
 mod mpvbin;
+mod remote;
 mod report;
 mod scan;
 mod session;
@@ -36,6 +37,7 @@ lumen — media library player and test harness
   lumen items <paths...>              the collection, grouped into films and seasons
   lumen play  <paths...>              play everything found
   lumen test  <paths...>              open every file briefly and report which fail
+  lumen serve <path>                  run a persistent player a phone can pair with and control
 
 Options
   --seconds <n>       play only n seconds of each file (default 20 for `test`)
@@ -52,6 +54,10 @@ Options
   --json <path>       write the machine-readable report here
   --                  everything after this is passed to mpv verbatim
 
+`serve` options
+  --port <n>          TCP port to listen on (default 7890)
+  --bind <addr>       address to bind (default 0.0.0.0 — every interface)
+
 Other
   --help              this text
   --version           version and target platform
@@ -65,6 +71,13 @@ fn main() -> ExitCode {
         Some("doctor") => doctor(),
         Some("setup") => setup(),
         Some(c @ ("scan" | "items" | "play" | "test")) => match run(c, &args[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("serve") => match serve(&args[1..]) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -204,6 +217,44 @@ fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
     // A failed file is the finding. Exiting zero on a run that could not open half the library would
     // make this useless in a script.
     Ok(if session.failed().count() > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// A persistent, remotely controllable player. Runs until the process is killed.
+fn serve(args: &[String]) -> Result<ExitCode, String> {
+    // The one positional argument: the library path. A small hand-rolled walk rather than reusing
+    // `positional()`'s `TAKES_VALUE` list, which belongs to `play`/`test`'s own options and has
+    // nothing to do with `--port`/`--bind`.
+    let stop = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut root = None;
+    let mut i = 0;
+    while i < stop {
+        let a = &args[i];
+        if a == "--port" || a == "--bind" {
+            i += 2;
+            continue;
+        }
+        if !a.starts_with("--") && root.is_none() {
+            root = Some(PathBuf::from(a));
+        }
+        i += 1;
+    }
+    let root = root.ok_or("usage: lumen serve <path> [--port <n>] [--bind <addr>]")?;
+
+    if !root.exists() {
+        return Err(format!("{} does not exist", root.display()));
+    }
+
+    let port: u16 = value(args, "--port")
+        .map(|v| v.parse().map_err(|_| format!("--port must be a number, got {v:?}")))
+        .transpose()?
+        .unwrap_or(7890);
+    let bind = value(args, "--bind").unwrap_or_else(|| "0.0.0.0".to_string());
+
+    println!(
+        "lumen serve — do not forward this port through your router; it is meant for your own LAN"
+    );
+    remote::server::run(&root, &bind, port, &passthrough(args), |line| println!("{line}"))?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn write_json(
