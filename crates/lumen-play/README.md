@@ -13,9 +13,13 @@ library is also the first real test of that code on data that is not a fixture.
 Linux, and both Mac architectures — on every `v*` tag, and on demand via workflow dispatch. Grab
 the artifact for your platform from the Actions run and unpack it.
 
-The **Windows** bundle is self-contained: it carries `mpv.exe` (statically linked FFmpeg and
-libplacebo) beside `lumen.exe`, so the folder runs from a USB stick with nothing installed. Nothing
-touches the registry; deleting the folder undoes everything.
+The **Windows** bundle is self-contained: `lumen.exe`'s C runtime is statically linked
+(`target-feature=+crt-static`, see `.cargo/config.toml`), so it needs no Visual C++ Redistributable
+installed — and it carries `mpv.exe` beside it (statically linked FFmpeg and libplacebo), so the
+folder runs from a USB stick with nothing installed and nothing touching the registry. Both of those
+claims are checked in `release.yml` on every build — the binary's import table for a stray
+VCRUNTIME/MSVCP dependency, and mpv's own reported decoder list for the full codec set, TrueHD and
+DTS-HD MA included — rather than assumed to still hold from an earlier release.
 
 **Linux and macOS** bundles ship the binary alone, because mpv there is dynamically linked against
 a long dependency chain and shipping that correctly means shipping a distribution — which the

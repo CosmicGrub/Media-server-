@@ -94,6 +94,31 @@ jobs:
             "$BIN" --version
           fi
 
+      # `.cargo/config.toml` statically links the MSVC CRT for this target specifically, so
+      # lumen.exe needs no Visual C++ Redistributable on the machine that runs it — checked here
+      # rather than assumed, the same evidence-over-assumption approach `package-windows.sh` already
+      # uses (it objdumps the mingw-gnu build for exactly this class of missing dependency).
+      - name: Set up MSVC dev tools (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Verify lumen.exe needs no VC++ Redistributable (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          $deps = (dumpbin /dependents $bin | Out-String)
+          Write-Host $deps
+          # If either of these shows up, target-feature=+crt-static silently stopped applying and
+          # the binary is back to needing the redistributable installed on the target machine —
+          # which would surface as a "VCRUNTIME140.dll was not found" dialog on a bare Windows
+          # install, a worse first impression than any error this program prints itself.
+          if ($deps -match 'VCRUNTIME|MSVCP\d') {
+            throw "lumen.exe still imports a VC++ runtime DLL -- target-feature=+crt-static is not taking effect. See dumpbin output above."
+          }
+          Write-Host 'OK -- no VCRUNTIME/MSVCP dependency; the Visual C++ Redistributable is not required'
+
       - name: Stage the bundle
         shell: bash
         run: |
@@ -147,6 +172,43 @@ jobs:
           & "$out/lumen.exe" doctor
           Write-Host "mpv bundled: $((Get-Item "$out/mpv.exe").Length / 1MB) MB"
 
+      # "All dependencies and appropriate codecs included" checked, not assumed. This is the bundle's
+      # real advantage over the Android build: TrueHD, DTS-HD MA, DTS and DTS:X don't decode there
+      # because that's gated on an OEM licensing a hardware or software decoder that mostly does not
+      # exist on a phone, but this mpv's statically linked FFmpeg carries its own software decoder for
+      # every one of them — nothing here is limited by what Windows itself ships. Same
+      # evidence-over-assumption approach as the DLL-import check above and `package-windows.sh`'s
+      # own objdump check: read what mpv actually reports it can decode, rather than trust that the
+      # build fetched still has what an earlier release verified.
+      - name: Verify codec coverage (Windows)
+        if: matrix.os == 'windows-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "dist/lumen-${{ matrix.name }}"
+          $mpv = "$out/mpv.exe"
+
+          $video = (& $mpv --vd=help 2>&1 | Out-String)
+          $audio = (& $mpv --ad=help 2>&1 | Out-String)
+          Write-Host "== video decoders =="
+          Write-Host $video
+          Write-Host "== audio decoders =="
+          Write-Host $audio
+
+          # dca is FFmpeg's decoder name for DTS (Digital Theater Systems, historical), and covers
+          # the DTS-HD MA and DTS:X extensions losslessly, not just the DTS core.
+          $requiredVideo = 'h264', 'hevc', 'vp9', 'av1', 'mpeg2video', 'vc1'
+          $requiredAudio = 'ac3', 'eac3', 'dca', 'truehd', 'flac', 'aac', 'opus', 'mp3'
+
+          $missing = @()
+          foreach ($c in $requiredVideo) { if ($video -notmatch [regex]::Escape($c)) { $missing += "video:$c" } }
+          foreach ($c in $requiredAudio) { if ($audio -notmatch [regex]::Escape($c)) { $missing += "audio:$c" } }
+
+          if ($missing.Count -gt 0) {
+            throw "bundled mpv is missing expected decoders: $($missing -join ', ')"
+          }
+          Write-Host 'OK -- full video and audio codec set present, including TrueHD and DTS-HD MA (dca)'
+
       - name: Add the quick-start note
         shell: bash
         run: |
@@ -154,6 +216,11 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cat > "$OUT/START-HERE.txt" <<'TXT'
           lumen - media library player and test harness
+
+          Nothing to install. lumen.exe's C runtime is statically linked (no Visual C++
+          Redistributable needed) and mpv.exe's FFmpeg is statically linked with its own software
+          decoders for every codec this product supports, TrueHD and DTS-HD MA included -- CI checks
+          both of those on every build rather than assuming they still hold.
 
           1. Open PowerShell in this folder (Shift+right-click > "Open PowerShell window here").
 

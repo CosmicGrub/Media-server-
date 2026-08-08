@@ -360,9 +360,6 @@ fn setup() -> ExitCode {
     // PowerShell does the work: it is present on every supported Windows, handles TLS and redirects,
     // and `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
     // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
-    // PowerShell does the work: present on every supported Windows, handles TLS and redirects, and
-    // `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
-    // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
     //
     // SourceForge first because that is the source mpv.io itself links to for Windows, and its URL
     // shape is stable. GitHub is the fallback: its API is rate-limited unauthenticated, which is
