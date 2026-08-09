@@ -247,6 +247,13 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
             "127.0.0.1",
             "--",
             "--vo=null", // No display in CI or this container; audio/video pipeline still runs.
+            // No audio device either. Without this, mpv's `loadfile` blocks on Windows while it
+            // probes WASAPI for a device that does not exist on a headless runner -- long enough to
+            // trip `run_command`'s 5-second reply timeout in remote/server.rs, which reads as "the
+            // player is not responding" even though mpv is fine and would have answered eventually.
+            // Linux/macOS were never affected (no such probe stalls audio-less there), which is
+            // exactly why this was invisible until this test first ran for real on Windows CI.
+            "--ao=null",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
