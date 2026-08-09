@@ -15,11 +15,23 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/rust.yml'
-  pull_request:
   workflow_dispatch:
+
+  # No `pull_request` trigger: every PR in this repo is a same-repo branch -> main (or -> the shared
+  # development branch), so `push` above already runs this exact commit's checks. A `pull_request` run
+  # would be a second full three-platform matrix, on paid-tier Windows/macOS runners, for the same
+  # commit and the same answer -- see `release.yml`'s `on:` block for the fuller version of this
+  # reasoning, which applies here identically.
 
 permissions:
   contents: read
+
+# Cancel a still-running run for the same branch the moment a newer push arrives, so three fixes
+# pushed minutes apart don't each burn a full paid-tier matrix to completion when only the last one's
+# result was ever going to matter.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
