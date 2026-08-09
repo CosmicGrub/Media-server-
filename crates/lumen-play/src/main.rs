@@ -458,10 +458,27 @@ try {
 }
 "#;
 
+    // Written to a temp file and run with `-File` rather than passed inline via `-Command`.
+    // `-Command`'s documented `-args <arg-array>` passthrough is specified for an actual ScriptBlock
+    // literal (`{ ... }`, only constructible from inside PowerShell itself) — not for plain script
+    // text handed in from an external process, which is all this ever was. That mismatch is exactly
+    // what left `$dest` as `$null` here: nothing in the script reads it until the very last few
+    // lines, so it went unnoticed until `lumen setup` was actually run to completion for the first
+    // time. `-File` binds trailing arguments to `$args` unambiguously, which is the whole reason it
+    // exists.
+    let script_path = std::env::temp_dir().join(format!("lumen-setup-{}.ps1", std::process::id()));
+    if let Err(e) = std::fs::write(&script_path, script) {
+        eprintln!("cannot write a temporary setup script to {}: {e}\n", script_path.display());
+        eprintln!("{}", mpvbin::install_hint());
+        return ExitCode::from(2);
+    }
+
     let status = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script, "-args"])
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script_path)
         .arg(&dir)
         .status();
+    let _ = std::fs::remove_file(&script_path);
 
     match status {
         Ok(s) if s.success() => {
