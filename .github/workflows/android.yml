@@ -326,3 +326,85 @@ jobs:
           path: android/app/build/reports/androidTests/
           if-no-files-found: ignore
           retention-days: 7
+
+  # The Fold 5 analogue of the Tab S9 FE walkthrough above -- same script, different profile, plus
+  # the one thing a slab-shaped device cannot exercise at all: folding. `pixel_fold` is Google's own
+  # foldable and the closest built-in AVD equivalent to a Z Fold 5 (no canned "Galaxy Z Fold 5"
+  # profile exists), close enough on inner-screen aspect ratio to actually exercise the posture-aware
+  # layout `fold/FoldState.kt` drives, not just resize a phone layout to fit.
+  device-walkthrough:
+    name: device walkthrough (Fold 5)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Free disk space for the AVD
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android/sdk/ndk \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /usr/local/lib/node_modules || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Download the built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: android/apks
+
+      # mpv on the *runner*, not the emulator -- this is what synthesizes the real test clip pushed
+      # to the device below, the same lavfi+encode technique the desktop CLI's own tests and
+      # release.yml's playback verification already use. No fixture checked into the repo.
+      - name: Install mpv (for synthesizing the test clip)
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mpv
+
+      - name: Synthesize a real test clip
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mpv "av://lavfi:testsrc2=size=320x180:rate=15:duration=4" \
+            --audio-file="av://lavfi:sine=frequency=440:duration=4" \
+            --o=lumen-probe.mp4 --ovc=libx264 --ovcopts=preset=ultrafast --oac=aac --msg-level=all=error
+          ls -lh lumen-probe.mp4
+
+      - name: Walk through the app on a Fold 5-profiled emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_fold
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -no-snapshot-save -camera-back none
+          disk-size: 6144M
+          disable-animations: true
+          script: cd android && ./ci/device-walkthrough.sh dev.lumen.player.fold5.debug --foldable
+
+      - name: Upload walkthrough evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-fold5-walkthrough
+          path: android/walkthrough/
+          if-no-files-found: warn
+          retention-days: 14
