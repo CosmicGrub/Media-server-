@@ -21,9 +21,18 @@ claims are checked in `release.yml` on every build — the binary's import table
 VCRUNTIME/MSVCP dependency, and mpv's own reported decoder list for the full codec set, TrueHD and
 DTS-HD MA included — rather than assumed to still hold from an earlier release.
 
-**Linux and macOS** bundles ship the binary alone, because mpv there is dynamically linked against
-a long dependency chain and shipping that correctly means shipping a distribution — which the
-package manager already is:
+**Linux and macOS** are self-contained too, the same way Windows is, just with different tools:
+mpv is vendored beside `lumen`, along with the codec/format/subtitle layer a bare OS install does
+not already have (FFmpeg, libx264/x265, dav1d, libass, and the rest). What is deliberately *not*
+vendored is GL/Vulkan/VA-API, the display server, the audio server, and the security/identity stack
+— those have to be this machine's own, or hardware decode, window rendering, audio routing and
+certificate validation would all be running against a frozen copy nothing ever updates. `lumen`
+finds the vendored copy the same way it finds a bundled Windows one — beside its own executable,
+checked first. `release.yml` proves the vendored pair actually decodes a file, with
+`LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` unset, on every build.
+
+No mpv on the machine and building your own bundle instead of downloading one? Same one prerequisite
+either way, to vendor *from*:
 
 ```bash
 #   macOS     brew install mpv
@@ -35,6 +44,13 @@ package manager already is:
 ```bash
 cargo build --release -p lumen-play
 ./target/release/lumen doctor
+```
+
+Building a bundle with mpv vendored in, on the platform you're building for:
+
+```bash
+./crates/lumen-play/package-linux.sh --with-mpv    # -> dist/lumen-linux-x86_64.tar.gz  (needs patchelf)
+./crates/lumen-play/package-macos.sh  --with-mpv    # -> dist/lumen-macos-<arch>.tar.gz
 ```
 
 Cross-compiling a Windows bundle from Linux, which is how the first one was made:

