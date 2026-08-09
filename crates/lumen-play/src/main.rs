@@ -364,40 +364,75 @@ fn setup() -> ExitCode {
     // SourceForge first because that is the source mpv.io itself links to for Windows, and its URL
     // shape is stable. GitHub is the fallback: its API is rate-limited unauthenticated, which is
     // fine for one call but not something to depend on first.
+    //
+    // Both sources are tried for the *download itself*, not just the version lookup — a GitHub
+    // Actions runner hitting SourceForge's `/download` redirector has been observed getting back a
+    // small mirror-selection or rate-limit page instead of the archive, on a run where the listing
+    // page it walked moments earlier loaded fine. A `try` around the lookup alone never sees that
+    // failure, so the GitHub fallback never fires: the fix is a real fallback chain over the whole
+    // fetch, and validating the result by its actual 7-Zip file signature rather than by size, since
+    // an interstitial page is not guaranteed to land under any particular byte threshold.
     let script = r#"
 $ErrorActionPreference = 'Stop'
 $dest = $args[0]
 $tmp  = Join-Path $env:TEMP ("lumen-mpv-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 $ProgressPreference = 'SilentlyContinue'
+# A generic browser-like UA: SourceForge has been seen serving a different (small, non-archive)
+# response to requests that look scripted, and Invoke-WebRequest's default UA names itself and the
+# PowerShell version outright.
+$ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) lumen-setup'
 
-function Get-Url {
+function Get-Candidates {
+  $out = @()
   try {
     Write-Host 'Looking up the latest mpv build (sourceforge)...'
-    $listing = Invoke-WebRequest -UseBasicParsing -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
+    $listing = Invoke-WebRequest -UseBasicParsing -UserAgent $ua -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
     $vers = [regex]::Matches($listing.Content, 'mpv-(\d+\.\d+\.\d+)-x86_64\.7z') |
             ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
     if ($vers) {
       $v = $vers[-1]
-      Write-Host ("  mpv " + $v)
-      return "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
+      Write-Host ("  mpv " + $v + " (sourceforge)")
+      $out += "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
     }
-  } catch { Write-Host '  sourceforge lookup failed, trying github' }
+  } catch { Write-Host '  sourceforge lookup failed' }
   try {
     $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest' -Headers @{ 'User-Agent' = 'lumen' }
     $a = $rel.assets | Where-Object { $_.name -like 'mpv-x86_64-2*' -and $_.name -like '*.7z' -and $_.name -notlike '*v3*' } | Select-Object -First 1
-    if ($a) { Write-Host ("  " + $a.name); return $a.browser_download_url }
+    if ($a) { Write-Host ("  " + $a.name + " (github)"); $out += $a.browser_download_url }
   } catch { }
-  return $null
+  return $out
+}
+
+# A 7-Zip archive always opens with this six-byte signature. Checking that, rather than a size
+# threshold, is what actually distinguishes "the real archive" from "some other small-ish response
+# that happened to clear an arbitrary byte count" — a captive portal or rate-limit page is not
+# guaranteed to land under any particular size.
+function Test-SevenZipSignature($path) {
+  $sig = [byte[]](0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C)
+  $bytes = [System.IO.File]::ReadAllBytes($path)
+  if ($bytes.Length -lt $sig.Length) { return $false }
+  for ($i = 0; $i -lt $sig.Length; $i++) { if ($bytes[$i] -ne $sig[$i]) { return $false } }
+  return $true
 }
 
 try {
-  $url = Get-Url
-  if (-not $url) { throw 'could not find an mpv download' }
+  $candidates = Get-Candidates
+  if (-not $candidates) { throw 'could not find an mpv download' }
+
   $archive = Join-Path $tmp 'mpv.7z'
-  Write-Host 'Downloading (about 30 MB)...'
-  Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
-  if ((Get-Item $archive).Length -lt 1MB) { throw 'the download is too small to be an mpv build' }
+  $downloaded = $false
+  foreach ($url in $candidates) {
+    try {
+      Write-Host "Downloading from $url ..."
+      Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -UserAgent $ua
+      if (Test-SevenZipSignature $archive) { $downloaded = $true; break }
+      Write-Host '  not a real 7-Zip archive (likely a mirror-selection or rate-limit page) -- trying the next source'
+    } catch {
+      Write-Host "  download failed: $($_.Exception.Message) -- trying the next source"
+    }
+  }
+  if (-not $downloaded) { throw 'every mpv download source returned something that was not a real archive' }
 
   Write-Host 'Extracting...'
   $extracted = $false

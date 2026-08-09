@@ -151,21 +151,55 @@ jobs:
           $out = "dist/lumen-${{ matrix.name }}"
           $tmp = Join-Path $env:RUNNER_TEMP "mpv"
           New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          # SourceForge has been observed serving a small mirror-selection/rate-limit page instead of
+          # the archive to requests that look scripted; a plain browser-like UA avoids it in
+          # practice, and the GitHub fallback below covers the rest.
+          $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) lumen-release'
 
           Write-Host 'Locating the latest mpv build...'
-          $listing = Invoke-WebRequest -UseBasicParsing -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
-          $vers = [regex]::Matches($listing.Content, 'mpv-(\d+\.\d+\.\d+)-x86_64\.7z') |
-                  ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
-          if (-not $vers) { throw 'no mpv version found' }
-          $v = $vers[-1]
-          Write-Host "mpv $v"
+          $candidates = @()
+          try {
+            $listing = Invoke-WebRequest -UseBasicParsing -UserAgent $ua -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
+            $vers = [regex]::Matches($listing.Content, 'mpv-(\d+\.\d+\.\d+)-x86_64\.7z') |
+                    ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
+            if ($vers) {
+              $v = $vers[-1]
+              Write-Host "  mpv $v (sourceforge)"
+              $candidates += "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
+            }
+          } catch { Write-Host '  sourceforge lookup failed' }
+          try {
+            $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest' -Headers @{ 'User-Agent' = 'lumen' }
+            $a = $rel.assets | Where-Object { $_.name -like 'mpv-x86_64-2*' -and $_.name -like '*.7z' -and $_.name -notlike '*v3*' } | Select-Object -First 1
+            if ($a) { Write-Host "  $($a.name) (github)"; $candidates += $a.browser_download_url }
+          } catch { }
+          if (-not $candidates) { throw 'no mpv download source found' }
+
+          # A 7-Zip archive always opens with this six-byte signature. Checking that, rather than a
+          # size threshold, is what actually tells "the real archive" apart from some other small
+          # response that happened to clear an arbitrary byte count — a rate-limit page is not
+          # guaranteed to land under any particular size.
+          function Test-SevenZipSignature($path) {
+            $sig = [byte[]](0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C)
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -lt $sig.Length) { return $false }
+            for ($i = 0; $i -lt $sig.Length; $i++) { if ($bytes[$i] -ne $sig[$i]) { return $false } }
+            return $true
+          }
 
           $archive = Join-Path $tmp 'mpv.7z'
-          Invoke-WebRequest -UseBasicParsing -OutFile $archive `
-            -Uri "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
-          # A captive portal or an error page saved to disk would "extract" to nothing and ship a
-          # bundle with no player in it.
-          if ((Get-Item $archive).Length -lt 1MB) { throw 'download too small to be an mpv build' }
+          $downloaded = $false
+          foreach ($url in $candidates) {
+            try {
+              Write-Host "Downloading from $url ..."
+              Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -UserAgent $ua
+              if (Test-SevenZipSignature $archive) { $downloaded = $true; break }
+              Write-Host '  not a real 7-Zip archive (likely a mirror-selection or rate-limit page) -- trying the next source'
+            } catch {
+              Write-Host "  download failed: $($_.Exception.Message) -- trying the next source"
+            }
+          }
+          if (-not $downloaded) { throw 'every mpv download source returned something that was not a real archive' }
 
           & 7z x $archive ("-o" + $tmp) -y | Out-Null
           $mpv = Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse | Select-Object -First 1
