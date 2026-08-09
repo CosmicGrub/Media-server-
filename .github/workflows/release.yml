@@ -17,6 +17,11 @@ name: Desktop release
 
 on:
   push:
+    # `branches: ['**']` is load-bearing, not decorative: GitHub Actions' own rule is that defining
+    # `tags` without `branches` makes a push trigger fire on tag pushes *only* — a plain branch push
+    # would never reach this workflow at all, silently, which is exactly the kind of thing that looks
+    # fine until the day someone expects `desktop-latest` to have updated and it hasn't.
+    branches: ['**']
     tags: ['v*']
     paths:
       - 'crates/lumen-play/**'
