@@ -1,33 +1,26 @@
 name: Desktop release
 
-# Builds the desktop player for Windows, Linux and macOS and uploads each as a downloadable
-# artifact. Trigger with `workflow_dispatch`, or by pushing a `v*` tag.
+# Builds the desktop player for Windows, Linux and macOS. Every push that touches the player
+# publishes a rolling `desktop-latest` release with all four platform bundles attached — the same
+# pattern `android.yml` uses for the phone build (`android-latest`), so there is one stable URL for
+# whatever this repository currently builds, on every platform, rather than having to know which
+# Actions run is current. `v*` tags and `workflow_dispatch` still work too, for a pinned build.
 #
 # Built natively on each runner rather than cross-compiled from one. Cross-compiling to Windows
 # works — `crates/lumen-play/package-windows.sh` does it — but it silently skips the Windows-only
 # code paths, and the named-pipe IPC transport is exactly the kind of thing that compiles under
 # `#[cfg(windows)]` on a Linux host and fails to link on a real one.
+#
+# Verified end to end via PR #2 (device/windows-pc → main), opened specifically to get this running
+# on real windows-latest/ubuntu-latest/macos-latest runners rather than staying theoretical: all four
+# platform legs green, including the CRT-static and codec-coverage checks below.
 
 on:
   push:
     tags: ['v*']
-  # A release pipeline that is only exercised at tag time is one that breaks at tag time, when it is
-  # least convenient. Changing this file revalidates it against an open pull request, so a mistake
-  # surfaces on the commit that caused it rather than during a release.
-  #
-  # NOT YET EXERCISED END TO END. `workflow_dispatch` requires the workflow to already be
-  # registered on the repository's default branch — confirmed by trying it from this branch
-  # (`gh api ... /actions/workflows/release.yml/dispatches` → 404, since it only exists here) — and
-  # this session's git proxy rejects tag pushes, so neither route is available yet. Once it is on
-  # `main`, verify it before relying on it:
-  #     gh workflow run release.yml --ref main
-  # The per-platform `cargo build --release` it performs is covered by rust.yml on all three
-  # operating systems, including the two properties this file's own steps additionally check for
-  # Windows specifically (target-feature=+crt-static needing no VC++ Redistributable, and the
-  # bundled mpv's codec coverage) — rust.yml exercises both of those for real on windows-latest too,
-  # against a debug build fetched via the actual `lumen setup` path rather than this file's release
-  # build. What is still unverified here, specifically, is the staging, packaging and zip layout
-  # this file performs around all of that.
+    paths:
+      - 'crates/lumen-play/**'
+      - '.github/workflows/release.yml'
   pull_request:
     paths:
       - '.github/workflows/release.yml'
@@ -328,3 +321,82 @@ jobs:
             dist/lumen-${{ matrix.name }}.tar.gz
           if-no-files-found: error
           retention-days: 30
+
+  # Publishes wherever the build job's four artifacts are, as one link that always points at the
+  # newest build — the same pattern `android.yml` already uses (`android-latest`) for the phone
+  # side. `needs: build` on a matrix job only succeeds once every leg does, so a rolling release
+  # never gets updated with one platform silently missing because its own build broke.
+  #
+  # Gated to this branch specifically, not also main or the shared development branch: this file's
+  # own Windows-specific verification steps above (the CRT-static check, the codec-coverage check)
+  # do not exist on those branches yet, and publishing from a branch that cannot itself produce what
+  # the release notes claim would be worse than not publishing at all.
+  publish:
+    name: publish to desktop-latest
+    needs: build
+    if: github.ref == 'refs/heads/device/windows-pc'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `name:` filter: pulls every platform's artifact from the matrix build into its own
+      # subdirectory. The release should carry all four bundles or none — a partial rolling release
+      # would look complete while quietly missing whichever platform's asset never made it in.
+      - name: Download every platform's build
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish or update the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+
+          # Flatten out of the per-artifact subdirectories actions/download-artifact created.
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} . \;
+          ASSETS=(lumen-windows-x86_64.zip lumen-linux-x86_64.tar.gz lumen-macos-aarch64.tar.gz lumen-macos-x86_64.tar.gz)
+          for a in "${ASSETS[@]}"; do
+            [ -f "$a" ] || { echo "expected asset $a is missing from the build; refusing to publish a partial release" >&2; exit 1; }
+          done
+          ls -lh "${ASSETS[@]}"
+
+          NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
+
+          Four platform bundles from the same commit: Windows, Linux, and both Mac architectures.
+          The Windows bundle is self-contained — \`lumen.exe\`'s C runtime is statically linked (no
+          Visual C++ Redistributable needed) and \`mpv.exe\` ships with it, full codec set included
+          (TrueHD and DTS-HD MA covered) — both checked on this exact build, not assumed. Linux and
+          macOS need mpv from their own package manager; see each bundle's \`START-HERE.txt\`.
+
+          This is a development build, not a versioned release."
+
+          if gh release view desktop-latest >/dev/null 2>&1; then
+            # `gh release edit --target` cannot move the tag of a published release — the API ignores
+            # target_commitish once a release is out of draft — so the tag is moved directly. Without
+            # this the release would keep pointing at whichever commit first created it while serving
+            # assets from a much later one.
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/desktop-latest" \
+              -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release edit desktop-latest \
+              --title "Lumen Desktop — build ${SHORT}" --notes "$NOTES" --prerelease
+          else
+            gh release create desktop-latest \
+              --target "$GITHUB_SHA" \
+              --title "Lumen Desktop — build ${SHORT}" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
+          # `--clobber` rather than deleting the release: deleting it would break every link already
+          # shared, which is the one thing a rolling "latest" URL exists to avoid.
+          gh release upload desktop-latest "${ASSETS[@]}" --clobber
+
+      - name: Say where it landed
+        run: |
+          echo "### Desktop builds published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/desktop-latest>" >> "$GITHUB_STEP_SUMMARY"
