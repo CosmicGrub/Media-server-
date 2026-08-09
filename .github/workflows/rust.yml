@@ -48,15 +48,34 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      # `remote_serve.rs` has a real integration test that pairs, plays, seeks and reads state back
+      # from an actual mpv process — but it self-skips ("mpv is not on PATH") rather than failing
+      # when mpv is absent, so it can run in a plain `cargo test` locally without every contributor
+      # installing mpv first. That default-skip means it has almost certainly never executed for
+      # real on any GitHub-hosted runner: nothing before this line ever put mpv on PATH. Installing
+      # it here, before Build/Test, is what turns "compiles, and the test didn't complain" into
+      # "a real mpv process was actually driven end to end."
+      - name: Install mpv (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq mpv
+          else
+            brew install mpv
+          fi
+
       - name: Build
         run: cargo build --workspace --all-targets
 
       - name: Test
         run: cargo test --workspace
 
-      # `lumen doctor` runs on a machine with no mpv here, which is itself worth exercising: it must
-      # report the absence and exit 2 rather than panicking. Exit 2 is the expected outcome, so a
-      # zero would be the failure.
+      # On windows-latest mpv is still absent here (the fetch happens further down), which is itself
+      # worth exercising: `doctor` must report the absence and exit 2 rather than panicking. On
+      # Linux/macOS mpv is already installed above, so `doctor` finding it and exiting 0 is the
+      # expected outcome there instead -- either is accepted below, per platform.
       - name: Smoke test the CLI
         shell: bash
         run: |
@@ -124,6 +143,26 @@ jobs:
             throw "fetched mpv is missing expected decoders: $($missing -join ', ')"
           }
           Write-Host 'OK -- full video and audio codec set present, including TrueHD and DTS-HD MA (dca)'
+
+      # The step above deliberately runs before mpv is on PATH, so it exercises `lumen setup`'s own
+      # download path rather than short-circuiting on "mpv is already available". Only now, with
+      # `target/debug/mpv.exe` fetched and proven, is it safe to put it on PATH and re-run
+      # `remote_serve.rs` for real -- it self-skips otherwise, the same silent gap Linux and macOS
+      # had before mpv was installed for them above. This is the Windows leg of the same fix.
+      - name: Put the fetched mpv on PATH and re-run the real-mpv integration test (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Content -Path $env:GITHUB_PATH -Value "$pwd\target\debug"
+
+      - name: Test remote_serve with real mpv (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v mpv || command -v mpv.exe
+          cargo test -p lumen-play --test remote_serve -- --nocapture
 
   lint:
     name: fmt + clippy

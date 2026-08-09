@@ -248,6 +248,51 @@ jobs:
           }
           Write-Host 'OK -- full video and audio codec set present, including TrueHD and DTS-HD MA (dca)'
 
+      # Everything above proves the binary starts and the codec list mpv reports looks right.
+      # Neither proves a file actually plays -- android.yml's `emulator` job boots a real device and
+      # runs the built APK for exactly this reason: a build that compiles and a build that works are
+      # different claims, and only running it tells them apart. This is the same proof for the
+      # desktop artifact.
+      #
+      # mpv renders its own test clip (real H.264/AAC, synthesized from a signal generator via its
+      # built-in lavfi support, not a fixture checked into the repo) and the exact `lumen`/`lumen.exe`
+      # this job just built plays it back through the exact mpv this job just bundled or installed --
+      # `--vo=null --ao=null` because a CI runner has neither a display nor an audio device, and
+      # `--hwdec=no` so the proof is this build's own software decode path, not a driver's.
+      - name: Install mpv (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq mpv
+          else
+            brew install mpv
+          fi
+
+      - name: Verify real playback
+        if: matrix.os != 'windows-latest' || (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="dist/lumen-${{ matrix.name }}"
+          BIN="$OUT/${{ matrix.bin }}"
+          PROBE="${RUNNER_TEMP:-/tmp}/lumen-probe.mkv"
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            MPV="$OUT/mpv.exe"
+          else
+            MPV="mpv"
+          fi
+
+          "$MPV" "av://lavfi:testsrc2=size=160x90:rate=8:duration=3" \
+            --audio-file="av://lavfi:sine=frequency=440:duration=3" \
+            --o="$PROBE" --ovc=libx264 --ovcopts=preset=ultrafast --oac=aac --msg-level=all=error
+          ls -lh "$PROBE"
+
+          "$BIN" test "$PROBE" --seconds 2 --vo null --hwdec no -- --ao=null
+          echo "OK -- lumen actually played a real file through mpv, not just started"
+
       - name: Add the quick-start note
         shell: bash
         run: |
