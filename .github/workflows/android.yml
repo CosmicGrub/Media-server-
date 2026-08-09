@@ -23,6 +23,13 @@ on:
 permissions:
   contents: read
 
+# Cancel a still-running run for the same branch the moment a newer push arrives. The `emulator` job
+# alone can run 45 minutes across a 2-entry API-level matrix; three pushes minutes apart should not
+# mean three of those in flight when only the last one's result was ever going to matter.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
