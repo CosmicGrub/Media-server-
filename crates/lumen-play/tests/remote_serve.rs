@@ -247,18 +247,25 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
             "127.0.0.1",
             "--",
             "--vo=null", // No display in CI or this container; audio/video pipeline still runs.
-            // No audio device either. Without this, mpv's `loadfile` blocks on Windows while it
-            // probes WASAPI for a device that does not exist on a headless runner -- long enough to
-            // trip `run_command`'s 5-second reply timeout in remote/server.rs, which reads as "the
-            // player is not responding" even though mpv is fine and would have answered eventually.
-            // Linux/macOS were never affected (no such probe stalls audio-less there), which is
-            // exactly why this was invisible until this test first ran for real on Windows CI.
-            "--ao=null",
+            "--ao=null", // No audio device either, for the same reason.
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("lumen must be runnable");
+
+    // mpv's own errors -- an unopenable file, a missing decoder, a rejected IPC command -- land on
+    // the server's stderr and were previously discarded outright, so a failure here had no more to
+    // go on than "the player is not responding". Forwarded live rather than buffered and printed on
+    // panic: the reader thread outlives the `Command` handle, and a buffer nothing ever flushes is
+    // no more useful than /dev/null.
+    if let Some(stderr) = server.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[lumen serve stderr] {line}");
+            }
+        });
+    }
 
     // The pairing code is on stdout, the first useful thing the server prints. Read lines until it
     // shows up rather than sleeping a fixed guess, which would be either too slow or too flaky.
