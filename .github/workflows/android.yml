@@ -326,3 +326,93 @@ jobs:
           path: android/app/build/reports/androidTests/
           if-no-files-found: ignore
           retention-days: 7
+
+  # A driven walkthrough on an emulator profiled after the Tab S9 FE, not just a headless test
+  # runner: sideloads the APK the `build` job just produced, exercises the permission flow, pushes a
+  # real media file and plays it through the app's own local-library screen, and saves screenshots
+  # plus a screen recording as artifacts. `emulator` above proves the app launches and its
+  # instrumented tests pass; this proves what a person tapping through it would actually see.
+  #
+  # Driven with adb + `uiautomator dump` text lookups rather than Espresso/Compose test APIs on
+  # purpose: no new test dependency, and locating a button by its own visible text ("Rescan") or a
+  # library row by the exact filename just pushed is exactly as precise as a human doing the same
+  # thing, without hard-coding screen coordinates that would not hold across a tablet's aspect ratio.
+  device-walkthrough:
+    name: device walkthrough (Tab S9 FE)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Free disk space for the AVD
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android/sdk/ndk \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /usr/local/lib/node_modules || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Download the built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: android/apks
+
+      # mpv on the *runner*, not the emulator -- this is what synthesizes the real test clip pushed
+      # to the device below, the same lavfi+encode technique the desktop CLI's own tests and
+      # release.yml's playback verification already use. No fixture checked into the repo.
+      - name: Install mpv (for synthesizing the test clip)
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mpv
+
+      - name: Synthesize a real test clip
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mpv "av://lavfi:testsrc2=size=320x180:rate=15:duration=4" \
+            --audio-file="av://lavfi:sine=frequency=440:duration=4" \
+            --o=lumen-probe.mp4 --ovc=libx264 --ovcopts=preset=ultrafast --oac=aac --msg-level=all=error
+          ls -lh lumen-probe.mp4
+
+      - name: Walk through the app on a Tab S9 FE-profiled emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          # No canned "Galaxy Tab S9 FE" AVD profile exists; `pixel_tablet` (2560x1600, 276 dpi) is
+          # the closest built-in equivalent -- a real 10-11" tablet form factor and density, not a
+          # phone profile stretched to fit.
+          profile: pixel_tablet
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -no-snapshot-save -camera-back none
+          disk-size: 6144M
+          disable-animations: true
+          script: cd android && ./ci/device-walkthrough.sh dev.lumen.player.tabs9fe.debug
+
+      - name: Upload walkthrough evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-tabs9fe-walkthrough
+          path: android/walkthrough/
+          if-no-files-found: warn
+          retention-days: 14
