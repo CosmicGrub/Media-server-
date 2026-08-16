@@ -1,14 +1,15 @@
 //! The wire protocol between `lumen serve` and a remote client (phone, watch, eventually web).
 //!
-//! **Newline-delimited JSON over a plain TCP socket, not WebSocket.** This is a deliberate choice,
-//! not a shortcut. mpv's own IPC protocol — which `crate::ipc` already speaks — is exactly this
-//! shape: one JSON object per line, read with a blocking loop. Extending that same shape from a
-//! local socket to a LAN socket costs nothing new to understand and nothing new to depend on. A
-//! WebSocket server needs an HTTP upgrade handshake (parsing headers, computing
-//! `Sec-WebSocket-Accept`, which means either a hand-rolled SHA-1 or another dependency) for a
-//! capability this protocol does not need yet: there is no browser client today, and when one shows
-//! up a small WS-to-TCP bridge is a bounded, separate piece of work rather than a reason to carry
-//! that machinery now.
+//! **Newline-delimited JSON over TLS, not WebSocket.** This is a deliberate choice, not a shortcut.
+//! mpv's own IPC protocol — which `crate::ipc` already speaks — is exactly this shape: one JSON
+//! object per line, read with a blocking loop. Extending that same shape from a local socket to a LAN
+//! socket costs nothing new to understand and nothing new to depend on. A WebSocket server needs an
+//! HTTP upgrade handshake (parsing headers, computing `Sec-WebSocket-Accept`, which means either a
+//! hand-rolled SHA-1 or another dependency) for a capability this protocol does not need yet: there is
+//! no browser client today, and when one shows up a small WS-to-TCP bridge is a bounded, separate
+//! piece of work rather than a reason to carry that machinery now. The framing here is plain
+//! newline-delimited lines either way; see `remote/tls.rs` for why the *bytes on the wire* stopped
+//! being plaintext.
 //!
 //! **Push, not poll.** The server writes a new `State` line whenever what is playing changes; the
 //! client just reads its socket. A watch polling over Bluetooth every few seconds to ask "anything

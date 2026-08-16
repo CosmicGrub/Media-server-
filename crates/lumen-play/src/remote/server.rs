@@ -5,16 +5,19 @@
 //! never shares a live connection either. Every client-handling thread reaches mpv by sending a
 //! [`Command`] down a channel and waiting on its own reply channel; the driver thread is the only
 //! thing that ever calls a method on `Mpv` directly. That single thread also polls mpv's own state
-//! on a short interval and publishes it to [`SharedState`], which every connected client's writer
+//! on a short interval and publishes it to [`SharedState`], which every connected client's own
 //! thread reads independently — no broadcast/fan-out machinery, because "did the version number
 //! change since I last sent one" is enough to know whether to push.
 //!
-//! **Two threads per connection**, split with `TcpStream::try_clone`: a reader thread blocks on
-//! incoming lines and turns them into commands, a writer thread polls the shared state and pushes
-//! whenever it changes. `std` has no readiness multiplexing for sockets, so this is the plain way to
-//! do "read on one side, write independently on the other" without another dependency.
+//! **One thread per connection**, over TLS (see `tls.rs`). A single `rustls::StreamOwned` cannot be
+//! split into an independent reader half and writer half the way a raw `TcpStream` could with
+//! `try_clone` — reading and writing both touch the same connection state, so both must happen on one
+//! thread. That thread gives the underlying socket a short read timeout and loops: read whatever
+//! arrived (or time out and read nothing), dispatch any complete lines, then check whether
+//! `SharedState` has moved on and push a `State` line if so. The timeout is what stands in for the
+//! old writer thread's independent polling tick.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,14 +30,18 @@ use crate::remote::pairing::{self, AttemptLimiter, PairResult, PendingCode, Toke
 use crate::remote::protocol::{
     ClientMessage, LibraryEntry, NowPlaying, PlaybackState, ReplyBody, ServerMessage,
 };
+use crate::remote::tls::{self, ServerCert};
 use crate::scan::{self, Scan, ScanOptions};
 
-/// How often the writer thread checks whether the state has moved on. Short enough that a seek
-/// feels immediate on the client, long enough that idle connections cost nothing worth measuring.
-const STATE_POLL_INTERVAL: Duration = Duration::from_millis(300);
+/// Doubles as this connection's TCP read timeout and its "check for new state to push" tick. Short
+/// enough that a seek feels immediate on the client, long enough that idle connections cost nothing
+/// worth measuring.
+const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// How often the driver thread re-reads mpv's own properties to build the next `PlaybackState`.
 const MPV_POLL_INTERVAL: Duration = Duration::from_millis(400);
+
+type TlsStream = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
 /// A request from a client thread to the mpv driver thread, with its own private reply channel —
 /// this is what lets several client connections issue commands concurrently without stepping on
@@ -115,6 +122,11 @@ pub fn run(
         .canonicalize()
         .map_err(|e| format!("cannot resolve library path {}: {e}", library_path.display()))?;
 
+    tls::install_crypto_provider();
+    let server_cert = ServerCert::load_or_generate(&ServerCert::default_dir())
+        .map_err(|e| format!("cannot set up TLS: {e}"))?;
+    let tls_config = server_cert.server_config().map_err(|e| format!("cannot set up TLS: {e}"))?;
+
     let scan =
         scan::scan(std::slice::from_ref(&library_path.to_path_buf()), &ScanOptions::default());
     log(&format!(
@@ -146,6 +158,11 @@ pub fn run(
          token and does not need it again)",
         pairing::CODE_LIFETIME.as_secs() / 60
     ));
+    log(&format!(
+        "tls fingerprint: {}  (a client should pin this the moment it pairs, and refuse to \
+         reconnect if a later connection ever presents a different one)",
+        server_cert.fingerprint()
+    ));
     let pending_code = Arc::new(Mutex::new(Some(PendingCode {
         code,
         expires_at: SystemTime::now() + pairing::CODE_LIFETIME,
@@ -169,7 +186,8 @@ pub fn run(
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else { continue };
         let ctx = Arc::clone(&ctx);
-        std::thread::spawn(move || handle_connection(stream, &ctx));
+        let tls_config = Arc::clone(&tls_config);
+        std::thread::spawn(move || handle_connection(stream, &ctx, &tls_config));
     }
     Ok(())
 }
@@ -259,88 +277,94 @@ fn read_state(mpv: &mut Mpv) -> PlaybackState {
     }
 }
 
-fn handle_connection(stream: TcpStream, ctx: &ServerContext) {
-    let Ok(reader_stream) = stream.try_clone() else { return };
-    let writer = Arc::new(Mutex::new(stream));
-    let authed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+/// Drive one client connection, start to finish, on this one thread: TLS handshake, then a loop that
+/// reads whatever has arrived (tolerating the read timing out with nothing new), dispatches any
+/// complete lines, and pushes a fresh `State` line whenever `SharedState` has moved on since the last
+/// one — but only once this connection has authenticated, so an unauthenticated socket gets nothing
+/// but the ability to pair, including no free look at what is currently playing.
+fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustls::ServerConfig>) {
+    if tcp.set_read_timeout(Some(CONNECTION_POLL_INTERVAL)).is_err() {
+        return;
+    }
+    let conn = match rustls::ServerConnection::new(Arc::clone(tls_config)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warning: TLS setup failed for a client connection: {e}");
+            return;
+        }
+    };
+    let mut tls: TlsStream = rustls::StreamOwned::new(conn, tcp);
 
-    let push_writer = Arc::clone(&writer);
-    let push_shared = Arc::clone(&ctx.shared);
-    let push_authed = Arc::clone(&authed);
-    let pusher =
-        std::thread::spawn(move || push_state_loop(&push_writer, &push_shared, &push_authed));
-
-    read_command_loop(reader_stream, ctx, &writer, &authed);
-    let _ = pusher.join();
-}
-
-/// Push a `State` line whenever the version moves on, but only once the connection has authenticated
-/// — an unauthenticated socket gets nothing but the ability to pair, including no free look at
-/// what is currently playing.
-fn push_state_loop(
-    writer: &Arc<Mutex<TcpStream>>,
-    shared: &Arc<SharedState>,
-    authed: &Arc<std::sync::atomic::AtomicBool>,
-) {
+    let mut authed = false;
     let mut last_sent_version = u64::MAX; // Never equal to a real version until one is observed.
+    let mut pending = Vec::new(); // Bytes read but not yet forming a complete line.
+    let mut chunk = [0u8; 4096];
+
     loop {
-        std::thread::sleep(STATE_POLL_INTERVAL);
-        if !authed.load(Ordering::Acquire) {
-            continue;
+        match tls.read(&mut chunk) {
+            Ok(0) => return, // Clean EOF: the peer closed the connection.
+            Ok(n) => pending.extend_from_slice(&chunk[..n]),
+            Err(e) if is_timeout(&e) => {} // Nothing new; fall through to the state-push check below.
+            Err(_) => return, // Any other I/O error (including a failed handshake) ends the connection.
         }
-        let (state, version) = shared.snapshot();
-        if version == last_sent_version {
-            continue;
+
+        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = pending.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                continue;
+            }
+            if !handle_line(line, ctx, &mut authed, &mut tls) {
+                return; // The write side failed -- the peer is gone, stop driving this connection.
+            }
         }
-        let mut w = writer.lock().unwrap();
-        if w.write_all(ServerMessage::State(state).to_line().as_bytes()).is_err() {
-            return; // The reader thread will notice the same disconnect and exit on its own.
+
+        if authed {
+            let (state, version) = ctx.shared.snapshot();
+            if version != last_sent_version {
+                if tls.write_all(ServerMessage::State(state).to_line().as_bytes()).is_err() {
+                    return;
+                }
+                last_sent_version = version;
+            }
         }
-        drop(w);
-        last_sent_version = version;
     }
 }
 
-fn read_command_loop(
-    stream: TcpStream,
-    ctx: &ServerContext,
-    writer: &Arc<Mutex<TcpStream>>,
-    authed: &Arc<std::sync::atomic::AtomicBool>,
-) {
-    let mut lines = BufReader::new(stream).lines();
-    while let Some(Ok(line)) = lines.next() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some(msg) = ClientMessage::parse(&line) else {
-            send(
-                writer,
-                &ServerMessage::Error { id: "?".into(), message: "malformed message".into() },
-            );
-            continue;
-        };
-
-        if !authed.load(Ordering::Acquire) && !msg.is_pre_auth() {
-            send(
-                writer,
-                &ServerMessage::Error {
-                    id: msg.id().to_string(),
-                    message: "pair or authenticate first".into(),
-                },
-            );
-            continue;
-        }
-
-        let reply = dispatch(msg, ctx, authed);
-        send(writer, &reply);
-    }
+/// A read timing out is not a disconnect — it is this connection's poll tick finding nothing new.
+/// `WouldBlock` is what Unix reports for a timed-out socket read; `TimedOut` is what Windows reports
+/// for the same condition, hence checking both rather than relying on one platform's spelling.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
-fn dispatch(
-    msg: ClientMessage,
-    ctx: &ServerContext,
-    authed: &Arc<std::sync::atomic::AtomicBool>,
-) -> ServerMessage {
+/// Parse and dispatch one line, writing its reply. Returns whether the connection is still usable —
+/// `false` means the write failed and the caller should stop driving this connection, the same signal
+/// the old writer thread gave by returning early.
+fn handle_line(line: &str, ctx: &ServerContext, authed: &mut bool, tls: &mut TlsStream) -> bool {
+    let Some(msg) = ClientMessage::parse(line) else {
+        return send(
+            tls,
+            &ServerMessage::Error { id: "?".into(), message: "malformed message".into() },
+        );
+    };
+
+    if !*authed && !msg.is_pre_auth() {
+        return send(
+            tls,
+            &ServerMessage::Error {
+                id: msg.id().to_string(),
+                message: "pair or authenticate first".into(),
+            },
+        );
+    }
+
+    let reply = dispatch(msg, ctx, authed);
+    send(tls, &reply)
+}
+
+fn dispatch(msg: ClientMessage, ctx: &ServerContext, authed: &mut bool) -> ServerMessage {
     let id = msg.id().to_string();
     match msg {
         ClientMessage::Pair { code, .. } => {
@@ -367,7 +391,7 @@ fn dispatch(
                         // restart will require pairing again, which is worth knowing.
                         eprintln!("warning: could not persist pairing token: {e}");
                     }
-                    authed.store(true, Ordering::Release);
+                    *authed = true;
                     ServerMessage::Paired { id, token }
                 }
                 PairResult::WrongCode => {
@@ -381,7 +405,7 @@ fn dispatch(
         }
         ClientMessage::Auth { token, .. } => {
             if ctx.tokens.lock().unwrap().is_valid(&token) {
-                authed.store(true, Ordering::Release);
+                *authed = true;
                 ServerMessage::Reply { id, result: ReplyBody::Ok }
             } else {
                 ServerMessage::Error { id, message: "unknown token; pair again".into() }
@@ -462,9 +486,10 @@ fn run_command(ctx: &ServerContext, id: String, body: CommandBody) -> ServerMess
     }
 }
 
-fn send(writer: &Arc<Mutex<TcpStream>>, msg: &ServerMessage) {
-    let mut w = writer.lock().unwrap();
-    let _ = w.write_all(msg.to_line().as_bytes());
+/// Write one reply. Returns whether it succeeded, so the caller can stop driving a connection whose
+/// peer is gone rather than looping forever writing into a dead socket.
+fn send(tls: &mut TlsStream, msg: &ServerMessage) -> bool {
+    tls.write_all(msg.to_line().as_bytes()).is_ok()
 }
 
 /// A `u32` worth of entropy for the pairing code. Not security-critical on its own — the code is

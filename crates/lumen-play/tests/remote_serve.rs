@@ -1,8 +1,9 @@
 //! End-to-end verification of `lumen serve` against real mpv.
 //!
 //! Every other test of `remote::protocol` and `remote::pairing` checks logic in isolation. This is
-//! the one that proves the pieces actually work assembled: a real `lumen serve` process, a raw
-//! `TcpStream` standing in for a phone, pairing with the code the server printed, then driving a
+//! the one that proves the pieces actually work assembled: a real `lumen serve` process, a TLS
+//! connection standing in for a phone -- pinning the fingerprint the server prints, the same way a
+//! real client is meant to on first pair -- pairing with the code the server printed, then driving a
 //! real mpv instance through play, seek, and volume and reading real state back. It is skipped
 //! rather than failed when mpv is not on `PATH`, the same convention the rest of the crate's
 //! mpv-dependent tests use — this is infrastructure, not a defect, when it happens in CI on a
@@ -11,7 +12,82 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use sha2::{Digest, Sha256};
+
+/// One TLS connection standing in for a phone. `rustls::StreamOwned` implements both `Write` and
+/// `BufRead` itself (see `remote/tls.rs`'s doc on why the production server relies on the same
+/// thing) — no separate `BufReader` wrapper needed, and no `try_clone` split either, since this test
+/// only ever writes a request and then reads its reply, never both at once.
+type ClientTls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+
+/// Verifies a server's certificate against one pinned fingerprint, exactly the way a real client is
+/// meant to the moment it is shown a fingerprint alongside a pairing code (trust-on-first-use — see
+/// `remote/tls.rs`'s module doc). No hostname or CA chain is ever checked; the fingerprint is this
+/// server's entire identity as far as this test (and a real client) is concerned.
+#[derive(Debug)]
+struct PinnedFingerprint(String);
+
+impl ServerCertVerifier for PinnedFingerprint {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        let digest = Sha256::digest(end_entity.as_ref());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        if hex == self.0 {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(TlsError::General(format!(
+                "certificate fingerprint mismatch: pinned {}, got {hex}",
+                self.0
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
 
 /// A tiny hand-rolled JSON line, matching exactly the shape `lumen_play::remote::protocol::ClientMessage::parse` expects. Not the `json` module's own writer — that is a private detail of the
 /// binary crate, unreachable from an external integration test, and duplicating four lines of
@@ -283,16 +359,31 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let code = code.expect("the server must print a pairing code on startup");
     assert_eq!(code.len(), 6, "pairing code should be six digits, got {code:?}");
 
+    // The TLS fingerprint is on stdout too, right after the pairing code -- a real client pins this
+    // the same moment it is shown the code (see remote/tls.rs's module doc). Keep reading the same
+    // `lines` iterator rather than starting a new deadline loop, so the two lines cannot be confused
+    // even if the server's print order ever changes.
+    let mut fingerprint = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        if let Some(rest) = line.strip_prefix("tls fingerprint: ") {
+            fingerprint = Some(rest.split("  ").next().unwrap().to_string());
+            break;
+        }
+    }
+    let fingerprint = fingerprint.expect("the server must print a TLS fingerprint on startup");
+
+    rustls::crypto::ring::default_provider().install_default().ok();
+
     // Give the listener a moment to actually be accepting connections — it starts after the
     // pairing code is printed, so there is a real (if short) window between the two.
-    let mut stream = connect_with_retry(port, Duration::from_secs(10));
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut tls = connect_tls(port, &fingerprint, Duration::from_secs(10));
 
     // Pair.
-    stream
-        .write_all(request("1", &format!("\"type\":\"pair\",\"code\":\"{code}\"")).as_bytes())
+    tls.write_all(request("1", &format!("\"type\":\"pair\",\"code\":\"{code}\"")).as_bytes())
         .unwrap();
-    let paired = read_reply(&mut reader);
+    let paired = read_reply(&mut tls);
     assert_eq!(
         paired.ty().as_deref(),
         Some("paired"),
@@ -304,21 +395,19 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
 
     // A wrong code afterwards must fail — the code was consumed by the successful pairing above and
     // must not be replayable.
-    let mut second = connect_with_retry(port, Duration::from_secs(5));
-    let mut second_reader = BufReader::new(second.try_clone().unwrap());
+    let mut second = connect_tls(port, &fingerprint, Duration::from_secs(5));
     second
         .write_all(request("x", &format!("\"type\":\"pair\",\"code\":\"{code}\"")).as_bytes())
         .unwrap();
-    let replay = read_reply(&mut second_reader);
+    let replay = read_reply(&mut second);
     assert_eq!(replay.bool("ok"), Some(false), "a consumed pairing code must not work twice");
     drop(second);
 
     // Play the real file.
     let escaped = file.to_str().unwrap().replace('\\', "\\\\").replace('"', "\\\"");
-    stream
-        .write_all(request("2", &format!("\"type\":\"play\",\"path\":\"{escaped}\"")).as_bytes())
+    tls.write_all(request("2", &format!("\"type\":\"play\",\"path\":\"{escaped}\"")).as_bytes())
         .unwrap();
-    let play_reply = read_reply(&mut reader);
+    let play_reply = read_reply(&mut tls);
     assert_eq!(play_reply.bool("ok"), Some(true), "play must be accepted: {:?}", play_reply.0);
 
     // A state push should arrive on its own — nobody asked for it — naming the file now playing.
@@ -327,7 +416,7 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let mut saw_playing = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        let msg = read_message(&mut reader);
+        let msg = read_message(&mut tls);
         if msg.ty().as_deref() == Some("state") {
             if let Some(serde_json_lite::Val::Map(np)) = msg.0.get("now_playing") {
                 if np.get("path").is_some() {
@@ -340,18 +429,17 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     assert!(saw_playing, "expected an unprompted state push naming the file now playing");
 
     // Seek and set the volume; both must be accepted by the real mpv process, not just parsed.
-    stream.write_all(request("3", "\"type\":\"seek\",\"position_ms\":1500").as_bytes()).unwrap();
-    assert_eq!(read_reply(&mut reader).bool("ok"), Some(true));
+    tls.write_all(request("3", "\"type\":\"seek\",\"position_ms\":1500").as_bytes()).unwrap();
+    assert_eq!(read_reply(&mut tls).bool("ok"), Some(true));
 
-    stream.write_all(request("4", "\"type\":\"volume\",\"level\":40").as_bytes()).unwrap();
-    assert_eq!(read_reply(&mut reader).bool("ok"), Some(true));
+    tls.write_all(request("4", "\"type\":\"volume\",\"level\":40").as_bytes()).unwrap();
+    assert_eq!(read_reply(&mut tls).bool("ok"), Some(true));
 
     // An unauthenticated second connection must be refused any command other than pair/auth — this
     // is the one behaviour that, if broken, means anyone on the LAN controls the player.
-    let mut stranger = connect_with_retry(port, Duration::from_secs(5));
-    let mut stranger_reader = BufReader::new(stranger.try_clone().unwrap());
+    let mut stranger = connect_tls(port, &fingerprint, Duration::from_secs(5));
     stranger.write_all(request("5", "\"type\":\"pause\"").as_bytes()).unwrap();
-    let refused = read_reply(&mut stranger_reader);
+    let refused = read_reply(&mut stranger);
     assert_eq!(
         refused.bool("ok"),
         Some(false),
@@ -362,7 +450,7 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     stranger
         .write_all(request("6", &format!("\"type\":\"auth\",\"token\":\"{token}\"")).as_bytes())
         .unwrap();
-    let authed = read_reply(&mut stranger_reader);
+    let authed = read_reply(&mut stranger);
     assert_eq!(
         authed.bool("ok"),
         Some(true),
@@ -373,21 +461,38 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let _ = server.wait();
 }
 
+/// Connect over TCP, then complete a TLS handshake pinned to `fingerprint` — the same trust-on-first-
+/// use a real client performs, not a bypass of it. `ServerName` is required by the API but never
+/// actually checked: [`PinnedFingerprint`] verifies the certificate by its hash alone.
+fn connect_tls(port: u16, fingerprint: &str, timeout: Duration) -> ClientTls {
+    let tcp = connect_with_retry(port, timeout);
+    let pinned = fingerprint.replace(':', "").to_lowercase();
+    let verifier = Arc::new(PinnedFingerprint(pinned));
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    let name = ServerName::try_from("lumen-serve").unwrap();
+    let conn = rustls::ClientConnection::new(Arc::new(config), name)
+        .expect("a valid pinned-verifier config must build a client connection");
+    rustls::StreamOwned::new(conn, tcp)
+}
+
 /// Skips any `state` lines to find the reply matching what was just sent — the two interleave on the
 /// same socket by design, and a naive "read one line, assume it is the reply" would be exactly the
 /// bug the id-echoing protocol exists to make impossible to write correctly by accident.
-fn read_reply(reader: &mut BufReader<TcpStream>) -> Reply {
+fn read_reply(tls: &mut ClientTls) -> Reply {
     loop {
-        let msg = read_message(reader);
+        let msg = read_message(tls);
         if msg.ty().as_deref() != Some("state") {
             return msg;
         }
     }
 }
 
-fn read_message(reader: &mut BufReader<TcpStream>) -> Reply {
+fn read_message(tls: &mut ClientTls) -> Reply {
     let mut line = String::new();
-    reader.read_line(&mut line).expect("the server must not have closed the connection");
+    tls.read_line(&mut line).expect("the server must not have closed the connection");
     assert!(!line.is_empty(), "connection closed while a message was expected");
     Reply::parse(&line)
 }
