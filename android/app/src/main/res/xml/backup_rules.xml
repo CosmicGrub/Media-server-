@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Legacy (pre-Android 12) full-backup rules. The remote-control connection prefs are excluded even
+  though they are now stored via EncryptedSharedPreferences (see RemoteConnectionStore.kt) -- this is
+  belt-and-suspenders, not the primary defense: keeping the pairing token's file out of any backup
+  entirely is simpler to reason about than "it's fine because it's ciphertext".
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="lumen.remote.enc.xml" />
+    <exclude domain="sharedpref" path="lumen.remote.xml" />
+</full-backup-content>
