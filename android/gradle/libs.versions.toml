@@ -22,6 +22,9 @@ coroutines = "1.9.0"
 junit = "4.13.2"
 androidxTest = "1.6.1"
 androidxTestJunit = "1.2.1"
+# Encrypts SharedPreferences at rest -- the saved remote-control pairing token is sensitive
+# enough (durable control of a desktop player) to not sit in a plaintext prefs file.
+securityCrypto = "1.1.0"
 
 [libraries]
 core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -49,6 +52,7 @@ window = { module = "androidx.window:window", version.ref = "window" }
 adaptive = { module = "androidx.compose.material3.adaptive:adaptive", version.ref = "adaptive" }
 documentfile = { module = "androidx.documentfile:documentfile", version.ref = "documentfile" }
 coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+security-crypto = { module = "androidx.security:security-crypto", version.ref = "securityCrypto" }
 
 # --- test ---
 junit                      = { module = "junit:junit", version.ref = "junit" }
