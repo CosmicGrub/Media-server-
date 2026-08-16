@@ -62,6 +62,45 @@ pub fn judge(pending: &PendingCode, submitted: &str, now: SystemTime) -> PairRes
     if submitted == pending.code { PairResult::Accepted } else { PairResult::WrongCode }
 }
 
+/// Caps how many wrong-code guesses the pairing endpoint tolerates in a sliding window, across every
+/// connection combined — a fresh `TcpStream` per guess costs an attacker nothing, so the limit has to
+/// live here rather than per-connection.
+///
+/// A six-digit code has a million possibilities; capping guesses at a handful per minute turns
+/// "guessable given enough parallel connections" back into "not guessable within the code's
+/// lifetime", which is the property the design doc above claims but did not, until this, enforce.
+pub struct AttemptLimiter {
+    max_attempts: u32,
+    window: Duration,
+    attempts: Vec<SystemTime>,
+}
+
+impl AttemptLimiter {
+    pub fn new(max_attempts: u32, window: Duration) -> Self {
+        Self { max_attempts, window, attempts: Vec::new() }
+    }
+
+    /// The default policy: 5 wrong guesses per minute. Five is enough to cover a mistyped digit or
+    /// two; a real attacker needs on the order of 100,000 tries on average to land a six-digit code,
+    /// which this limit stretches out to weeks rather than the seconds unlimited parallel connections
+    /// would otherwise allow.
+    pub fn default_policy() -> Self {
+        Self::new(5, Duration::from_secs(60))
+    }
+
+    /// Record an attempt at `now` and report whether it is still within budget. Old attempts fall out
+    /// of the window as they age, so a burst of guesses does not permanently lock the code out — only
+    /// sustained guessing does.
+    pub fn record(&mut self, now: SystemTime) -> bool {
+        self.attempts.retain(|&t| now.duration_since(t).map(|d| d < self.window).unwrap_or(true));
+        if self.attempts.len() as u32 >= self.max_attempts {
+            return false;
+        }
+        self.attempts.push(now);
+        true
+    }
+}
+
 /// Tokens that have successfully paired, persisted so restarting the server does not un-pair every
 /// device that already has one.
 ///
@@ -219,5 +258,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = TokenStore::load(&path);
         assert!(!store.is_valid("anything"));
+    }
+
+    #[test]
+    fn the_attempt_limiter_allows_up_to_the_configured_maximum() {
+        let mut limiter = AttemptLimiter::new(3, Duration::from_secs(60));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(limiter.record(now));
+        assert!(limiter.record(now));
+        assert!(limiter.record(now));
+        assert!(!limiter.record(now), "a fourth attempt within the window must be refused");
+    }
+
+    #[test]
+    fn the_attempt_limiter_forgets_attempts_once_they_age_out_of_the_window() {
+        let mut limiter = AttemptLimiter::new(1, Duration::from_secs(60));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(limiter.record(now));
+        assert!(!limiter.record(now), "the window has not elapsed yet");
+
+        let later = now + Duration::from_secs(61);
+        assert!(limiter.record(later), "the earlier attempt should have aged out by now");
     }
 }

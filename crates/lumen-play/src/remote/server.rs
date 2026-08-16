@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::ipc::{self, Mpv};
-use crate::remote::pairing::{self, PairResult, PendingCode, TokenStore};
+use crate::remote::pairing::{self, AttemptLimiter, PairResult, PendingCode, TokenStore};
 use crate::remote::protocol::{
     ClientMessage, LibraryEntry, NowPlaying, PlaybackState, ReplyBody, ServerMessage,
 };
@@ -89,7 +89,14 @@ struct ServerContext {
     tokens: Arc<Mutex<TokenStore>>,
     token_path: PathBuf,
     pending_code: Arc<Mutex<Option<PendingCode>>>,
+    /// Shared across every connection on purpose: a fresh TCP connection costs a guesser nothing, so
+    /// the limit on wrong-code guesses has to be global, not per-socket. See `pairing::AttemptLimiter`.
+    pair_attempts: Arc<Mutex<AttemptLimiter>>,
     library: Arc<Mutex<Scan>>,
+    /// The canonicalized root `lumen serve` was pointed at. Every `Play` request is checked against
+    /// this before being forwarded to mpv — see `resolve_playable_path` — so a paired client can only
+    /// ever open a file the server itself already scanned, not an arbitrary path on the host.
+    library_root: PathBuf,
 }
 
 /// Run the server. Blocks until the process is killed — this is meant to run in the foreground of a
@@ -101,6 +108,13 @@ pub fn run(
     extra_mpv_args: &[String],
     log: impl Fn(&str) + Send + Sync + 'static,
 ) -> Result<(), String> {
+    // Canonicalized once, up front: every `Play` request is checked against this root later, and
+    // resolving symlinks/`..` here rather than per-request is both cheaper and means a single
+    // definition of "inside the library" is shared by the scan and the containment check.
+    let library_root = library_path
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve library path {}: {e}", library_path.display()))?;
+
     let scan =
         scan::scan(std::slice::from_ref(&library_path.to_path_buf()), &ScanOptions::default());
     log(&format!(
@@ -143,7 +157,9 @@ pub fn run(
         tokens,
         token_path,
         pending_code,
+        pair_attempts: Arc::new(Mutex::new(AttemptLimiter::default_policy())),
         library: Arc::new(Mutex::new(scan)),
+        library_root,
     });
 
     let listener = TcpListener::bind((bind, port))
@@ -328,6 +344,12 @@ fn dispatch(
     let id = msg.id().to_string();
     match msg {
         ClientMessage::Pair { code, .. } => {
+            if !ctx.pair_attempts.lock().unwrap().record(SystemTime::now()) {
+                return ServerMessage::Error {
+                    id,
+                    message: "too many wrong pairing attempts; wait a minute and try again".into(),
+                };
+            }
             let mut pending = ctx.pending_code.lock().unwrap();
             let Some(p) = pending.as_ref() else {
                 return ServerMessage::Error { id, message: "no pairing code is active".into() };
@@ -382,7 +404,10 @@ fn dispatch(
                 .collect();
             ServerMessage::Reply { id, result: ReplyBody::Library(entries) }
         }
-        ClientMessage::Play { path, .. } => run_command(ctx, id, CommandBody::Play(path)),
+        ClientMessage::Play { path, .. } => match resolve_playable_path(ctx, &path) {
+            Ok(real_path) => run_command(ctx, id, CommandBody::Play(real_path)),
+            Err(message) => ServerMessage::Error { id, message },
+        },
         ClientMessage::Pause { .. } => run_command(ctx, id, CommandBody::Pause),
         ClientMessage::Resume { .. } => run_command(ctx, id, CommandBody::Resume),
         ClientMessage::TogglePlayPause { .. } => run_command(ctx, id, CommandBody::Toggle),
@@ -399,6 +424,30 @@ fn dispatch(
             message: "no queue yet; play a specific file instead".into(),
         },
     }
+}
+
+/// Refuse to hand mpv a path outside the directory `lumen serve` was pointed at.
+///
+/// Without this, a paired client's `Play{path}` is forwarded to mpv's `loadfile` verbatim — pairing
+/// gates *that you can send commands at all*, but said nothing about *which files* a command could
+/// name, so a legitimately paired client (or a token stolen off disk) could open any file readable by
+/// the mpv process, not just something in the library it was shown. Canonicalizing and checking
+/// ancestry closes that: the requested file must resolve to somewhere under the scanned root.
+fn resolve_playable_path(ctx: &ServerContext, requested: &str) -> Result<String, String> {
+    contain_within_library(&ctx.library_root, requested)
+}
+
+/// The pure check behind [`resolve_playable_path`], split out so it can be tested without spinning
+/// up a whole `ServerContext` — the containment logic is what matters here, not the plumbing around
+/// it.
+fn contain_within_library(library_root: &Path, requested: &str) -> Result<String, String> {
+    let real = Path::new(requested)
+        .canonicalize()
+        .map_err(|_| "that file does not exist on this server".to_string())?;
+    if !real.starts_with(library_root) {
+        return Err("that file is outside the served library".into());
+    }
+    Ok(real.to_string_lossy().into_owned())
 }
 
 fn run_command(ctx: &ServerContext, id: String, body: CommandBody) -> ServerMessage {
@@ -431,4 +480,67 @@ fn random_bytes_16() -> [u8; 16] {
     let mut buf = [0u8; 16];
     getrandom::fill(&mut buf).expect("the OS random source must be available");
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("lumen-server-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_file_inside_the_library_root_is_allowed() {
+        let root = temp_dir("inside");
+        let file = root.join("Movie.mkv");
+        std::fs::write(&file, b"not a real container, just needs to exist").unwrap();
+
+        let resolved = contain_within_library(&root, file.to_str().unwrap())
+            .expect("a file under the served root must be playable");
+        assert_eq!(Path::new(&resolved), file);
+    }
+
+    #[test]
+    fn a_file_outside_the_library_root_is_refused() {
+        let root = temp_dir("outside-root");
+        let outsider_dir = temp_dir("outside-victim");
+        let outsider = outsider_dir.join("not-in-the-library.mkv");
+        std::fs::write(&outsider, b"secret").unwrap();
+
+        let err = contain_within_library(&root, outsider.to_str().unwrap())
+            .expect_err("a path outside the served root must be refused");
+        assert!(err.contains("outside"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_path_traversal_attempt_out_of_the_library_root_is_refused() {
+        let root = temp_dir("traversal-root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let victim_dir = temp_dir("traversal-victim");
+        let victim = victim_dir.join("secret.mkv");
+        std::fs::write(&victim, b"secret").unwrap();
+
+        // `../` out of the scanned root and into a sibling directory the server was never pointed at.
+        let traversal = root
+            .join("sub")
+            .join("..")
+            .join("..")
+            .join(victim_dir.file_name().unwrap())
+            .join(victim.file_name().unwrap());
+        let err = contain_within_library(&root, traversal.to_str().unwrap())
+            .expect_err("a `..`-traversal out of the served root must be refused");
+        assert!(err.contains("outside"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn a_path_that_does_not_exist_is_refused_rather_than_leaking_whether_it_would_be_in_scope() {
+        let root = temp_dir("nonexistent-root");
+        let missing = root.join("nope.mkv");
+        assert!(contain_within_library(&root, missing.to_str().unwrap()).is_err());
+    }
 }
