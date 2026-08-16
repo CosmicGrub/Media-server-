@@ -6,8 +6,15 @@ import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
-/** One remembered server: enough to reconnect without pairing again. */
-data class SavedServer(val host: String, val port: Int, val token: String)
+/**
+ * One remembered server: enough to reconnect without pairing again.
+ *
+ * [fingerprint] is the SHA-256 of the TLS certificate this app saw the moment pairing succeeded --
+ * see `RemoteTls.kt`. It is what every later reconnect is pinned against; without it, a saved token
+ * would still work, but the connection carrying it would trust whatever certificate showed up that
+ * time, which is exactly the gap pinning exists to close.
+ */
+data class SavedServer(val host: String, val port: Int, val token: String, val fingerprint: String)
 
 /**
  * The last `lumen serve` this phone paired with.
@@ -49,8 +56,12 @@ class RemoteConnectionStore(context: Context) {
         val host = prefs.getString(KEY_HOST, null) ?: return null
         val port = prefs.getInt(KEY_PORT, -1)
         val token = prefs.getString(KEY_TOKEN, null)
-        if (port <= 0 || token.isNullOrEmpty()) return null
-        return SavedServer(host, port, token)
+        val fingerprint = prefs.getString(KEY_FINGERPRINT, null)
+        // A record from before pinning existed (or one written by a build that failed to capture a
+        // fingerprint) has nothing to pin a reconnect against -- treated as absent rather than loaded
+        // half-formed, so the caller re-pairs instead of silently reconnecting unpinned.
+        if (port <= 0 || token.isNullOrEmpty() || fingerprint.isNullOrEmpty()) return null
+        return SavedServer(host, port, token, fingerprint)
     }
 
     fun save(server: SavedServer) {
@@ -58,13 +69,19 @@ class RemoteConnectionStore(context: Context) {
             .putString(KEY_HOST, server.host)
             .putInt(KEY_PORT, server.port)
             .putString(KEY_TOKEN, server.token)
+            .putString(KEY_FINGERPRINT, server.fingerprint)
             .apply()
     }
 
     /** Forget the saved token — used when a saved token is refused, so the app does not keep
      * retrying credentials the server itself has told it are no good. */
     fun clear() {
-        prefs.edit().remove(KEY_HOST).remove(KEY_PORT).remove(KEY_TOKEN).apply()
+        prefs.edit()
+            .remove(KEY_HOST)
+            .remove(KEY_PORT)
+            .remove(KEY_TOKEN)
+            .remove(KEY_FINGERPRINT)
+            .apply()
     }
 
     private companion object {
@@ -73,5 +90,6 @@ class RemoteConnectionStore(context: Context) {
         const val KEY_HOST = "host"
         const val KEY_PORT = "port"
         const val KEY_TOKEN = "token"
+        const val KEY_FINGERPRINT = "fingerprint"
     }
 }
