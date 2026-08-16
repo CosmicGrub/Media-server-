@@ -3,10 +3,14 @@ package dev.lumen.player.remote
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
+import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +47,12 @@ sealed interface ConnectionState {
  * around: [send] registers a [CompletableDeferred] under the id it just wrote, and the reader loop
  * resolves it when a `reply` or `paired` message naming that id comes back. A `state` push carries no
  * id and is never treated as a reply to anything — it goes straight to [playback] instead.
+ *
+ * The socket is TLS, always -- `lumen serve` only accepts TLS connections (see the Rust side's
+ * `remote/tls.rs`). [connect] takes a `pinnedFingerprint`: `null` for a first pairing, where any
+ * certificate is accepted and recorded for the caller to persist once pairing actually succeeds; a
+ * saved fingerprint for every reconnect after that, which [FingerprintTrustManager] enforces exactly.
+ * See [observedFingerprint].
  */
 class RemoteClient {
 
@@ -50,6 +60,7 @@ class RemoteClient {
     private var socket: Socket? = null
     private var writer: OutputStreamWriter? = null
     private var readerJob: Job? = null
+    private var trustManager: FingerprintTrustManager? = null
     private val nextId = AtomicLong(1)
     private val pending = ConcurrentHashMap<String, CompletableDeferred<RemoteProtocol.ServerMessage>>()
 
@@ -59,21 +70,45 @@ class RemoteClient {
     private val _playback = MutableStateFlow(RemoteProtocol.PlaybackState(null, 0))
     val playback: StateFlow<RemoteProtocol.PlaybackState> = _playback.asStateFlow()
 
-    /** Open the socket and start the reader loop. Does not pair or authenticate — that is a
+    /** The fingerprint of the certificate the current (or most recent) connection actually presented
+     * -- set the moment the TLS handshake completes, regardless of whether it was pinned or accepted
+     * on first sight. `null` before any successful handshake. The caller persists this alongside the
+     * token once pairing succeeds; see [RemoteViewModel.submitPairingCode]. */
+    val observedFingerprint: String? get() = trustManager?.observedFingerprint
+
+    /** Open a TLS connection and start the reader loop. Does not pair or authenticate — that is a
      * separate step, because the caller may have a saved token to try before falling back to asking
-     * for a fresh pairing code. */
-    suspend fun connect(host: String, port: Int) {
+     * for a fresh pairing code.
+     *
+     * [pinnedFingerprint] is `null` only for a first pairing to a server this app has never connected
+     * to before; every other caller should pass the fingerprint saved from that first pairing, so a
+     * later connection is held to presenting the same certificate rather than trusting whatever shows
+     * up that time. A mismatch fails the handshake itself -- surfaced through the normal
+     * `ConnectionState.Failed` path below, not a special case.
+     */
+    suspend fun connect(host: String, port: Int, pinnedFingerprint: String?) {
         close()
         _connection.value = ConnectionState.Connecting
         try {
             val s = withContext(Dispatchers.IO) {
-                Socket().apply { connect(java.net.InetSocketAddress(host, port), CONNECT_TIMEOUT_MS) }
+                val raw = Socket().apply { connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS) }
+                val tm = FingerprintTrustManager(pinnedFingerprint)
+                val sslContext = SSLContext.getInstance("TLS")
+                sslContext.init(null, arrayOf(tm), SecureRandom())
+                val tls = sslContext.socketFactory.createSocket(raw, host, port, true) as SSLSocket
+                tls.startHandshake()
+                trustManager = tm
+                tls
             }
             socket = s
             writer = OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8)
             _connection.value = ConnectionState.AwaitingPairing
             readerJob = scope.launch { readLoop(s) }
         } catch (e: java.io.IOException) {
+            // Covers both a plain connection failure and a rejected/mismatched TLS handshake --
+            // startHandshake() throws SSLHandshakeException, an IOException subclass, wrapping
+            // whatever FingerprintTrustManager threw, so its message (which names the mismatch)
+            // reaches the UI through the same path as any other connection error.
             _connection.value = ConnectionState.Failed(e.message ?: "could not connect")
         }
     }

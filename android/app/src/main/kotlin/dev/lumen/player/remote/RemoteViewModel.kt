@@ -53,7 +53,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun reconnectWithToken(saved: SavedServer) {
         viewModelScope.launch {
-            client.connect(saved.host, saved.port)
+            client.connect(saved.host, saved.port, saved.fingerprint)
             if (client.connection.value !is ConnectionState.AwaitingPairing) return@launch
             client.authenticate(saved.token).onFailure {
                 // The server no longer recognises this token — it was revoked, or belongs to a
@@ -72,7 +72,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             lastHost = host,
             lastPort = port.toString(),
         )
-        viewModelScope.launch { client.connect(host, port) }
+        // No pinned fingerprint yet -- this is necessarily a first connection to this server from
+        // this app's point of view (a saved one reconnects via reconnectWithToken instead), so
+        // whatever certificate it presents is accepted and recorded, pending the pairing code itself
+        // succeeding. See RemoteClient's class doc and FingerprintTrustManager.
+        viewModelScope.launch { client.connect(host, port, pinnedFingerprint = null) }
     }
 
     fun submitPairingCode(code: String) {
@@ -81,7 +85,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 .onSuccess { token ->
                     val host = _state.value.lastHost
                     val port = _state.value.lastPort.toIntOrNull()
-                    if (port != null) store.save(SavedServer(host, port, token))
+                    val fingerprint = client.observedFingerprint
+                    when {
+                        port == null -> {}
+                        // The handshake that got us here must have observed a fingerprint -- if it
+                        // somehow did not, saving a server with nothing to pin would make every future
+                        // reconnect trust on sight forever, which is worse than not saving at all.
+                        fingerprint == null -> _state.value = _state.value.copy(
+                            error = "paired, but no certificate fingerprint was recorded; " +
+                                "reconnect will require pairing again",
+                        )
+                        else -> store.save(SavedServer(host, port, token, fingerprint))
+                    }
                     refreshLibraryIfConnected()
                 }
                 .onFailure { _state.value = _state.value.copy(error = it.message) }
