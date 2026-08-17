@@ -42,8 +42,13 @@ comfortably spans that whole range.
 The Fold 5 is the device the adaptive layout in `android/app/src/main/kotlin/dev/lumen/player/ui/`
 was designed against:
 
-- **Tabletop posture** (half-open, standing on a surface): video fills the top half above the
-  crease, transport controls and the library live below it.
+- **Tabletop posture** (half-open, standing on a surface, horizontal hinge): video fills the top
+  half above the crease, transport controls and the library live below it.
+- **Book posture** (half-open, held upright, vertical hinge): video fills one side of the crease,
+  transport controls and the library live on the other. Posture detection has recognised this shape
+  since `FoldState.kt` was first written; the layout that actually draws it (`BookLayout`) did not
+  exist until this pass — before it, a vertical hinge fell through to the ordinary flat-window rule
+  and could put the video across the crease.
 - **Inner display, flat**: video and library side by side (`SideBySide`).
 - **Cover screen**: video on top, library filling the rest (`Stacked`), scaled to whatever share of
   the height the user sets.

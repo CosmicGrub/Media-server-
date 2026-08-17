@@ -197,6 +197,9 @@ enum class Arrangement {
     /** Half open on a surface: video above the crease, everything else below. */
     Tabletop,
 
+    /** Held like a book: video on one side of a vertical hinge, everything else on the other. */
+    Book,
+
     /** Two panes across. Only where the window is big enough for a list to be worth reading. */
     SideBySide,
 
@@ -218,13 +221,16 @@ enum class Arrangement {
  */
 fun arrangementFor(
     isTabletop: Boolean,
+    isBook: Boolean,
     widthDp: Int,
     heightDp: Int,
     mode: ViewMode,
 ): Arrangement = when {
-    // Tabletop keeps its shape in every mode: the top screen is the video whether or not a library
-    // is shown below it. That is the posture's entire reason for existing.
+    // Tabletop and Book both keep their shape in every mode: the picture stays pinned to its side of
+    // the physical hinge whether or not a library is shown on the other side of it. That fixed
+    // geometry is the entire reason either posture-specific layout exists.
     isTabletop -> Arrangement.Tabletop
+    isBook -> Arrangement.Book
     !mode.showsLibrary -> Arrangement.VideoOnly
     widthDp >= 600 && heightDp >= 480 -> Arrangement.SideBySide
     else -> Arrangement.Stacked
