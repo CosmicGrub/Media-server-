@@ -2,31 +2,46 @@ package dev.lumen.player.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement as LayoutArrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BrightnessMedium
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
@@ -41,39 +56,148 @@ import dev.lumen.player.player.PlayerViewModel
 import dev.lumen.player.player.UiState
 
 /**
- * The whole UI, laid out by fold posture.
+ * The whole UI, laid out by fold posture and by what the user asked for.
  *
- * Three layouts, because a Fold 5 is three devices:
- *
- *  - **Tabletop** (half-open, horizontal hinge): video above the crease, library below it. The
- *    layout that makes a foldable worth targeting — the phone stands on a table and plays hands-free.
- *  - **Wide** (inner display, flat): video and library side by side. The inner screen is nearly
- *    square, so a full-width 16:9 video would leave a third of the display empty.
- *  - **Tall** (cover screen): video on top, library filling the rest. At 23.1:9 there is no room
- *    for anything beside the video.
+ * A Fold 5 is several devices — cover screen, inner display, half open on a table, and each of those
+ * turned on its side — so the arrangement is chosen rather than fixed. But the arrangement is only
+ * half the answer: the first version of this screen put the library beside the video in every one of
+ * those shapes with no way to dismiss it, so the video never got the panel it was on. [ViewMode] is
+ * the user's half, and it wins.
  */
 @UnstableApi
 @Composable
 fun PlayerScreen(
     vm: PlayerViewModel,
-    contentPadding: androidx.compose.foundation.layout.PaddingValues =
-        androidx.compose.foundation.layout.PaddingValues(0.dp),
+    settings: DisplaySettings,
+    onSettingsChange: ((DisplaySettings) -> DisplaySettings) -> Unit,
+    contentPadding: PaddingValues = PaddingValues(0.dp),
+    /// Re-requests media access, or opens settings when the permission is permanently denied.
+    /// Supplied by the host so this screen holds no permission mechanics.
+    onRequestAccess: () -> Unit = {},
+    /// True while the window is a floating Picture-in-Picture rectangle. Everything but the video
+    /// itself is suppressed in that state — there is no room for a library list in a PiP window, no
+    /// room to read the gesture hints, and the system already draws its own play/pause affordance
+    /// from the media session, so `PlayerView`'s own controller would only be a second, cramped copy.
+    isInPip: Boolean = false,
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val posture by rememberPosture()
     val config = LocalConfiguration.current
 
-    // The inner display is about 6:5; the cover screen about 23:9. 600dp is the conventional
-    // breakpoint for "this is a tablet-shaped surface", and on a Fold 5 it separates the two
-    // displays cleanly.
-    val isWide = config.screenWidthDp >= 600
+    val tabletop = posture as? Posture.Tabletop
+    val book = posture as? Posture.Book
+    val arrangement = if (isInPip) {
+        Arrangement.VideoOnly
+    } else {
+        arrangementFor(
+            isTabletop = tabletop != null,
+            isBook = book != null,
+            widthDp = config.screenWidthDp,
+            heightDp = config.screenHeightDp,
+            mode = settings.viewMode,
+        )
+    }
 
-    when (val p = posture) {
-        is Posture.Tabletop -> TabletopLayout(vm, state, p, contentPadding)
-        is Posture.Book -> BookLayout(vm, state, contentPadding)
-        Posture.Flat ->
-            if (isWide) WideLayout(vm, state, contentPadding)
-            else TallLayout(vm, state, contentPadding)
+    var sheetOpen by remember { mutableStateOf(false) }
+    var tracksOpen by remember { mutableStateOf(false) }
+    var hint by remember { mutableStateOf<String?>(null) }
+    val tracks by vm.tracks.collectAsStateWithLifecycle()
+    val subtitlesDisabled by vm.subtitlesDisabled.collectAsStateWithLifecycle()
+    // The hint is a message, not a state: it says what just changed and then gets out of the way.
+    LaunchedEffect(hint) {
+        if (hint != null) {
+            kotlinx.coroutines.delay(1400)
+            hint = null
+        }
+    }
+
+    val video: @Composable (Modifier) -> Unit = { modifier ->
+        VideoSurface(
+            vm = vm,
+            settings = settings,
+            onZoom = { factor -> onSettingsChange { it.withZoom(factor) } },
+            onPan = { dx, dy -> onSettingsChange { it.withPan(dx, dy) } },
+            onCycleFit = {
+                onSettingsChange { s -> s.copy(fit = s.fit.next()) }
+                hint = "Scaling: ${settings.fit.next().label}"
+            },
+            // A PiP window is a few centimetres across on most phones. mpv's own gesture handling —
+            // scrub, brightness, volume, pinch — reading a drag that small is a source of accidental
+            // input, not a control anyone can use, so it is switched off rather than left to misfire.
+            gesturesEnabled = !isInPip,
+            modifier = modifier,
+        )
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        when (arrangement) {
+            Arrangement.Tabletop -> TabletopLayout(
+                vm, state, tabletop!!, settings, contentPadding, onRequestAccess, video
+            )
+            Arrangement.Book -> BookLayout(
+                vm, state, book!!, settings, contentPadding, onRequestAccess, video
+            )
+            Arrangement.SideBySide ->
+                SideBySideLayout(vm, state, settings, contentPadding, onRequestAccess, video)
+            Arrangement.Stacked ->
+                StackedLayout(vm, state, settings, contentPadding, onRequestAccess, video)
+            Arrangement.VideoOnly -> Box(
+                Modifier.fillMaxSize().background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) { video(Modifier.fillMaxSize()) }
+        }
+
+        // Every floating control disappears in PiP rather than being drawn tiny: a window a few
+        // centimetres across has no room to show them legibly, let alone to hit them accurately.
+        if (isInPip) return@Box
+
+        // Its own button rather than folded into ViewModeButton's sheet: track choice is a decision
+        // about *this file*, made and remade during playback, and a control buried a level down
+        // behind an unrelated icon is exactly how "the player picked the wrong audio" happens — the
+        // control exists, nobody finds it.
+        TrackPickerButton(
+            onOpen = { tracksOpen = true },
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(top = contentPadding.calculateTopPadding())
+                .padding(12.dp),
+        )
+
+        // Always in the same corner, in every arrangement and every posture. A control that moves
+        // when the device folds is one that has to be found again each time.
+        ViewModeButton(
+            mode = settings.viewMode,
+            onCycle = {
+                onSettingsChange { it.copy(viewMode = it.viewMode.next()) }
+                hint = settings.viewMode.next().name
+            },
+            onOpenOptions = { sheetOpen = true },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(top = contentPadding.calculateTopPadding())
+                .padding(12.dp),
+        )
+
+        hint?.let { GestureHint(it, Modifier.align(Alignment.TopCenter)) }
+    }
+
+    if (sheetOpen) {
+        DisplayOptionsSheet(
+            settings = settings,
+            arrangement = arrangement,
+            onChange = onSettingsChange,
+            onDismiss = { sheetOpen = false },
+        )
+    }
+
+    if (tracksOpen) {
+        TrackSheet(
+            choices = dev.lumen.player.player.TrackSelection.choicesFor(tracks),
+            subtitlesDisabled = subtitlesDisabled,
+            onSelect = { g, t -> vm.selectTrack(g, t) },
+            onSubtitlesOff = { vm.disableSubtitles() },
+            onDismiss = { tracksOpen = false },
+        )
     }
 }
 
@@ -83,6 +207,10 @@ fun PlayerScreen(
  * The hinge bounds arrive in pixels from `WindowInfoTracker` and have to become dp for Compose.
  * Nothing is drawn across the crease: on a Fold 5 it is a visible, slightly recessed line, and a
  * control placed on it is one that is hard to read and unreliable to press.
+ *
+ * This arrangement survives every view mode, because the geometry is the point — the top screen is
+ * the picture whether or not a library sits below it. In Theater and Immersive the bottom half keeps
+ * the now-playing bar and loses the list, which is what makes the posture usable one-handed.
  */
 @UnstableApi
 @Composable
@@ -90,7 +218,10 @@ private fun TabletopLayout(
     vm: PlayerViewModel,
     state: UiState,
     p: Posture.Tabletop,
+    settings: DisplaySettings,
     contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
 ) {
     val density = LocalDensity.current
     val topHeightDp = with(density) { p.hingeTopPx.toDp() }
@@ -98,14 +229,9 @@ private fun TabletopLayout(
 
     Column(Modifier.fillMaxSize()) {
         Box(
-            Modifier
-                .fillMaxWidth()
-                .height(topHeightDp)
-                .background(Color.Black),
+            Modifier.fillMaxWidth().height(topHeightDp).background(Color.Black),
             contentAlignment = Alignment.Center,
-        ) {
-            VideoSurface(vm, Modifier.fillMaxSize())
-        }
+        ) { video(Modifier.fillMaxSize()) }
         // The crease itself. Left empty on purpose — see above.
         Spacer(Modifier.fillMaxWidth().height(hingeHeightDp))
         Column(
@@ -115,69 +241,134 @@ private fun TabletopLayout(
                 .padding(horizontal = 12.dp)
         ) {
             NowPlayingBar(state, vm)
-            LibraryList(state, vm, Modifier.fillMaxSize())
+            if (settings.viewMode.showsLibrary) {
+                LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
+            }
         }
     }
 }
 
-/** Half-open held like a book: video one side, library the other. */
+/**
+ * Held like a book: video on one side of a vertical hinge, everything else on the other.
+ *
+ * The counterpart to [TabletopLayout] for [Posture.Book] -- posture detection has recognised a
+ * vertical hinge since `FoldState.kt` was written, but until this layout existed nothing ever
+ * consumed it: `arrangementFor` fell straight through to the ordinary width/height rule, so a Fold 5
+ * held open like a book was laid out exactly as if it were an unfolded flat window of the same size,
+ * with a video pane that could straddle the physical crease.
+ *
+ * Same reasoning as [TabletopLayout] for the crease itself: nothing is drawn on it, since it is a
+ * visible, slightly recessed line on the hardware this build targets and a control placed there is
+ * hard to read and unreliable to press. The hinge bounds arrive in pixels from `WindowInfoTracker`
+ * and have to become dp for Compose, same as the tabletop case.
+ */
 @UnstableApi
 @Composable
-private fun BookLayout(vm: PlayerViewModel, state: UiState, contentPadding: PaddingValues) =
-    WideLayout(vm, state, contentPadding)
+private fun BookLayout(
+    vm: PlayerViewModel,
+    state: UiState,
+    p: Posture.Book,
+    settings: DisplaySettings,
+    contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
+) {
+    val density = LocalDensity.current
+    val leftWidthDp = with(density) { p.hingeLeftPx.toDp() }
+    val hingeWidthDp = with(density) { (p.hingeRightPx - p.hingeLeftPx).toDp() }
 
-/** Inner display, flat. Nearly square, so the two panes sit side by side. */
+    Row(Modifier.fillMaxSize()) {
+        Box(
+            Modifier.fillMaxHeight().width(leftWidthDp).background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) { video(Modifier.fillMaxSize()) }
+        // The crease itself. Left empty on purpose — see above.
+        Spacer(Modifier.fillMaxHeight().width(hingeWidthDp))
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(top = contentPadding.calculateTopPadding())
+                .padding(bottom = contentPadding.calculateBottomPadding())
+                .padding(horizontal = 12.dp)
+        ) {
+            NowPlayingBar(state, vm)
+            if (settings.viewMode.showsLibrary) {
+                LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
+            }
+        }
+    }
+}
+
+/** Two panes across. The split is the user's, not a constant. */
 @UnstableApi
 @Composable
-private fun WideLayout(vm: PlayerViewModel, state: UiState, contentPadding: PaddingValues) {
+private fun SideBySideLayout(
+    vm: PlayerViewModel,
+    state: UiState,
+    settings: DisplaySettings,
+    contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
+) {
     Row(Modifier.fillMaxSize()) {
         Box(
             Modifier
-                .weight(0.62f)
+                .weight(settings.splitFraction)
                 .fillMaxHeight()
                 .background(Color.Black),
             contentAlignment = Alignment.Center,
-        ) {
-            VideoSurface(vm, Modifier.fillMaxSize())
-        }
+        ) { video(Modifier.fillMaxSize()) }
         Column(
             Modifier
-                .weight(0.38f)
+                .weight(1f - settings.splitFraction)
                 .fillMaxHeight()
                 .padding(top = contentPadding.calculateTopPadding())
                 .padding(bottom = contentPadding.calculateBottomPadding())
                 .padding(12.dp)
         ) {
             NowPlayingBar(state, vm)
-            LibraryList(state, vm, Modifier.fillMaxSize())
+            LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
         }
     }
 }
 
-/** Cover screen. Too narrow for anything but a stack. */
+/**
+ * Two panes stacked. The cover screen, and the inner display turned to a shape too short for a list
+ * beside the picture.
+ *
+ * The video box is a share of the height rather than a hardcoded 16:9. The 16:9 box was wrong in
+ * both directions at once: a 2.39:1 film was letterboxed inside it *and* the box was letterboxed
+ * inside a 23:9 screen, so a scope film played in a band across the middle of a tall black
+ * rectangle. A share of the height plus the chosen scaling mode gives one letterbox at most, and the
+ * share is adjustable because no single number is right for both a phone screen and a tablet one.
+ */
 @UnstableApi
 @Composable
-private fun TallLayout(vm: PlayerViewModel, state: UiState, contentPadding: PaddingValues) {
+private fun StackedLayout(
+    vm: PlayerViewModel,
+    state: UiState,
+    settings: DisplaySettings,
+    contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
+) {
     Column(Modifier.fillMaxSize()) {
         Box(
             Modifier
                 .fillMaxWidth()
-                // 16:9 rather than fillMaxHeight: on a 23:9 screen a proportional split would leave
-                // the video a sliver and the list unusable.
-                .aspectRatio(16f / 9f)
+                .weight(settings.splitFraction)
                 .background(Color.Black),
             contentAlignment = Alignment.Center,
-        ) {
-            VideoSurface(vm, Modifier.fillMaxSize())
-        }
+        ) { video(Modifier.fillMaxSize()) }
         Column(
             Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
+                .weight(1f - settings.splitFraction)
                 .padding(bottom = contentPadding.calculateBottomPadding())
                 .padding(horizontal = 12.dp)
         ) {
             NowPlayingBar(state, vm)
-            LibraryList(state, vm, Modifier.fillMaxSize())
+            LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
         }
     }
 }
@@ -188,23 +379,227 @@ private fun TallLayout(vm: PlayerViewModel, state: UiState, contentPadding: Padd
  * There is no Compose-native video surface, so this is an `AndroidView`. The `update` block is what
  * keeps it correct across a fold: the composition is re-run with the same player instance, so the
  * surface is re-attached rather than recreated and playback continues through the transition.
+ *
+ * Two layers of sizing, and they are not interchangeable:
+ *
+ *  - **Fit and aspect** are applied by `PlayerView` to the video surface itself, so the subtitle and
+ *    control overlays stay unscaled and legible. Scaling those with the picture is how subtitles end
+ *    up cropped off the side of a zoomed frame.
+ *  - **Pinch zoom and pan** are a Compose `graphicsLayer` on top, because Media3 has no such concept.
+ *    `clipToBounds` keeps a zoomed picture inside its pane instead of drawing over the library.
  */
 @UnstableApi
 @Composable
-private fun VideoSurface(vm: PlayerViewModel, modifier: Modifier = Modifier) {
-    AndroidView(
-        modifier = modifier,
-        factory = { ctx ->
-            PlayerView(ctx).apply {
-                useController = true
-                controllerAutoShow = true
-                setShowNextButton(false)
-                setShowPreviousButton(false)
+private fun VideoSurface(
+    vm: PlayerViewModel,
+    settings: DisplaySettings,
+    onZoom: (Float) -> Unit,
+    onPan: (Float, Float) -> Unit,
+    onCycleFit: () -> Unit,
+    gesturesEnabled: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
+    // Null until the playback service has been reached. `PlayerView` accepts that and shows its
+    // placeholder, which is the honest thing to draw while there is genuinely no player yet.
+    val player by vm.player.collectAsStateWithLifecycle()
+    val levels = rememberScreenLevels()
+    var feedback by remember { mutableStateOf<GestureFeedback?>(null) }
+    // Where the scrub started. Read once per gesture: reading the live position on every frame would
+    // make the target chase the seek that the gesture itself is causing.
+    var scrubFrom by remember { mutableLongStateOf(0L) }
+    var scrubTo by remember { mutableLongStateOf(0L) }
+
+    LaunchedEffect(feedback) {
+        if (feedback != null) {
+            kotlinx.coroutines.delay(900)
+            feedback = null
+        }
+    }
+
+    Box(
+        modifier
+            .clipToBounds()
+            .pointerInput(player, gesturesEnabled) {
+                if (!gesturesEnabled) return@pointerInput
+                val width = size.width.toFloat()
+                val height = size.height.toFloat()
+                playerDragGestures(
+                    isZoomed = { settings.zoom > 1f },
+                    onZoom = onZoom,
+                    onPan = onPan,
+                    onDragStart = { _, axis ->
+                        if (axis == DragAxis.Horizontal) {
+                            scrubFrom = player?.currentPosition ?: 0L
+                            scrubTo = scrubFrom
+                        }
+                    },
+                    onDrag = { zone, axis, dx, dy ->
+                        when (axis) {
+                            DragAxis.Horizontal -> {
+                                scrubTo = PlayerGestures.scrubTarget(
+                                    scrubTo, dx, width, player?.duration ?: 0L
+                                )
+                                feedback = GestureFeedback.Seek(scrubTo, scrubTo - scrubFrom)
+                            }
+                            DragAxis.Vertical -> {
+                                val delta = PlayerGestures.levelDelta(dy, height)
+                                feedback = if (zone == GestureZone.Left) {
+                                    GestureFeedback.Brightness(levels.nudgeBrightness(delta))
+                                } else {
+                                    GestureFeedback.Volume(levels.nudgeVolume(delta))
+                                }
+                            }
+                            DragAxis.Undecided -> {}
+                        }
+                    },
+                    // The seek happens once, at the end. Seeking on every frame of the drag makes a
+                    // decoder re-key dozens of times a second and the picture stutters into place
+                    // rather than following the finger.
+                    onDragEnd = { axis ->
+                        if (axis == DragAxis.Horizontal) player?.seekTo(scrubTo)
+                    },
+                )
             }
-        },
-        update = { view -> view.player = vm.player },
-        onRelease = { view -> view.player = null },
-    )
+            // Taps stay in their own `pointerInput`. Tap detection gives up the moment movement
+            // passes the touch slop, so it cannot compete with the drag detector above — which is
+            // exactly why these two can coexist when two drag detectors could not.
+            .pointerInput(player, gesturesEnabled) {
+                if (!gesturesEnabled) return@pointerInput
+                val width = size.width.toFloat()
+                detectTapGestures(
+                    onDoubleTap = { offset ->
+                        val p = player ?: return@detectTapGestures
+                        val zone = PlayerGestures.zoneFor(offset.x, width)
+                        val target =
+                            PlayerGestures.doubleTapSeekMs(zone, p.currentPosition, p.duration)
+                        if (target == null) {
+                            vm.togglePlayPause()
+                        } else {
+                            p.seekTo(target)
+                            feedback = GestureFeedback.Seek(target, target - p.currentPosition)
+                        }
+                    },
+                )
+            }
+    ) {
+        AndroidView(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = settings.zoom
+                    scaleY = settings.zoom
+                    translationX = settings.panX
+                    translationY = settings.panY
+                },
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    useController = true
+                    controllerAutoShow = true
+                    setShowNextButton(false)
+                    setShowPreviousButton(false)
+                }
+            },
+            update = { view ->
+                view.player = player
+                // The system draws its own play/pause affordance on a PiP window from the media
+                // session; PlayerView's controller would only be a second copy with no room to fit.
+                view.useController = gesturesEnabled
+                view.resizeMode = settings.fit.resizeMode()
+                // The forced ratio goes on `PlayerView`'s own content frame — Media3's supported
+                // mechanism for this — rather than on a Compose wrapper, so the picture is reshaped
+                // without reshaping the subtitle and control overlays drawn on top of it.
+                //
+                // A non-positive value is how `AspectRatioFrameLayout` is told to go back to the
+                // video's own ratio; there is no separate clear call, which is what `Source` maps to.
+                view.findViewById<androidx.media3.ui.AspectRatioFrameLayout>(
+                    androidx.media3.ui.R.id.exo_content_frame
+                )?.setAspectRatio(settings.aspect.ratio ?: 0f)
+
+                // `setApplyEmbeddedStyles` is deliberately left at Media3's default (on): ASS and
+                // PGS carry their own position and colour, often used to place a forced subtitle
+                // where it will not cover the picture, and forcing an override here would fight that
+                // rather than improve it. `setStyle`/text size below is the fallback style Media3
+                // uses for cues with no embedded styling of their own — plain SRT and VTT, which is
+                // exactly the case a size and background toggle are for.
+                view.subtitleView?.setFractionalTextSize(
+                    androidx.media3.ui.SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * settings.subtitleScale
+                )
+                view.subtitleView?.setStyle(
+                    androidx.media3.ui.CaptionStyleCompat(
+                        android.graphics.Color.WHITE,
+                        if (settings.subtitleBackground) {
+                            android.graphics.Color.argb(160, 0, 0, 0)
+                        } else {
+                            android.graphics.Color.TRANSPARENT
+                        },
+                        android.graphics.Color.TRANSPARENT,
+                        androidx.media3.ui.CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                        android.graphics.Color.BLACK,
+                        /* typeface = */ null,
+                    )
+                )
+            },
+            onRelease = { view -> view.player = null },
+        )
+
+        feedback?.let { GestureFeedbackOverlay(it, Modifier.align(Alignment.Center)) }
+    }
+}
+
+/**
+ * What a drag is doing, drawn over the picture while it happens.
+ *
+ * A gesture with no feedback is indistinguishable from one that missed — the whole reason a phone
+ * player shows *something* the instant a thumb touches the screen, before the effect it is having is
+ * otherwise visible at all.
+ */
+@Composable
+private fun GestureFeedbackOverlay(feedback: GestureFeedback, modifier: Modifier = Modifier) {
+    Card(
+        modifier.padding(24.dp),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = Color.Black.copy(alpha = 0.65f)
+        ),
+    ) {
+        Column(
+            Modifier.padding(horizontal = 20.dp, vertical = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            when (feedback) {
+                is GestureFeedback.Seek -> {
+                    val sign = if (feedback.deltaMs >= 0) "+" else "-"
+                    Text(
+                        PlayerViewModel.formatDuration(feedback.targetMs),
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall,
+                    )
+                    Text(
+                        "$sign${PlayerViewModel.formatDuration(kotlin.math.abs(feedback.deltaMs))}",
+                        color = Color.White.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.labelLarge,
+                    )
+                }
+                is GestureFeedback.Brightness ->
+                    LevelRow(Icons.Filled.BrightnessMedium, feedback.level)
+                is GestureFeedback.Volume ->
+                    LevelRow(Icons.Filled.VolumeUp, feedback.level)
+            }
+        }
+    }
+}
+
+@Composable
+private fun LevelRow(icon: androidx.compose.ui.graphics.vector.ImageVector, level: Float) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.size(10.dp))
+        LinearProgressIndicator(
+            progress = { level.coerceIn(0f, 1f) },
+            modifier = Modifier.size(width = 120.dp, height = 6.dp),
+            color = Color.White,
+            trackColor = Color.White.copy(alpha = 0.25f),
+        )
+    }
 }
 
 @Composable
@@ -222,6 +617,20 @@ private fun NowPlayingBar(state: UiState, vm: PlayerViewModel) {
                     .joinToString("  ·  "),
                 style = MaterialTheme.typography.bodySmall,
             )
+        }
+        // "Resumed from 42:10". A player that silently starts a film forty minutes in is
+        // indistinguishable from one that lost your place and picked a random spot; saying so is
+        // what turns it from a surprise into a feature, and tapping starts from the beginning.
+        state.notice?.let { message ->
+            Card(Modifier.fillMaxWidth().padding(top = 8.dp).clickable {
+                vm.clearResumePoint()
+                vm.dismissNotice()
+            }) {
+                Column(Modifier.padding(12.dp)) {
+                    Text(message, style = MaterialTheme.typography.bodySmall)
+                    Text("tap to start from the beginning", style = MaterialTheme.typography.labelSmall)
+                }
+            }
         }
         state.error?.let { message ->
             Card(Modifier.fillMaxWidth().padding(top = 8.dp).clickable { vm.dismissError() }) {
@@ -242,14 +651,18 @@ private fun NowPlayingBar(state: UiState, vm: PlayerViewModel) {
 private fun LibraryList(
     state: UiState,
     vm: PlayerViewModel,
+    onRequestAccess: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     when {
+        // `onRequestAccess`, not `vm.refresh()`. Refresh only re-queries MediaStore, which without
+        // the permission returns nothing and leaves this screen exactly as it was — a button that
+        // appears to do nothing, and no route back into the app for anyone who denied once.
         !state.permissionGranted -> Box(modifier, contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("Media access is needed to list your videos.")
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = { vm.refresh() }) { Text("Retry") }
+                Button(onClick = onRequestAccess) { Text("Grant access") }
             }
         }
 
@@ -270,7 +683,7 @@ private fun LibraryList(
             }
         }
 
-        else -> LazyColumn(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        else -> LazyColumn(modifier, verticalArrangement = LayoutArrangement.spacedBy(4.dp)) {
             items(state.items, key = { it.id }) { item ->
                 LibraryRow(item, isPlaying = item.id == state.nowPlaying?.id) { vm.play(item) }
             }

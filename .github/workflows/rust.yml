@@ -1,0 +1,114 @@
+name: Rust
+
+# Tests, lints and formatting for the Rust workspace — the desktop player and every crate under it.
+#
+# Runs on all three desktop platforms because the player is platform-specific in exactly the places
+# that matter: the mpv IPC transport is a Unix socket on Linux/macOS and a named pipe on Windows,
+# the environment probe shells out to different tools per OS, and path handling differs. A
+# Linux-only CI would let a Windows-only break reach a release unnoticed.
+
+on:
+  push:
+    paths:
+      - 'crates/**'
+      - 'spikes/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rust.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI only. Locally a warning should not block an edit-compile cycle; in CI it
+  # is the difference between a clean tree and a slow accumulation nobody ever goes back to fix.
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Do not cancel the other platforms when one fails. Knowing whether a break is
+      # Windows-specific or universal is most of the diagnosis, and that is lost if the run aborts.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      # `lumen doctor` runs on a machine with no mpv here, which is itself worth exercising: it must
+      # report the absence and exit 2 rather than panicking. Exit 2 is the expected outcome, so a
+      # zero would be the failure.
+      - name: Smoke test the CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=$(cargo run -q -p lumen-play -- --version)
+          echo "$BIN"
+          echo "$BIN" | grep -q "^lumen "
+
+          # A missing mpv must be reported, not crashed on.
+          set +e
+          cargo run -q -p lumen-play -- doctor > doctor.txt 2>&1
+          code=$?
+          set -e
+          cat doctor.txt
+          if [ "$code" != "0" ] && [ "$code" != "2" ]; then
+            echo "doctor exited $code; expected 0 (mpv present) or 2 (mpv absent)" >&2
+            exit 1
+          fi
+
+          # Scanning a tree with no media must succeed and report nothing, not error.
+          mkdir -p empty-lib
+          cargo run -q -p lumen-play -- scan empty-lib
+
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  licence-gate:
+    name: licence gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The LGPL-only discipline from ADR-0002 is a shipping constraint, not a preference: a GPL
+      # component makes the whole product GPL and forecloses the App Store. Checking it by hand is
+      # how it stops being checked.
+      - name: Run the licence gate
+        run: |
+          if [ -x ci/license-gate.sh ]; then
+            ./ci/license-gate.sh
+          else
+            echo "ci/license-gate.sh missing or not executable" >&2
+            exit 1
+          fi

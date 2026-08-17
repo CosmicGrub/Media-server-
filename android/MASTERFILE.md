@@ -524,6 +524,30 @@ adb install -r app-release.apk
 Without a computer: copy the APK to the phone, open it in Files, and allow installing from that
 source when prompted.
 
+### Getting a CI build onto the phone
+
+Every push that touches `android/` publishes the APK to a rolling prerelease:
+
+**<https://github.com/CosmicGrub/Media-server-/releases/tag/android-latest>**
+
+Open that on the phone, tap `lumen.apk`, allow installation from the browser when Android asks, and
+that is the whole procedure — no PC, no cable. The link never changes; the asset behind it is
+replaced on each build, and the release title carries the commit it came from.
+
+The reason this exists rather than pointing at the run's Artifacts section: **an Actions artifact is
+a zip, and Android cannot install a zip.** Getting the app onto a device from an artifact means a
+PC, a download, an unzip, and a cable. A release asset is the `.apk` itself.
+
+The repository is private, so the phone's browser has to be signed in to GitHub for the download to
+start. That is a one-time login, not a per-build step.
+
+From a PC instead, if the cable is already there:
+
+```bash
+gh release download android-latest --repo CosmicGrub/Media-server- --pattern lumen.apk
+adb install -r lumen.apk
+```
+
 ### Verifying what you built
 
 ```bash

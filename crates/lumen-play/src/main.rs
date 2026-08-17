@@ -13,9 +13,11 @@
 //! `test` is the mode worth running first on a large collection: it walks a thousand files in an
 //! evening rather than a fortnight, and the output is a list of exactly which ones failed and why.
 
+mod fidelity;
 mod ipc;
 mod json;
 mod mpvbin;
+mod remote;
 mod report;
 mod scan;
 mod session;
@@ -35,11 +37,13 @@ lumen — media library player and test harness
   lumen items <paths...>              the collection, grouped into films and seasons
   lumen play  <paths...>              play everything found
   lumen test  <paths...>              open every file briefly and report which fail
+  lumen serve <path>                  run a persistent player a phone can pair with and control
 
 Options
   --seconds <n>       play only n seconds of each file (default 20 for `test`)
   --limit <n>         stop after n playable files
   --depth <n>         maximum directory depth
+  --identify          compute a content identity per file and report duplicates
   --include-samples   keep files that look like sample clips
   --shuffle           play in random order
   --windowed          do not go fullscreen
@@ -49,6 +53,14 @@ Options
   --dry-run           print the mpv command and playlist, launch nothing
   --json <path>       write the machine-readable report here
   --                  everything after this is passed to mpv verbatim
+
+`serve` options
+  --port <n>          TCP port to listen on (default 7890)
+  --bind <addr>       address to bind (default 0.0.0.0 — every interface)
+
+Other
+  --help              this text
+  --version           version and target platform
 
 Exit codes: 0 all played, 1 at least one file failed, 2 usage or setup error.";
 
@@ -65,8 +77,27 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Some("serve") => match serve(&args[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
         Some("--help" | "-h" | "help") => {
             println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        // Expected of anything shipped, and the first thing anyone asks a binary that misbehaves.
+        // Reports the target it was built for, not the host running it: a bug report saying
+        // "lumen 0.1.0" is far less useful than one naming the architecture.
+        Some("--version" | "-V" | "version") => {
+            println!(
+                "lumen {} ({} {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
             ExitCode::SUCCESS
         }
         _ => {
@@ -123,6 +154,7 @@ fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
     }
 
     let opts = ScanOptions {
+        identify: flag(args, "--identify"),
         include_samples: flag(args, "--include-samples"),
         limit: value(args, "--limit").and_then(|v| v.parse().ok()),
         max_depth: value(args, "--depth").and_then(|v| v.parse().ok()),
@@ -187,6 +219,44 @@ fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
     Ok(if session.failed().count() > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
+/// A persistent, remotely controllable player. Runs until the process is killed.
+fn serve(args: &[String]) -> Result<ExitCode, String> {
+    // The one positional argument: the library path. A small hand-rolled walk rather than reusing
+    // `positional()`'s `TAKES_VALUE` list, which belongs to `play`/`test`'s own options and has
+    // nothing to do with `--port`/`--bind`.
+    let stop = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut root = None;
+    let mut i = 0;
+    while i < stop {
+        let a = &args[i];
+        if a == "--port" || a == "--bind" {
+            i += 2;
+            continue;
+        }
+        if !a.starts_with("--") && root.is_none() {
+            root = Some(PathBuf::from(a));
+        }
+        i += 1;
+    }
+    let root = root.ok_or("usage: lumen serve <path> [--port <n>] [--bind <addr>]")?;
+
+    if !root.exists() {
+        return Err(format!("{} does not exist", root.display()));
+    }
+
+    let port: u16 = value(args, "--port")
+        .map(|v| v.parse().map_err(|_| format!("--port must be a number, got {v:?}")))
+        .transpose()?
+        .unwrap_or(7890);
+    let bind = value(args, "--bind").unwrap_or_else(|| "0.0.0.0".to_string());
+
+    println!(
+        "lumen serve — do not forward this port through your router; it is meant for your own LAN"
+    );
+    remote::server::run(&root, &bind, port, &passthrough(args), |line| println!("{line}"))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn write_json(
     args: &[String],
     found: &scan::Scan,
@@ -246,6 +316,11 @@ fn doctor() -> ExitCode {
         );
     } else {
         println!("  {}", real.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+        // `--hwdec=help` lists what mpv was *compiled* with, not what works here. A build with
+        // nvdec support on a machine with no NVIDIA driver lists nvdec and then fails to load
+        // libcuda at playback. `lumen test` reports what each file actually decoded with, which is
+        // the number to trust.
+        println!("  (compiled-in support; `lumen test` reports what actually decoded)");
     }
 
     println!("\nnext");

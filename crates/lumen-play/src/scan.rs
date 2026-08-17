@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use lumen_identity::ContentSketch;
 use lumen_match::{EpisodeSpec, ParsedName};
 use lumen_model::Container;
 use lumen_probe::{Candidate, Confidence, sniff};
@@ -80,6 +81,11 @@ pub struct ScannedFile {
     pub extension_mismatch: bool,
     /// No signature matched at all. Not a refusal — the player still tries.
     pub unidentified: bool,
+    /// Content-derived identity, when `--identify` asked for it.
+    ///
+    /// Survives rename, move and remount, because it is derived from the bytes rather than the path.
+    /// Two files with the same sketch are the same content under different names.
+    pub identity: Option<ContentSketch>,
     pub parsed: ParsedName,
 }
 
@@ -149,6 +155,12 @@ impl ScannedFile {
 
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
+    /// Compute a content-derived identity for each playable file, which finds duplicates.
+    ///
+    /// Off by default because it is real I/O: the sniffer reads 4 KiB per file, and a sketch reads
+    /// up to 3 MiB. Across five thousand files that is 15 GiB rather than 20 MiB, which over a
+    /// network share is the difference between seconds and an afternoon.
+    pub identify: bool,
     /// Include files that parse as sample clips.
     pub include_samples: bool,
     /// Stop after this many playable files. `None` for no limit.
@@ -225,7 +237,16 @@ fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn classify(path: &Path, size: u64) -> ScannedFile {
+/// Content identity for one file.
+///
+/// Failure is `None` rather than an error: a file the sketch cannot read is still a file the player
+/// should try, and losing the whole scan over one unreadable item would be the wrong trade.
+fn sketch(path: &Path, size: u64) -> Option<ContentSketch> {
+    let mut f = std::fs::File::open(path).ok()?;
+    lumen_identity::sketch_reader(&mut f, size).ok()
+}
+
+fn classify(path: &Path, size: u64, identify: bool) -> ScannedFile {
     let ext = lower_ext(path);
     let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let parsed = lumen_match::parse(&name);
@@ -242,8 +263,12 @@ fn classify(path: &Path, size: u64) -> ScannedFile {
     // `sniff` always ends its list with a `Weak` raw-elementary-stream fallback, because the demuxer
     // is entitled to try that on anything. For classification it means the opposite of a match:
     // treating it as identification would make every text file in the tree a video.
-    let best =
-        candidates.iter().filter(|c| c.confidence > Confidence::Weak).max_by_key(|c| c.confidence);
+    //
+    // `find` rather than `max_by_key`: `sniff` returns candidates strongest-first and breaks ties in
+    // a meaningful order, and `max_by_key` returns the *last* maximum, which quietly reversed that.
+    // It cost every WebM file its identity — WebM and Matroska both match the EBML magic with equal
+    // confidence, and the tie went to the wrong one.
+    let best = candidates.iter().find(|c| c.confidence > Confidence::Weak);
     let container = best.map(|c| c.container);
     let ext_container = ext.as_deref().and_then(container_for_ext);
 
@@ -266,6 +291,12 @@ fn classify(path: &Path, size: u64) -> ScannedFile {
         MediaKind::Other
     };
 
+    // Only for things that will be played. Sketching a sidecar subtitle costs a read and answers a
+    // question nobody asked.
+    let identity = (identify && matches!(kind, MediaKind::Video | MediaKind::Audio) && size > 0)
+        .then(|| sketch(path, size))
+        .flatten();
+
     ScannedFile {
         path: path.to_path_buf(),
         size,
@@ -276,8 +307,27 @@ fn classify(path: &Path, size: u64) -> ScannedFile {
         evidence: best.map(|c| c.evidence),
         extension_mismatch,
         unidentified: container.is_none(),
+        identity,
         parsed,
     }
+}
+
+/// Files that share a content identity: the same bytes under different names.
+///
+/// Returns groups of two or more indices into `scan.files`. A real library accumulates these — the
+/// same film downloaded twice, or kept at two qualities — and they are invisible to any check based
+/// on filename, which is exactly why they accumulate.
+pub fn duplicate_groups(scan: &Scan) -> Vec<Vec<usize>> {
+    let mut by_id: BTreeMap<u128, Vec<usize>> = BTreeMap::new();
+    for (i, f) in scan.files.iter().enumerate() {
+        if let Some(id) = f.identity {
+            by_id.entry(id.0).or_default().push(i);
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = by_id.into_values().filter(|g| g.len() > 1).collect();
+    // Largest group first: the worst offender is the one worth acting on.
+    groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    groups
 }
 
 /// Walk `roots` and classify everything found.
@@ -290,7 +340,7 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions) -> Scan {
     for root in roots {
         match std::fs::metadata(root) {
             Ok(m) if m.is_file() => {
-                let mut f = classify(root, m.len());
+                let mut f = classify(root, m.len(), opts.identify);
                 if f.kind == MediaKind::Other {
                     f.kind = MediaKind::Video;
                 }
@@ -361,7 +411,7 @@ fn walk(dir: &Path, depth: usize, opts: &ScanOptions, out: &mut Scan) {
         }
 
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        let f = classify(&path, size);
+        let f = classify(&path, size, opts.identify);
         if f.kind == MediaKind::Other {
             continue;
         }
@@ -553,6 +603,24 @@ mod tests {
     }
 
     #[test]
+    fn a_webm_file_keeps_its_own_identity_rather_than_being_called_matroska() {
+        // WebM and Matroska share the EBML magic and are separated only by the header's `DocType`,
+        // so both come back with equal confidence and the tie-break decides. It used to go the wrong
+        // way, and the cost was not cosmetic: a browser opens WebM and cannot open Matroska, so
+        // every `.webm` in a library was reported as needing a remux it does not need.
+        let d = TempDir::new("webm");
+        let mut bytes = vec![0x1A, 0x45, 0xDF, 0xA3, 0x87, 0x42, 0x82, 0x84];
+        bytes.extend_from_slice(b"webm");
+        bytes.extend(std::iter::repeat_n(0u8, 100_000));
+        d.file("Doc.2012.720p.WEBRip.VP9.webm", &bytes);
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        let f = &s.files[0];
+        assert_eq!(f.container, Some(Container::WebM));
+        assert!(!f.extension_mismatch);
+    }
+
+    #[test]
     fn an_unidentifiable_file_with_a_media_extension_is_still_offered() {
         // Refusing at scan time would break the "no refusal" guarantee before the player ever tried.
         // Plenty of real media has no signature: raw elementary streams, and any file whose header
@@ -704,6 +772,75 @@ mod tests {
         let order = playlist_order(&s);
         let names: Vec<String> = order.iter().map(|&i| s.files[i].file_name()).collect();
         assert!(names[0].contains("cd1"), "{names:?}");
+    }
+
+    #[test]
+    fn identity_is_off_unless_asked_for() {
+        // It is real I/O — 3 MiB a file against the sniffer's 4 KiB. Across a large library over a
+        // network share that is the difference between seconds and an afternoon, so it must never
+        // happen because someone ran a plain `scan`.
+        let d = TempDir::new("noid");
+        d.file("Film.mkv", &mkv_bytes());
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert!(s.files[0].identity.is_none());
+        assert!(duplicate_groups(&s).is_empty());
+    }
+
+    #[test]
+    fn the_same_content_under_different_names_is_one_group() {
+        // The case a filename-based check can never see, and the reason libraries accumulate
+        // duplicates: the same film downloaded twice under two release names.
+        let d = TempDir::new("dupe");
+        let bytes = mkv_bytes();
+        d.file("Arrival (2016) 1080p GROUP.mkv", &bytes);
+        d.file("Arrival.2016.1080p.OTHER.mkv", &bytes);
+        d.file("Something Else (2019).mkv", &mp4_bytes());
+
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { identify: true, ..Default::default() });
+        let groups = duplicate_groups(&s);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].len(), 2);
+        // Both members are the two Arrival copies, not the unrelated file.
+        for &i in &groups[0] {
+            assert!(s.files[i].file_name().contains("Arrival"), "{}", s.files[i].file_name());
+        }
+    }
+
+    #[test]
+    fn different_content_of_the_same_length_does_not_collide() {
+        // Length alone is a terrible identity: two different films at the same byte count are
+        // ordinary. The sketch mixes length *and* three sampled regions for exactly this reason.
+        let d = TempDir::new("samelen");
+        let mut a = mkv_bytes();
+        let mut b = mkv_bytes();
+        // Differ only in the middle, which is where a head-only hash would miss it.
+        let mid = a.len() / 2;
+        a[mid] = 0x11;
+        b[mid] = 0x22;
+        d.file("A.mkv", &a);
+        d.file("B.mkv", &b);
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { identify: true, ..Default::default() });
+        assert_eq!(
+            s.files[0].size, s.files[1].size,
+            "the test needs equal lengths to mean anything"
+        );
+        assert_ne!(s.files[0].identity, s.files[1].identity);
+        assert!(duplicate_groups(&s).is_empty());
+    }
+
+    #[test]
+    fn subtitles_are_not_sketched() {
+        // Sketching a sidecar costs a read and answers a question nobody asked.
+        let d = TempDir::new("subid");
+        d.file("Film.mkv", &mkv_bytes());
+        d.file("Film.eng.srt", b"1\n00:00:01,000 --> x\n");
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { identify: true, ..Default::default() });
+        let sub = s.files.iter().find(|f| f.kind == MediaKind::Subtitle).unwrap();
+        assert!(sub.identity.is_none());
+        assert!(s.playable().all(|f| f.identity.is_some()));
     }
 
     #[test]

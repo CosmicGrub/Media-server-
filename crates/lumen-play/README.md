@@ -9,30 +9,36 @@ library is also the first real test of that code on data that is not a fixture.
 
 ## Install
 
-**Windows — prebuilt bundle, nothing to install.** Unzip
-`lumen-windows-x86_64.zip` anywhere and run `lumen.exe` from that folder. It carries `mpv.exe`
-(mpv 0.41.0, with FFmpeg and libplacebo statically linked) beside it, so the folder is
-self-contained and portable — a USB stick works. Nothing touches the registry; deleting the folder
-undoes everything.
+**Download a build.** `.github/workflows/release.yml` produces one per platform — Windows,
+Linux, and both Mac architectures — on every `v*` tag, and on demand via workflow dispatch. Grab
+the artifact for your platform from the Actions run and unpack it.
 
-Build it yourself, from Linux or Windows:
+The **Windows** bundle is self-contained: it carries `mpv.exe` (statically linked FFmpeg and
+libplacebo) beside `lumen.exe`, so the folder runs from a USB stick with nothing installed. Nothing
+touches the registry; deleting the folder undoes everything.
 
-```bash
-# Cross-compiling from Linux needs these once:
-apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-x86-64-dev
-rustup target add x86_64-pc-windows-gnu
-
-./crates/lumen-play/package-windows.sh --with-mpv   # -> dist/lumen-windows-x86_64.zip
-```
-
-**Anywhere else**, mpv is the one prerequisite:
+**Linux and macOS** bundles ship the binary alone, because mpv there is dynamically linked against
+a long dependency chain and shipping that correctly means shipping a distribution — which the
+package manager already is:
 
 ```bash
 #   macOS     brew install mpv
 #   Linux     apt install mpv     (or dnf / pacman / zypper)
+```
 
+**Or build it yourself:**
+
+```bash
 cargo build --release -p lumen-play
 ./target/release/lumen doctor
+```
+
+Cross-compiling a Windows bundle from Linux, which is how the first one was made:
+
+```bash
+apt-get install -y gcc-mingw-w64-x86-64 mingw-w64-x86-64-dev
+rustup target add x86_64-pc-windows-gnu
+./crates/lumen-play/package-windows.sh --with-mpv   # -> dist/lumen-windows-x86_64.zip
 ```
 
 `lumen` finds mpv beside its own executable first, then on `PATH`, then in the usual install
@@ -48,6 +54,7 @@ library that stutters on a machine with no hardware decoder is a driver finding,
 
 ```bash
 lumen scan  ~/Media                      # what is in there, and what looks wrong
+lumen scan  ~/Media --identify           # also find duplicate content
 lumen items ~/Media                      # the collection, grouped into films and seasons
 lumen play  ~/Media                      # watch it
 lumen test  ~/Media --seconds 20         # open every file briefly, report which fail
@@ -78,9 +85,45 @@ Beyond pass/fail, four things a play-through by hand would not surface:
 - **Unseekable files.** Plays forward, cannot be navigated: a lost Matroska Cues element or an
   unusable MP4 `moov`. A play-through test never notices, because playing forward still works. You
   find out the first time you try to skip.
+- **Duplicate content** (with `--identify`). The same bytes under two different release names —
+  invisible to any filename-based check, which is exactly why a library accumulates them. Identity
+  is content-derived, so it survives rename, move and remount. Off by default: it reads up to 3 MiB
+  a file against the sniffer's 4 KiB, which over a network share is the difference between seconds
+  and an afternoon.
 - **HDR.** Decided by the transfer function (`pq`, `hlg`), not the primaries — BT.2020 with a
   conventional gamma curve is wide-gamut SDR, and conflating the two would misreport a distinction
   this product exists to get right.
+- **Fidelity tier per file, on two endpoints.** See below.
+
+## Fidelity: how well it played, and what it would cost elsewhere
+
+"It played" is the floor, not the charter. Every file that opens is put through the real decision
+ladder (`lumen-playback`) against two declared capability profiles (`lumen-caps`), and the run
+reports the T0–T5 tier from `docs/11` §1.1 that each would reach:
+
+```
+fidelity (7 files) — modelled from what each file demuxed, not measured
+  native   T0 3  T1 3  T3 1
+  browser  T1 5  T3 2
+  1 play untouched on a native client and cannot in a browser
+
+below T2 natively (1) — adapted even on a fully capable client
+  Old Movie (1998)  T3
+      This device has no decoder for Mpeg4Part2.
+```
+
+The two profiles are the ends of the range a multi-platform product has to live across: a native
+client with Matroska, hardware HEVC/AV1, an HD AVR and an HDR display; and a browser, which is
+fMP4/WebM only, stereo PCM, SDR, text subtitles. A UHD remux that reaches T0 on the first and T3 on
+the second is not a defect — it is the fact you need before promising the file plays "everywhere".
+
+**Modelled, not measured, and labelled that way.** The stream description is a real demux of a real
+file, so the input is observation. The endpoint is a declared profile, so the output is what those
+capabilities *would* yield, not what any particular device did. Every degraded outcome carries the
+ladder's own reasons (guarantee G1, `docs/11`), so a tier is never a number without a cause.
+
+Files that did not open get `null` rather than `T5`: a tier for a file that never demuxed would be
+fiction, and `null` says so where a default would not.
 
 ## Options
 
@@ -88,6 +131,7 @@ Beyond pass/fail, four things a play-through by hand would not surface:
 --seconds <n>       play only n seconds of each file (default 20 for `test`)
 --limit <n>         stop after n playable files
 --depth <n>         maximum directory depth
+--identify          content identity per file; finds duplicates (extra I/O)
 --include-samples   keep files that look like sample clips
 --shuffle           play in random order
 --windowed          do not go fullscreen
@@ -118,18 +162,35 @@ cannot race a property read. See Status below for the bug this replaced.
 freely, so a property read at the wrong moment would swallow the `end-file` event carrying the reason
 a file failed, and the outcome would silently become "unknown".
 
-Zero dependencies beyond the workspace's own crates, including a hand-written JSON reader — mpv's
+**The fidelity assessment uses mpv's own track selection, not ours.** This file really played, and
+describing a selection that did not happen would be a worse answer than the one in front of us.
+`lumen-playback`'s automatic selector stands in only when mpv marked nothing selected at all.
+
+One external dependency, reached transitively: `lumen-identity` uses `xxhash-rust` for the content
+sketch. Everything else is the workspace's own crates plus a hand-written JSON reader — mpv's
 events carry file paths, and a path is exactly the kind of string full of braces, commas and quotes
 that substring matching gets wrong silently.
 
 ## Status
 
-76 tests, plus an end-to-end run of the Windows binary against real encoded media (H.264 in
-Matroska and MP4, MPEG-4 part 2 in AVI, and a deliberately corrupt file) under Wine: five files,
-four played, one correctly reported as `unrecognized file format`, every resolution and codec
-attributed to the right file, exit code 1.
+CI runs tests, clippy and rustfmt on Linux, macOS and Windows for every push, plus the ADR-0002
+licence gate. The platform matrix is not decoration: the mpv IPC transport is a Unix socket on one
+and a named pipe on the other, and the environment probe shells out to different tools per OS.
 
-That last point was a bug the real run caught, and it is worth knowing about:
+96 tests in this crate and 474 across the workspace, plus end-to-end runs against real encoded media.
+
+The Windows binary under Wine (H.264 in Matroska and MP4, MPEG-4 part 2 in AVI, and a deliberately
+corrupt file): five files, four played, one correctly reported as `unrecognized file format`, every
+resolution and codec attributed to the right file, exit code 1.
+
+The Linux binary against an eight-file corpus encoded for the purpose — H.264/AAC in Matroska and
+MP4, H.264/FLAC, H.264/AC-3, VP9/Opus in WebM, HEVC 10-bit PQ with TrueHD in Matroska, MPEG-4 part 2
+with AC-3 in AVI, and a corrupt file: seven played, one correctly failed, and the fidelity model
+answered as it should on each. The HEVC/PQ/TrueHD remux reached T0 natively and T3 in a browser; the
+XviD-in-AVI file reached T3 on both, correctly attributed to the absent MPEG-4 part 2 decoder rather
+than to the container.
+
+Three bugs the real runs caught, all invisible to unit tests:
 
 - mpv given a playlist **on the command line** starts playing before this process can connect, so
   the first `start-file` event is gone before anything is listening.
@@ -142,6 +203,16 @@ wrong, and invisible without checking the output against known inputs. The playl
 over IPC after connecting, and results are keyed on `playlist_entry_id`, which rides on the events
 themselves and cannot race.
 
-**Not yet exercised:** real GPU decoding and rendering. The Wine verification ran with `--vo=null`
-on a machine with no GPU, so hardware decode paths, `gpu-next`, HDR tone mapping and frame pacing
-are still untested. `LUMEN_DEBUG_EVENTS=1` dumps the raw mpv event stream if something looks wrong.
+The Linux corpus run caught a second one, in the scanner rather than the player: **every WebM file
+was being identified as Matroska.** WebM and Matroska share the EBML magic and are separated only by
+the header's `DocType`, so both come back as candidates with equal confidence — and the tie-break
+used `max_by_key`, which returns the *last* maximum, quietly reversing the order `sniff` had
+deliberately sorted them into. The cost was not cosmetic: a browser opens WebM and cannot open
+Matroska, so every `.webm` in a library was reported as needing a remux it does not need. The probe
+now reads the `DocType`, and the scanner takes the first candidate rather than the last-strongest.
+
+**Not yet exercised:** real GPU decoding and rendering. Every verification so far ran with
+`--vo=null` on a machine with no GPU, so hardware decode paths, `gpu-next`, HDR tone mapping and
+frame pacing are still untested. The fidelity tiers are likewise modelled against declared profiles
+rather than measured on the devices they name. `LUMEN_DEBUG_EVENTS=1` dumps the raw mpv event stream
+if something looks wrong.

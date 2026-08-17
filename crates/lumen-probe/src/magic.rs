@@ -68,6 +68,16 @@ pub fn sniff(head: &[u8]) -> Vec<Candidate> {
         out.push(c);
     }
 
+    // The EBML magic is shared by Matroska and WebM; only the `DocType` in the header separates
+    // them, and it sits within the first few dozen bytes. The distinction is not cosmetic: a browser
+    // opens WebM and cannot open Matroska, so calling every `.webm` Matroska reports a remux that is
+    // not needed on the one endpoint where it would be expensive.
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3])
+        && crate::ebml::analyze(head).is_some_and(|l| l.is_webm_doctype())
+    {
+        push_unique(&mut out, Container::WebM, Confidence::Certain, "EBML header, DocType webm");
+    }
+
     for (sig, container, evidence) in AT_ZERO {
         if head.starts_with(sig) {
             let confidence =
@@ -100,7 +110,10 @@ pub fn sniff(head: &[u8]) -> Vec<Candidate> {
         "fallback: probe as a headerless elementary stream",
     );
 
-    out.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    // Strongest evidence first. `sort_by_key` with `Reverse` rather than a hand-written comparator:
+    // both are stable sorts, so candidates of equal confidence keep the order they were pushed in,
+    // which is what makes the first ISOBMFF hit win over a later offset-0 match.
+    out.sort_by_key(|c| std::cmp::Reverse(c.confidence));
     out
 }
 
@@ -235,6 +248,30 @@ mod tests {
 
     fn best(head: &[u8]) -> Container {
         sniff(head)[0].container
+    }
+
+    /// An EBML header carrying `DocType`, which is the only thing separating WebM from Matroska.
+    fn ebml_header(doctype: &str) -> Vec<u8> {
+        let mut children = vec![0x42, 0x82, 0x80 | doctype.len() as u8];
+        children.extend_from_slice(doctype.as_bytes());
+        let mut head = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80 | children.len() as u8];
+        head.extend_from_slice(&children);
+        head
+    }
+
+    #[test]
+    fn webm_is_distinguished_from_matroska_by_its_doctype() {
+        // Not cosmetic: a browser opens WebM and cannot open Matroska, so conflating the two makes
+        // every `.webm` in a library look like it needs a remux on the one endpoint where a remux is
+        // expensive. Matroska stays on the list, because its demuxer does read WebM.
+        let webm = sniff(&ebml_header("webm"));
+        assert_eq!(webm[0].container, Container::WebM);
+        assert_eq!(webm[0].confidence, Confidence::Certain);
+        assert!(webm.iter().any(|c| c.container == Container::Matroska));
+
+        assert_eq!(best(&ebml_header("matroska")), Container::Matroska);
+        // A header too short to carry a DocType is Matroska, which is what the demuxer will try.
+        assert_eq!(best(&[0x1A, 0x45, 0xDF, 0xA3, 0x00]), Container::Matroska);
     }
 
     #[test]

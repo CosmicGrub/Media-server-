@@ -1,0 +1,222 @@
+name: Desktop release
+
+# Builds the desktop player for Windows, Linux and macOS and uploads each as a downloadable
+# artifact. Trigger with `workflow_dispatch`, or by pushing a `v*` tag.
+#
+# Built natively on each runner rather than cross-compiled from one. Cross-compiling to Windows
+# works — `crates/lumen-play/package-windows.sh` does it — but it silently skips the Windows-only
+# code paths, and the named-pipe IPC transport is exactly the kind of thing that compiles under
+# `#[cfg(windows)]` on a Linux host and fails to link on a real one.
+
+on:
+  push:
+    tags: ['v*']
+  # A release pipeline that is only exercised at tag time is one that breaks at tag time, when it is
+  # least convenient. Changing this file revalidates it against an open pull request, so a mistake
+  # surfaces on the commit that caused it rather than during a release.
+  #
+  # NOT YET EXERCISED END TO END. `workflow_dispatch` requires this file to be on the default
+  # branch, and this session's git proxy rejects tag pushes, so neither route was available when it
+  # was written. Once it is on `main`, verify it before relying on it:
+  #     gh workflow run release.yml --ref main
+  # The per-platform `cargo build --release` it performs is covered by rust.yml on all three
+  # operating systems; what is unverified is the staging, mpv bundling and packaging around it.
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'crates/lumen-play/**'
+  workflow_dispatch:
+    inputs:
+      bundle_mpv:
+        description: 'Bundle mpv into the Windows zip (adds ~30 MB)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: lumen.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: lumen
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin: lumen
+          # Intel Macs are still in use and the runner can target them from the same host.
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin: lumen
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p lumen-play --target ${{ matrix.target }}
+
+      # A release binary that was never run is a release binary nobody has tested. `--version` is
+      # the cheapest possible proof that it links and starts on this platform.
+      - name: Verify the binary runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          ls -l "$BIN"
+          # Skip execution when the target is not the host — an aarch64 binary will not run on the
+          # x86_64 runner, and failing there would be a false negative.
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+            echo "cross-target build; skipping execution"
+          else
+            "$BIN" --version
+          fi
+
+      - name: Stage the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="dist/lumen-${{ matrix.name }}"
+          mkdir -p "$OUT"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$OUT/"
+          cp crates/lumen-play/README.md "$OUT/README.md"
+          cp LICENSE "$OUT/LICENSE" 2>/dev/null || true
+
+      # Only Windows gets a bundled player. mpv on Windows is one statically linked exe; on Linux
+      # and macOS it is a dynamically linked package with a long dependency chain, and shipping that
+      # correctly means shipping a distribution — which is what the package manager already is.
+      - name: Bundle mpv (Windows)
+        # Bundles on tag pushes and on pull-request validation; only an explicit dispatch can turn
+        # it off. The download and 7z extraction are the most fragile steps here, so skipping them
+        # during validation would leave the part most likely to break unexercised.
+        if: matrix.os == 'windows-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $out = "dist/lumen-${{ matrix.name }}"
+          $tmp = Join-Path $env:RUNNER_TEMP "mpv"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+          Write-Host 'Locating the latest mpv build...'
+          $listing = Invoke-WebRequest -UseBasicParsing -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
+          $vers = [regex]::Matches($listing.Content, 'mpv-(\d+\.\d+\.\d+)-x86_64\.7z') |
+                  ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
+          if (-not $vers) { throw 'no mpv version found' }
+          $v = $vers[-1]
+          Write-Host "mpv $v"
+
+          $archive = Join-Path $tmp 'mpv.7z'
+          Invoke-WebRequest -UseBasicParsing -OutFile $archive `
+            -Uri "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
+          # A captive portal or an error page saved to disk would "extract" to nothing and ship a
+          # bundle with no player in it.
+          if ((Get-Item $archive).Length -lt 1MB) { throw 'download too small to be an mpv build' }
+
+          & 7z x $archive ("-o" + $tmp) -y | Out-Null
+          $mpv = Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse | Select-Object -First 1
+          if (-not $mpv) { throw 'no mpv.exe in the archive' }
+          Copy-Item $mpv.FullName $out -Force
+          $d3d = Get-ChildItem -Path $tmp -Filter 'd3dcompiler_*.dll' -Recurse | Select-Object -First 1
+          if ($d3d) { Copy-Item $d3d.FullName $out -Force }
+
+          # Proof the pair works together, which is the only thing that makes this a bundle rather
+          # than two files in a folder.
+          & "$out/lumen.exe" doctor
+          Write-Host "mpv bundled: $((Get-Item "$out/mpv.exe").Length / 1MB) MB"
+
+      - name: Add the quick-start note
+        shell: bash
+        run: |
+          OUT="dist/lumen-${{ matrix.name }}"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cat > "$OUT/START-HERE.txt" <<'TXT'
+          lumen - media library player and test harness
+
+          1. Open PowerShell in this folder (Shift+right-click > "Open PowerShell window here").
+
+          2. Check the machine:
+                 .\lumen.exe doctor
+
+             If mpv is missing, run:
+                 .\lumen.exe setup
+
+          3. Look at your library without playing anything:
+                 .\lumen.exe scan "D:\Media"
+
+          4. Test it - opens every file briefly and reports which ones fail:
+                 .\lumen.exe test "D:\Media" --limit 5
+                 .\lumen.exe test "D:\Media" --json report.json
+
+          5. Watch:
+                 .\lumen.exe play "D:\Media"
+
+          Playback controls are mpv's own: space, arrows, f, q.
+          Exit codes: 0 all played, 1 something failed, 2 setup problem.
+          TXT
+          else
+            cat > "$OUT/START-HERE.txt" <<'TXT'
+          lumen - media library player and test harness
+
+          mpv is the one prerequisite:
+              macOS   brew install mpv
+              Linux   apt install mpv     (or dnf / pacman / zypper)
+
+          Then:
+              ./lumen doctor
+              ./lumen scan  ~/Media
+              ./lumen test  ~/Media --limit 5 --json report.json
+              ./lumen play  ~/Media
+
+          If mpv is somewhere unusual, point at it instead of moving it:
+              export LUMEN_MPV=/path/to/mpv
+
+          Playback controls are mpv's own: space, arrows, f, q.
+          Exit codes: 0 all played, 1 something failed, 2 setup problem.
+          TXT
+            chmod +x "$OUT/lumen"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a -tzip "lumen-${{ matrix.name }}.zip" "lumen-${{ matrix.name }}" > /dev/null
+          else
+            tar czf "lumen-${{ matrix.name }}.tar.gz" "lumen-${{ matrix.name }}"
+          fi
+          ls -lh lumen-${{ matrix.name }}.*
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-${{ matrix.name }}
+          path: |
+            dist/lumen-${{ matrix.name }}.zip
+            dist/lumen-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30

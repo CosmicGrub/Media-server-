@@ -1,10 +1,16 @@
 name: Android APK
 
-# Builds a sideloadable APK and attaches it to the run as a downloadable artifact.
+# Builds a sideloadable APK, attaches it to the run as a downloadable artifact, and publishes it to
+# a rolling `android-latest` release so the phone itself can fetch it.
 #
 # This exists because the Android SDK cannot be fetched in every environment — dl.google.com is
 # frequently blocked on locked-down networks — while a GitHub runner has it preinstalled. Push the
-# branch and collect the APK from the run's Artifacts section; no Android Studio required.
+# branch and collect the APK from the release or the run's Artifacts section; no Android Studio
+# required.
+#
+# The release matters for a reason the artifact cannot serve: an Actions artifact is a **zip**, and
+# Android cannot install a zip. A release asset is the `.apk` itself, so opening the link in the
+# phone's browser goes straight to the installer with no PC, no cable, and no unzipping.
 
 on:
   push:
@@ -16,6 +22,13 @@ on:
 
 permissions:
   contents: read
+
+# Cancel a still-running run for the same branch the moment a newer push arrives. The `emulator` job
+# alone can run 45 minutes across a 2-entry API-level matrix; three pushes minutes apart should not
+# mean three of those in flight when only the last one's result was ever going to matter.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -55,6 +68,11 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
 
+      # Fast, no emulator: the posture decision and the formatting helpers are free functions over
+      # primitives precisely so they can be checked here, in seconds, on every push.
+      - name: Unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
 
@@ -81,3 +99,312 @@ jobs:
           path: android/app/build/outputs/apk/*/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload unit-test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-unit-test-report
+          path: android/app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Publish the APK where a phone can reach it in one tap.
+  #
+  # An Actions artifact is a zip, and Android cannot install a zip — getting the app onto a device
+  # from one means a PC, a download, an unzip, and a cable. A release asset is the `.apk` itself, so
+  # the link opens the installer directly from the phone's browser.
+  #
+  # The tag is deliberately rolling rather than versioned: this is the current build of a branch
+  # under active development, not a version anyone should pin to. It is marked as a prerelease for
+  # the same reason.
+  publish:
+    name: publish to android-latest-fold5
+    needs: build
+    # This branch (`device/galaxy-z-fold-5`) is its own fork now, not a landing page tracking the
+    # shared development branch, so it publishes on every push to itself rather than being gated on
+    # `main` or the development branch's name.
+    if: github.ref == 'refs/heads/device/galaxy-z-fold-5'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      # A fork-specific rolling tag. Keeping this distinct from `android-latest` (the shared
+      # development build) and from the other device forks' own tags is what lets all of them
+      # publish from the same repository without three branches fighting to move the same tag out
+      # from under each other on every push.
+      RELEASE_TAG: android-latest-fold5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: apks
+
+      # Named for a human reading a download list on a phone, where the build directory structure
+      # that produced them is invisible and `app-release.apk` says nothing about what it is.
+      #
+      # The names carry no commit hash on purpose. A rolling release wants one permanent URL, so the
+      # asset name has to stay put and `--clobber` has to be able to replace it; a hash in the name
+      # would mint a new link every push and leave the old builds piling up beside it. Which build
+      # this is lives in the title and the notes instead.
+      - name: Name the assets for a human
+        id: assets
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          cp apks/release/app-release.apk lumen.apk
+          cp apks/debug/app-debug.apk lumen-debug.apk
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          ls -lh lumen.apk lumen-debug.apk
+
+      - name: Publish or update the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.assets.outputs.short }}
+        run: |
+          set -euo pipefail
+          NOTES="Rolling build of the Galaxy Z Fold 5 fork (\`${GITHUB_REF_NAME}\`) at \`${SHORT}\`.
+
+          Installs side-by-side with the shared development build and the other device forks —
+          this one's applicationId is \`dev.lumen.player.fold5\`, not \`dev.lumen.player\`.
+
+          **Sideload straight from the phone:** open this page in the phone's browser, tap
+          \`lumen.apk\`, and allow installation from that browser when Android asks.
+
+          **Or over USB from a PC**, with developer options and USB debugging on:
+          \`\`\`
+          adb install -r lumen.apk
+          \`\`\`
+
+          Signed with the standard Android debug key, which is what makes it installable without a
+          Play listing. It is not a production signing key, and this is a development build rather
+          than anything that should be distributed."
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # `gh release edit --target` cannot move the tag of a published release — the API ignores
+            # target_commitish once a release is out of draft — so the tag is moved directly. Without
+            # this the release would keep pointing at whichever commit first created it while serving
+            # assets from a much later one.
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
+              -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release edit "$RELEASE_TAG" \
+              --title "Lumen Android (Fold 5) — build ${SHORT}" --notes "$NOTES" --prerelease
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Lumen Android (Fold 5) — build ${SHORT}" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
+          # `--clobber` rather than deleting the release: deleting it would break every link already
+          # shared, which is the one thing a rolling "latest" URL exists to avoid.
+          gh release upload "$RELEASE_TAG" lumen.apk lumen-debug.apk --clobber
+
+      - name: Say where it landed
+        run: |
+          echo "### APK published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Open that on the phone and tap \`lumen.apk\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # A headless emulator. This is the only check that proves the APK installs and starts — a build
+  # that compiles tells you nothing about whether the Activity survives to RESUMED, and a crash on
+  # launch makes every other result irrelevant.
+  #
+  # Kept as a separate job because it is slow (booting an image takes minutes) and needs KVM, which
+  # only the Linux runners have.
+  emulator:
+    name: on-device tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: android
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 34 is what a Fold 5 ships with; 35 is what the app targets. Both, because the permission
+        # model and the window APIs differ between them and a pass on one is not a pass on the other.
+        api-level: [34, 35]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Without this the emulator falls back to software rendering and the boot times out.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The AVD's userdata partition is created on the root filesystem, and a hosted runner does not
+      # have much of it spare. This job failed for two runs with
+      #
+      #   FATAL | Not enough space to create userdata partition.
+      #           Available: 7344.32 MB, need 7372.80 MB.
+      #
+      # — twenty-eight megabytes short. The emulator died on the spot and the runner then polled a
+      # device that would never exist until the boot timeout expired, which is why it presented as a
+      # boot timeout and was misdiagnosed as one. The image had simply grown past the threshold
+      # between one runner release and the next; nothing in this repository changed.
+      #
+      # The NDK is the biggest single thing here and this build has no native code, so it goes. The
+      # rest are toolchains a Kotlin build never touches. Free space is printed either side so the
+      # next disk failure is diagnosable from the log rather than from a fatal line 1300 lines up.
+      - name: Free disk space for the AVD
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android/sdk/ndk \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /usr/local/lib/node_modules || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Generate debug keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore app/debug.keystore \
+            -storepass android -keypass android \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Run on-device tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: google_apis
+          # The emulator has no arm64 image; x86_64 is the only option on a CI runner. The app ships
+          # arm64-only, so abiFilters is widened just for this job rather than in the shipped APK.
+          arch: x86_64
+          profile: pixel_6
+          # No window, no audio, no boot animation — this is the headless part. `-no-snapshot-save`
+          # keeps the emulator from spending its shutdown writing a snapshot nothing will read: each
+          # job gets a fresh runner, so the snapshot is discarded with the machine.
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -no-snapshot-save -camera-back none
+          # The default userdata partition is 7372.80 MB, which is what did not fit. Nothing here
+          # needs seven gigabytes of writable guest storage: the APK is three megabytes and the tests
+          # write nothing. Asking for a size that comfortably fits is a better fix than freeing disk
+          # alone, because it stops the job depending on how large the runner image happens to be
+          # this week.
+          disk-size: 4096M
+          # Back to the action's 600 s default. The raise to 1200 s was made on a wrong diagnosis —
+          # the emulator was not booting slowly, it was dying instantly and never appearing at all,
+          # so the longer window bought nothing and made each failure take twice as long to report.
+          disable-animations: true
+          # `cd android` is load-bearing: the emulator-runner action runs `script` from the
+          # repository root and does NOT inherit the job's `defaults.run.working-directory`, so a
+          # bare `./gradlew` fails with "not found" after the emulator has already booted.
+          script: cd android && ./gradlew --no-daemon connectedDebugAndroidTest -PemulatorAbi=x86_64
+
+      - name: Upload on-device test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-device-test-report-api${{ matrix.api-level }}
+          path: android/app/build/reports/androidTests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The Fold 5 analogue of the Tab S9 FE walkthrough above -- same script, different profile, plus
+  # the one thing a slab-shaped device cannot exercise at all: folding. `pixel_fold` is Google's own
+  # foldable and the closest built-in AVD equivalent to a Z Fold 5 (no canned "Galaxy Z Fold 5"
+  # profile exists), close enough on inner-screen aspect ratio to actually exercise the posture-aware
+  # layout `fold/FoldState.kt` drives, not just resize a phone layout to fit.
+  device-walkthrough:
+    name: device walkthrough (Fold 5)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Free disk space for the AVD
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android/sdk/ndk \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /usr/local/lib/node_modules || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Download the built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: android/apks
+
+      # mpv on the *runner*, not the emulator -- this is what synthesizes the real test clip pushed
+      # to the device below, the same lavfi+encode technique the desktop CLI's own tests and
+      # release.yml's playback verification already use. No fixture checked into the repo.
+      - name: Install mpv (for synthesizing the test clip)
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mpv
+
+      - name: Synthesize a real test clip
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mpv "av://lavfi:testsrc2=size=320x180:rate=15:duration=4" \
+            --audio-file="av://lavfi:sine=frequency=440:duration=4" \
+            --o=lumen-probe.mp4 --ovc=libx264 --ovcopts=preset=ultrafast --oac=aac --msg-level=all=error
+          ls -lh lumen-probe.mp4
+
+      - name: Walk through the app on a Fold 5-profiled emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_fold
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -no-snapshot-save -camera-back none
+          disk-size: 6144M
+          disable-animations: true
+          script: cd android && ./ci/device-walkthrough.sh dev.lumen.player.fold5.debug --foldable
+
+      - name: Upload walkthrough evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-fold5-walkthrough
+          path: android/walkthrough/
+          if-no-files-found: warn
+          retention-days: 14
