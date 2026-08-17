@@ -44,7 +44,9 @@ resolves to:
 - **`Stacked`** in portrait, or if a split-screen multitasking window narrows it enough — video
   above the library, sized by the same adjustable height share rather than a fixed box.
 
-Never `Tabletop`, since that arrangement exists only for a physical hinge this device does not have.
+Never `Tabletop` or `Book`, since both arrangements exist only for a physical hinge this device does
+not have — `Tabletop` for a horizontal one, `Book` for a vertical one (added this pass: `FoldState.kt`
+had detected `Posture.Book` since it was first written, but no layout ever consumed it until now).
 
 Everything else in the app — view modes, gestures, Picture-in-Picture, resume position, track
 selection, the remote-control client for pairing with a `lumen serve` instance (see
