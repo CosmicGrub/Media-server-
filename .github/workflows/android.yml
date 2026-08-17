@@ -20,12 +20,17 @@ on:
   # So a build can be triggered without pushing anything.
   workflow_dispatch:
 
+# Every `runs-on` below is a repo variable with a hosted-runner fallback -- see
+# `.github/SELF_HOSTED_RUNNERS.md`. Unset (the default) is byte-identical to a plain `ubuntu-latest`
+# label. `emulator` uses its own variable, not `LUMEN_RUNNER_LINUX`, because it needs KVM (see that
+# job's own comment below) -- a machine that's fine for `build`/`publish` is not automatically fine
+# for the emulator, so the two are not meant to share one on/off switch.
 permissions:
   contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     defaults:
       run:
         working-directory: android
@@ -117,7 +122,7 @@ jobs:
     # Only from the development branch and the default branch. A release that moved on every feature
     # branch would make the "latest" link mean nothing.
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/claude/multiplatform-media-player-server-b7dwe7'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     permissions:
       contents: write
 
@@ -200,10 +205,14 @@ jobs:
   # launch makes every other result irrelevant.
   #
   # Kept as a separate job because it is slow (booting an image takes minutes) and needs KVM, which
-  # only the Linux runners have.
+  # only the Linux runners have. That KVM requirement is also why this job reads its own
+  # `LUMEN_RUNNER_ANDROID_EMULATOR` variable instead of `LUMEN_RUNNER_LINUX`: a self-hosted box that
+  # is perfectly fine for `build`/`publish` is not automatically fine for this one -- it needs
+  # hardware virtualization actually exposed to it (bare metal, or a VM with nested virtualization
+  # turned on), which a plain WSL2 runner on Windows will not have by default.
   emulator:
     name: on-device tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LUMEN_RUNNER_ANDROID_EMULATOR || 'ubuntu-latest' }}
     timeout-minutes: 45
     defaults:
       run:

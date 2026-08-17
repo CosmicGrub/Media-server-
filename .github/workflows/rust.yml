@@ -23,6 +23,16 @@ on:
   # commit and the same answer -- see `release.yml`'s `on:` block for the fuller version of this
   # reasoning, which applies here identically.
 
+# Every `runs-on` below is a repo variable with a hosted-runner fallback (`vars.X || 'x-latest'`), not
+# a hardcoded label. Hosted-runner *allocation* itself can be blocked account-wide -- spend limit
+# reached, Actions disabled, account under review -- and that shows up as every job dying in ~1-3s
+# with runner_id 0 before any of this file's steps ever run, which no workflow change can route
+# around. A self-hosted runner sidesteps that because it does not go through hosted allocation at
+# all -- it is either online and picks up the job, or it is not. Leaving these vars unset is
+# byte-identical to before; set one (Settings -> Secrets and variables -> Actions -> Variables) only
+# once a matching machine is actually registered as a self-hosted runner. See
+# `.github/SELF_HOSTED_RUNNERS.md` for how to register one and which platforms are realistic to.
+
 permissions:
   contents: read
 
@@ -42,13 +52,22 @@ env:
 jobs:
   test:
     name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # `matrix.os` stays the logical platform id (the `if: matrix.os == '...'` steps below key off
+    # it) -- `matrix.runner` is the actual label the job runs on, and is the only thing that changes
+    # when a platform moves to a self-hosted machine.
+    runs-on: ${{ matrix.runner }}
     strategy:
       # Do not cancel the other platforms when one fails. Knowing whether a break is
       # Windows-specific or universal is most of the diagnosis, and that is lost if the run aborts.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            runner: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
+          - os: windows-latest
+            runner: ${{ vars.LUMEN_RUNNER_WINDOWS || 'windows-latest' }}
+          - os: macos-latest
+            runner: ${{ vars.LUMEN_RUNNER_MACOS || 'macos-latest' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -178,7 +197,7 @@ jobs:
 
   lint:
     name: fmt + clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -194,7 +213,7 @@ jobs:
 
   licence-gate:
     name: licence gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
       # The LGPL-only discipline from ADR-0002 is a shipping constraint, not a preference: a GPL

@@ -61,26 +61,34 @@ env:
 jobs:
   build:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
+    # `matrix.os` stays the logical platform id (steps below key off it); `matrix.runner` is the
+    # actual label. Both macOS legs share `LUMEN_RUNNER_MACOS` since a self-hosted Mac can build
+    # both targets natively/cross just like `macos-latest` does. See rust.yml's `on:` block comment
+    # and `.github/SELF_HOSTED_RUNNERS.md` for why this exists and how to point it at a real machine.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: windows-x86_64
             os: windows-latest
+            runner: ${{ vars.LUMEN_RUNNER_WINDOWS || 'windows-latest' }}
             target: x86_64-pc-windows-msvc
             bin: lumen.exe
           - name: linux-x86_64
             os: ubuntu-latest
+            runner: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
             target: x86_64-unknown-linux-gnu
             bin: lumen
           - name: macos-aarch64
             os: macos-latest
+            runner: ${{ vars.LUMEN_RUNNER_MACOS || 'macos-latest' }}
             target: aarch64-apple-darwin
             bin: lumen
           # Intel Macs are still in use and the runner can target them from the same host.
           - name: macos-x86_64
             os: macos-latest
+            runner: ${{ vars.LUMEN_RUNNER_MACOS || 'macos-latest' }}
             target: x86_64-apple-darwin
             bin: lumen
 
@@ -431,7 +439,7 @@ jobs:
     name: publish to desktop-latest
     needs: build
     if: github.ref == 'refs/heads/device/windows-pc'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     permissions:
       contents: write
 
