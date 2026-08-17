@@ -330,6 +330,67 @@ pub fn duplicate_groups(scan: &Scan) -> Vec<Vec<usize>> {
     groups
 }
 
+/// Confirm a candidate duplicate group is genuinely byte-identical, not merely sketch-equal.
+///
+/// `duplicate_groups` is fast on purpose: it trusts `lumen_identity`'s sampled sketch (head, middle,
+/// tail — 3 MiB regardless of file size) rather than reading every file in full. That sketch's own
+/// documentation is explicit that a same-length, different-content collision at those three sampled
+/// regions is "implausible in practice," not impossible — and this report tells a person "same bytes
+/// under different names," a strong enough claim that "implausible" is not the bar for it. This is the
+/// full read that actually earns that claim, and it only ever runs on files a sketch already flagged as
+/// candidates — a handful of files, not the whole library — so it does not undo the sampling's own cost
+/// savings.
+///
+/// Returns `Ok(true)` only if every file in `paths` is byte-for-byte identical to the first. A read
+/// failure on any file — permissions, the file having moved again since the scan — is reported as
+/// `Err` rather than silently treated as "not a duplicate", since that is not evidence either way.
+pub fn verify_duplicate_group(paths: &[&Path]) -> std::io::Result<bool> {
+    let Some((first, rest)) = paths.split_first() else { return Ok(true) };
+    for other in rest {
+        if !same_bytes(first, other)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let mut fa = std::fs::File::open(a)?;
+    let mut fb = std::fs::File::open(b)?;
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    const CHUNK: usize = 256 * 1024;
+    let mut ba = vec![0u8; CHUNK];
+    let mut bb = vec![0u8; CHUNK];
+    loop {
+        let na = read_full(&mut fa, &mut ba)?;
+        let nb = read_full(&mut fb, &mut bb)?;
+        if na != nb || ba[..na] != bb[..nb] {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Fill `buf` as far as the reader has bytes left, looping on short reads the way a pipe or a network
+/// share can produce them. Mirrors `lumen_identity`'s own `read_up_to` so the two crates' streaming
+/// reads behave identically rather than by two slightly different conventions.
+fn read_full<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 /// Walk `roots` and classify everything found.
 ///
 /// A file given directly on the command line is classified whatever it looks like — an explicit
@@ -828,6 +889,48 @@ mod tests {
         );
         assert_ne!(s.files[0].identity, s.files[1].identity);
         assert!(duplicate_groups(&s).is_empty());
+    }
+
+    #[test]
+    fn verify_duplicate_group_confirms_genuinely_identical_files() {
+        let d = TempDir::new("verify-same");
+        let bytes = mkv_bytes();
+        let a = d.file("A.mkv", &bytes);
+        let b = d.file("B.mkv", &bytes);
+        let c = d.file("C.mkv", &bytes);
+        assert!(verify_duplicate_group(&[&a, &b, &c]).unwrap());
+    }
+
+    #[test]
+    fn verify_duplicate_group_refuses_a_group_that_only_agreed_on_the_sketch() {
+        // Simulates the exact gap this function exists to close: two files a sketch could plausibly
+        // treat as candidates (same length) but whose bytes actually differ somewhere the 3 MiB
+        // head/middle/tail sample would not have caught -- deep enough into the middle to miss the
+        // sample's own midpoint by a wide margin.
+        let d = TempDir::new("verify-diff");
+        let mut a = vec![0xAAu8; 8192];
+        let mut b = a.clone();
+        a[4100] = 0x01;
+        b[4100] = 0x02;
+        let pa = d.file("A.bin", &a);
+        let pb = d.file("B.bin", &b);
+        assert!(!verify_duplicate_group(&[&pa, &pb]).unwrap());
+    }
+
+    #[test]
+    fn verify_duplicate_group_is_trivially_true_for_zero_or_one_paths() {
+        let d = TempDir::new("verify-trivial");
+        let a = d.file("A.mkv", &mkv_bytes());
+        assert!(verify_duplicate_group(&[]).unwrap());
+        assert!(verify_duplicate_group(&[&a]).unwrap());
+    }
+
+    #[test]
+    fn verify_duplicate_group_reports_a_read_failure_rather_than_guessing() {
+        let d = TempDir::new("verify-missing");
+        let a = d.file("A.mkv", &mkv_bytes());
+        let missing = d.0.join("does-not-exist.mkv");
+        assert!(verify_duplicate_group(&[&a, &missing]).is_err());
     }
 
     #[test]

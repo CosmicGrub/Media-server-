@@ -26,6 +26,15 @@ pub struct Candidate {
 }
 
 /// Signatures anchored at offset 0.
+///
+/// Deliberately excluded: `#EXTM3U`. An M3U/HLS playlist is a text manifest that *names* other media
+/// files — it never demuxes as anything, let alone as the Matroska this table used to (wrongly) claim.
+/// There is no `Container` variant that fits a manifest, and inventing one just to give this signature
+/// somewhere to point would mean threading "does not apply" through every table that assumes a
+/// `Container` is directly demuxable (carriage rules, remux preference, the fidelity ladder's codec
+/// search). Recognizing `#EXTM3U` as *not a container* is a separate, smaller feature than this
+/// crate's job today; until it exists, a playlist correctly gets no confident container candidate
+/// rather than an actively wrong one.
 const AT_ZERO: &[(&[u8], Container, &str)] = &[
     (&[0x1A, 0x45, 0xDF, 0xA3], Container::Matroska, "EBML header"),
     (b"RIFF", Container::Avi, "RIFF (AVI or WAV)"),
@@ -36,7 +45,6 @@ const AT_ZERO: &[(&[u8], Container, &str)] = &[
     (&[0x00, 0x00, 0x01, 0xB3], Container::RawElementaryStream, "MPEG-2 sequence header"),
     (&[0x00, 0x00, 0x00, 0x01], Container::RawElementaryStream, "AnnexB start code"),
     (&[0x00, 0x00, 0x01], Container::RawElementaryStream, "AnnexB 3-byte start code"),
-    (b"#EXTM3U", Container::Matroska, "HLS/M3U playlist"),
     (b"\x1FVP8", Container::WebM, "IVF/VP8"),
     (b"DKIF", Container::WebM, "IVF"),
     (b"\xFF\xD8\xFF", Container::RawElementaryStream, "JPEG"),

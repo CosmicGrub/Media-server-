@@ -124,6 +124,43 @@ impl TokenStore {
         self.tokens.insert(token);
     }
 
+    /// Every currently-valid token, for `lumen unpair`'s listing — never printed in full (see
+    /// `main.rs`'s `unpair` command), just enough to let a person recognise which device is which.
+    pub fn tokens(&self) -> impl Iterator<Item = &str> {
+        self.tokens.iter().map(String::as_str)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    /// Remove every token matching `needle` exactly, or — if nothing matches exactly — every token
+    /// that starts with it, so a person can revoke by typing the short prefix `lumen unpair` prints
+    /// rather than the full 32-character secret. Returns the tokens actually removed, so the caller
+    /// can report what happened rather than a bare count: revoking nothing and revoking one token
+    /// that happened to be empty are different outcomes worth telling apart.
+    pub fn remove_matching(&mut self, needle: &str) -> Vec<String> {
+        if self.tokens.remove(needle) {
+            return vec![needle.to_string()];
+        }
+        let matches: Vec<String> =
+            self.tokens.iter().filter(|t| t.starts_with(needle)).cloned().collect();
+        for m in &matches {
+            self.tokens.remove(m);
+        }
+        matches
+    }
+
+    pub fn clear(&mut self) -> usize {
+        let n = self.tokens.len();
+        self.tokens.clear();
+        n
+    }
+
     /// Load from disk. A missing or unreadable file is an empty store, not an error — the first run
     /// has no file yet, and a corrupt one should cost re-pairing, not stop the server from starting.
     pub fn load(path: &Path) -> Self {
@@ -142,15 +179,36 @@ impl TokenStore {
         }
     }
 
-    /// Append-only on disk: a token is never removed by anything this type does, because there is no
-    /// revocation feature yet to call it from. Rewriting the whole file on every pairing would also
-    /// invite a torn write clobbering every previously paired device's token at once.
+    /// Append-only on disk: a token is never removed by this. Rewriting the whole file on every
+    /// pairing would also invite a torn write clobbering every previously paired device's token at
+    /// once — appending one line cannot lose an earlier one, whatever interrupts it.
     pub fn persist_new(&self, path: &Path, token: &str) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
         writeln!(f, "{token}")
+    }
+
+    /// Rewrite the whole file to match this store exactly — the operation revocation actually needs,
+    /// since removing a token means the file must stop naming it, not just avoid losing others.
+    /// Written to a sibling temp file and renamed into place rather than truncated in place, so a
+    /// process killed mid-write leaves either the old complete file or the new one, never a half-
+    /// written truncation that silently un-pairs every other device too.
+    pub fn persist_all(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            let mut sorted: Vec<&str> = self.tokens().collect();
+            sorted.sort_unstable();
+            for t in sorted {
+                writeln!(f, "{t}")?;
+            }
+        }
+        std::fs::rename(&tmp, path)
     }
 
     /// Where the token file lives: beside the rest of this user's Lumen state, not beside the binary
@@ -259,6 +317,91 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = TokenStore::load(&path);
         assert!(!store.is_valid("anything"));
+    }
+
+    #[test]
+    fn revoking_an_exact_token_removes_only_that_one() {
+        let mut store = TokenStore::new();
+        store.add("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        store.add("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+        let removed = store.remove_matching("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(removed, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()]);
+        assert!(!store.is_valid("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(store.is_valid("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn revoking_by_prefix_matches_the_unambiguous_token_it_names() {
+        let mut store = TokenStore::new();
+        store.add("abc123abc123abc123abc123abc123a".into());
+        store.add("zzz999zzz999zzz999zzz999zzz999z".into());
+        let removed = store.remove_matching("abc123");
+        assert_eq!(removed, vec!["abc123abc123abc123abc123abc123a".to_string()]);
+        assert!(!store.is_valid("abc123abc123abc123abc123abc123a"));
+        assert!(store.is_valid("zzz999zzz999zzz999zzz999zzz999z"));
+    }
+
+    #[test]
+    fn revoking_an_ambiguous_prefix_removes_every_match_and_says_so() {
+        // Deliberately not the common case (32 random hex characters make a colliding prefix
+        // astronomically unlikely) -- but if it ever happens, silently revoking only one of the two
+        // matches would leave the caller believing a token was revoked when it was not.
+        let mut store = TokenStore::new();
+        store.add("abc111aaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        store.add("abc222bbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+        let mut removed = store.remove_matching("abc");
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![
+                "abc111aaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "abc222bbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ]
+        );
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn revoking_a_token_that_does_not_exist_removes_nothing() {
+        let mut store = TokenStore::new();
+        store.add("realtoken0000000000000000000000".into());
+        assert!(store.remove_matching("nosuchtoken").is_empty());
+        assert!(store.is_valid("realtoken0000000000000000000000"));
+    }
+
+    #[test]
+    fn clear_revokes_every_token_and_reports_how_many() {
+        let mut store = TokenStore::new();
+        store.add("a0000000000000000000000000000000".into());
+        store.add("b0000000000000000000000000000000".into());
+        assert_eq!(store.clear(), 2);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn persist_all_round_trips_a_revocation_to_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumen-pairing-revoke-test-{}-{:x}",
+            std::process::id(),
+            std::ptr::from_ref(&dir_anchor()) as usize
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("tokens.txt");
+
+        let mut store = TokenStore::new();
+        store.add("keep0000000000000000000000000000".into());
+        store.add("revoke00000000000000000000000000".into());
+        store.persist_all(&path).unwrap();
+
+        store.remove_matching("revoke00000000000000000000000000");
+        store.persist_all(&path).unwrap();
+
+        // A restart after the revocation must not resurrect the revoked token from a stale file.
+        let reloaded = TokenStore::load(&path);
+        assert!(reloaded.is_valid("keep0000000000000000000000000000"));
+        assert!(!reloaded.is_valid("revoke00000000000000000000000000"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

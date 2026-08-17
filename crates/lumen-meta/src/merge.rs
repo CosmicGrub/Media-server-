@@ -170,6 +170,9 @@ pub fn merge_fragments(
 
     for fragment in fragments {
         for (key, value) in &fragment.fields {
+            if value.trim().is_empty() {
+                continue; // an empty overview is not an improvement on a populated one
+            }
             // Re-rank the provider for this specific field's group. A provider ranked first for
             // titles may be ranked last for artwork, and the fragment does not know which group each
             // of its own fields belongs to.
@@ -182,13 +185,21 @@ pub fn merge_fragments(
                 // A lock is absolute. Not "usually respected", not "unless the provider is better".
                 Some(existing) if existing.locked => continue,
                 Some(existing) if existing.source > effective => continue,
-                // Equal precedence: keep what is already there. Merging is then idempotent, and two
-                // providers at the same rank cannot flip a field back and forth between refreshes.
-                Some(existing) if existing.source == effective => continue,
+                // Equal precedence and an identical or "greater" value: keep what is already there.
+                // Two providers can land at the same effective rank (both unranked, or the same
+                // provider counted twice across a resolution retry), and when they disagree on the
+                // value, breaking the tie by *value* rather than by "whichever fragment came first"
+                // is what keeps the whole function order-independent — a running max is order-
+                // independent by construction, while "first seen wins" is not. Idempotent for the same
+                // reason `select_artwork`'s URL tie-break is: comparing a value against itself is a
+                // no-op, so re-merging the same fragments never churns the result.
+                Some(existing)
+                    if existing.source == effective
+                        && existing.value.as_str() >= value.as_str() =>
+                {
+                    continue;
+                }
                 _ => {}
-            }
-            if value.trim().is_empty() {
-                continue; // an empty overview is not an improvement on a populated one
             }
             out.fields.insert(
                 key.clone(),

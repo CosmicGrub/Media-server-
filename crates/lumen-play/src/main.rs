@@ -38,6 +38,7 @@ lumen — media library player and test harness
   lumen play  <paths...>              play everything found
   lumen test  <paths...>              open every file briefly and report which fail
   lumen serve <path>                  run a persistent player a phone can pair with and control
+  lumen unpair [<token>] [--all]      list, or revoke, devices previously paired with `serve`
 
 Options
   --seconds <n>       play only n seconds of each file (default 20 for `test`)
@@ -57,6 +58,11 @@ Options
 `serve` options
   --port <n>          TCP port to listen on (default 7890)
   --bind <addr>       address to bind (default 0.0.0.0 — every interface)
+
+`unpair` — with no arguments, lists every currently-paired device (by a short prefix, never the
+full token). With one, revokes whichever token starts with it — the whole token, or the prefix
+`unpair` just showed you. `--all` revokes every paired device at once. The server does not need to
+be running; this edits the same token file `serve` reads on its next start.
 
 Other
   --help              this text
@@ -78,6 +84,13 @@ fn main() -> ExitCode {
             }
         },
         Some("serve") => match serve(&args[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("unpair") => match unpair(&args[1..]) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -254,6 +267,51 @@ fn serve(args: &[String]) -> Result<ExitCode, String> {
         "lumen serve — do not forward this port through your router; it is meant for your own LAN"
     );
     remote::server::run(&root, &bind, port, &passthrough(args), |line| println!("{line}"))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// List or revoke devices previously paired with `serve`, without needing the server running.
+///
+/// The one gap the pairing design (`remote/pairing.rs`) left open on purpose, until now: a token
+/// was append-only, so getting rid of a compromised or no-longer-trusted device meant finding and
+/// hand-editing `paired-clients.txt`. This is that same file, edited by the tool that owns its
+/// format instead of by hand.
+fn unpair(args: &[String]) -> Result<ExitCode, String> {
+    let path = remote::pairing::TokenStore::default_path();
+    let mut store = remote::pairing::TokenStore::load(&path);
+
+    if args.iter().any(|a| a == "--all") {
+        let n = store.clear();
+        store
+            .persist_all(&path)
+            .map_err(|e| format!("could not update {}: {e}", path.display()))?;
+        println!("revoked {n} paired device{}", if n == 1 { "" } else { "s" });
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let Some(target) = args.iter().find(|a| !a.starts_with("--")) else {
+        if store.is_empty() {
+            println!("no devices are currently paired");
+        } else {
+            println!("{} paired device{}:", store.len(), if store.len() == 1 { "" } else { "s" });
+            // A prefix, never the full token: this is printed to a terminal, and a terminal's
+            // scrollback is exactly the kind of place a bearer token should not end up sitting.
+            let mut shown: Vec<&str> = store.tokens().collect();
+            shown.sort_unstable();
+            for t in shown {
+                println!("  {}…", &t[..8.min(t.len())]);
+            }
+            println!("\nrevoke one with: lumen unpair <prefix-shown-above>");
+        }
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let removed = store.remove_matching(target);
+    if removed.is_empty() {
+        return Err(format!("no paired device matches {target:?}"));
+    }
+    store.persist_all(&path).map_err(|e| format!("could not update {}: {e}", path.display()))?;
+    println!("revoked {} device{}", removed.len(), if removed.len() == 1 { "" } else { "s" });
     Ok(ExitCode::SUCCESS)
 }
 
