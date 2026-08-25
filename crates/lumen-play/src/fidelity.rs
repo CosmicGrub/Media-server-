@@ -72,7 +72,10 @@ pub fn assess(r: &FileResult, scanned: &ScannedFile) -> Option<Fidelity> {
 /// `reference_native` as published, with the network link removed: the bytes are on this machine, so
 /// a 100 Mbps remux has no link to exceed, and the ladder's own rule is that an unmeasured link must
 /// never trigger rejection.
-fn native_profile() -> ClientCapabilities {
+///
+/// `pub(crate)` so `calibration.rs` can ask the same declared capabilities what they claim about a
+/// codec's hardware-decode support, without a second, drifting copy of "what the native profile is".
+pub(crate) fn native_profile() -> ClientCapabilities {
     ClientCapabilities { network_bps: None, ..ClientCapabilities::reference_native() }
 }
 

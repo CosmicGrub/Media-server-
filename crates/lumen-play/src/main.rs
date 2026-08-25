@@ -13,6 +13,7 @@
 //! `test` is the mode worth running first on a large collection: it walks a thousand files in an
 //! evening rather than a fortnight, and the output is a list of exactly which ones failed and why.
 
+mod calibration;
 mod fidelity;
 mod ipc;
 mod json;
@@ -266,11 +267,43 @@ fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
     }
 
     println!("{}", report::render_session(&session));
+    record_calibration(&session);
     write_json(args, &found, Some(&session))?;
 
     // A failed file is the finding. Exiting zero on a run that could not open half the library would
     // make this useless in a script.
     Ok(if session.failed().count() > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// Append a calibration entry for every file this session actually played -- `docs/15` §C. A file
+/// that failed or was never reached, or one with no video track to compare, yields nothing to record
+/// (`calibration::observe` already says so); failure to write the log is reported once rather than
+/// aborting a run that otherwise succeeded, since the log is evidence for later, not something this
+/// session's own exit code should depend on.
+fn record_calibration(session: &session::SessionReport) {
+    let log_path = calibration::default_log_path();
+    let mut misses = 0usize;
+    let mut recorded = 0usize;
+    for r in &session.results {
+        let Some(entry) = calibration::observe(r) else { continue };
+        if entry.hardware_decode_as_predicted() == Some(false) {
+            misses += 1;
+        }
+        match calibration::append(&log_path, &entry) {
+            Ok(()) => recorded += 1,
+            Err(e) => {
+                eprintln!("calibration: could not write {}: {e}", log_path.display());
+                break;
+            }
+        }
+    }
+    if misses > 0 {
+        eprintln!(
+            "calibration: {misses}/{recorded} played file{} did not decode the way the fidelity \
+             model predicted -- see `lumen doctor` for details",
+            if recorded == 1 { "" } else { "s" }
+        );
+    }
 }
 
 /// A persistent, remotely controllable player. Runs until the process is killed.
@@ -469,6 +502,13 @@ fn doctor() -> ExitCode {
         // libcuda at playback. `lumen test` reports what each file actually decoded with, which is
         // the number to trust.
         println!("  (compiled-in support; `lumen test` reports what actually decoded)");
+    }
+
+    println!("\nfidelity calibration");
+    let log_path = calibration::default_log_path();
+    match calibration::read_all(&log_path) {
+        Ok(entries) => println!("  {}", calibration::summarize(&entries)),
+        Err(e) => println!("  could not read {}: {e}", log_path.display()),
     }
 
     println!("\nnext");

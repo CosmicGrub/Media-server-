@@ -174,6 +174,34 @@ property, not just a functional one).
 
 ## C. Fidelity Telemetry & Calibration Engine
 
+**Shipped** — [`calibration.rs`](../crates/lumen-play/src/calibration.rs) in `lumen-play`, wired into
+both `run()` (records after every `play`/`test` session) and `doctor()` (prints the running summary).
+Two design calls changed between this pitch and the real build:
+
+- **Scope narrowed to hardware video decode; audio passthrough left out entirely, not stubbed.**
+  Investigating the IPC path this pitch assumed found that `session.rs` never passes `--audio-spdif`
+  to mpv in the first place — mpv decodes every bitstream audio format (TrueHD, DTS-HD MA) to PCM
+  regardless of what the AVR could do, so comparing `audio-out-params` against a passthrough
+  prediction would make every single file "miss" for a reason that has nothing to do with the
+  fidelity model's honesty. That would be evidence about a missing feature, not about the model —
+  worth building once passthrough is actually requested, not before. The hardware-decode half ships
+  because it checks something the codebase already does for real: `session.rs` already queries
+  `hwdec-current` for every session, `fidelity::assess` already predicts a decode path for the same
+  file on the same struct — the gap really was just the missing comparison, exactly as pitched.
+- **Storage is hand-rolled JSON Lines via this crate's existing `json` module, not a new
+  serialization dependency.** Same reasoning as Engine A and B's dependency-avoidance calls — `lumen`
+  already parses and emits this shape of JSON for `--json` reports, so a fourth crate for one small
+  append-only log would be pure overhead.
+
+A real end-to-end run against actual mpv (a genuine H.264 file, headless, no hardware decoder
+available) caught a real bug before this shipped: the first draft compared mpv's human-readable
+`video-codec` property (`"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"`) against the codec-name table
+`fidelity::assess` itself matches against short FFmpeg names (`"h264"`) — silently never matching
+anything, exactly the kind of drift the module's own doc comment warns against. Fixed to read the
+selected video track's short codec name from `r.tracks` instead, the same field
+`fidelity::assess`'s own `mpv_selection` already reads — confirmed against that same real mpv run
+afterward, which correctly flagged the (real, expected) software-decode miss.
+
 ### The gap, precisely
 
 The fidelity module's own PR description says it plainly: fidelity tiers are **"modeled, not
