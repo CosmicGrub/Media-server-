@@ -22,6 +22,7 @@ mod remote;
 mod report;
 mod scan;
 mod session;
+mod verify;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -41,6 +42,7 @@ lumen — media library player and test harness
   lumen serve <path>                  run a persistent player a phone can pair with and control
   lumen unpair [<token>] [--all]      list, or revoke, devices previously paired with `serve`
   lumen reindex <path> [--index <db>] persist an incremental library index; re-probes only what changed
+  lumen verify  <path> [--index <db>] re-check indexed files' bytes against their last confirmed digest
 
 Options
   --seconds <n>       play only n seconds of each file (default 20 for `test`)
@@ -71,6 +73,23 @@ file (default `<path>/.lumen-index`, override with `--index`); every run after t
 files whose size or modified time actually changed, recognises a renamed-but-identical file as moved
 rather than lost, and keeps a tombstoned record for a file that temporarily disappears rather than
 forgetting it outright. Safe to interrupt and re-run at any time — nothing is left half-written.
+
+`verify` options
+  --reverify-days <n> re-check an already-confirmed file at most this often (default 30; a large
+                       file comes due sooner than this on its own — see below)
+  --budget <bytes>     stop after reading roughly this many bytes this run (default 8 GiB)
+
+`verify` — re-reads indexed files' actual bytes and compares them to the digest recorded the last
+time they were checked, catching corruption a size/mtime check can't: bit rot, a failed write, a bad
+sector. Never overprints a mismatch as newly fine — a confirmed-good file that later disagrees stays
+flagged, and is re-checked before anything else, until a later pass finds it matching again or
+`reindex` sees the file legitimately change. Prioritised, not a flat oldest-first queue: an
+unresolved mismatch first, then a file that has never been verified at all, then one `reindex` itself
+already flagged as worth a look, then everything else due — oldest-confirmed-first, with a bigger
+file coming due sooner than a small one on the same interval. Bounded by `--budget` per run, so a
+library too large to verify in one sitting is covered by repeated invocations (a scheduled task, same
+as `serve`'s own) rather than one run that never ends. Exits 1 if a mismatch or a read failure was
+found this run, 0 otherwise, so a script can act on the difference.
 
 Other
   --help              this text
@@ -106,6 +125,13 @@ fn main() -> ExitCode {
             }
         },
         Some("reindex") => match reindex_cmd(&args[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("verify") => match verify_cmd(&args[1..]) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -352,6 +378,31 @@ fn reindex_cmd(args: &[String]) -> Result<ExitCode, String> {
         println!("(see the index file for which paths need a look: {})", db.display());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Re-check indexed files' actual bytes against their last confirmed digest. See `verify.rs` for
+/// the tier-prioritised selection and the real file read; this is argument parsing, the summary
+/// line, and the exit-code convention documented in `USAGE` (1 means "something needs a look").
+fn verify_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let root = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from).ok_or(
+        "usage: lumen verify <path> [--index <db>] [--reverify-days <n>] [--budget <bytes>]",
+    )?;
+
+    let db =
+        value(args, "--index").map_or_else(|| reindex::default_index_path(&root), PathBuf::from);
+
+    let reverify_days = value(args, "--reverify-days")
+        .map(|v| v.parse().map_err(|_| format!("--reverify-days must be a number, got {v:?}")))
+        .transpose()?
+        .unwrap_or(verify::DEFAULT_REVERIFY_DAYS);
+    let budget_bytes = value(args, "--budget")
+        .map(|v| v.parse().map_err(|_| format!("--budget must be a number of bytes, got {v:?}")))
+        .transpose()?
+        .unwrap_or(verify::DEFAULT_BUDGET_BYTES);
+
+    let (_, report) = verify::run(&db, reverify_days, budget_bytes)?;
+    println!("{}", verify::summarize(&report));
+    Ok(if report.found_a_problem() { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 fn write_json(

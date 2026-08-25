@@ -100,6 +100,30 @@ already extracted.
 
 ## B. Library Integrity & Self-Healing Engine
 
+**Shipped** — [`Index::verify`](../crates/lumen-index/src/store.rs) plus `lumen verify` in
+`lumen-play`. Three design calls changed between this pitch and the real build, all recorded honestly
+below rather than left for the code to contradict silently:
+
+- **Digest algorithm: `lumen_identity::FileDigest`/`digest_reader` (xxh3-128), not BLAKE3.** Same
+  reasoning as Engine A's SQLite→flat-file swap — `xxhash-rust` is already in the dependency graph
+  via `lumen-identity`, reusing it adds nothing new to the license gate or the build matrix. It isn't
+  cryptographic, same as `ContentSketch` isn't — this defends against bit rot, not an adversary.
+- **Rate limiting: a per-invocation byte budget, not a live playback signal.** `lumen serve` has no
+  "something is currently playing" state a background pass could consult yet — that integration does
+  not exist, so tying a limiter to it would have been claiming a thing that isn't real. `lumen verify`
+  runs as its own standalone, budget-bounded invocation instead (`--budget`, default 8 GiB), meant to
+  be scheduled the same way `Install-LumenServeTask.ps1` already keeps `serve` alive. Backing off
+  specifically because a movie is playing is the honest phase-2 gap this leaves open, same shape as
+  Engine A's missing live filesystem watcher.
+- **Selection is tier-and-risk-prioritised, not flat oldest-first**, per explicit direction mid-build:
+  an unresolved mismatch is always reselected first (regardless of the reverify interval, until a
+  later pass confirms it or `reindex` sees the file legitimately change); then anything never
+  verified at all; then anything `reindex` itself already flagged via `needs_review`; then everything
+  else due, oldest-confirmed-first — and within that last tier, a larger file's effective interval is
+  shortened (halved per size-doubling above 4 GiB, capped at a quarter) since it carries more bit-rot
+  exposure for the same elapsed time. `mismatch_pending` is a new persisted field specifically to
+  make "unresolved" survive across process restarts, not just within one run.
+
 ### The gap, precisely
 
 This session already shipped `verify_duplicate_group` in

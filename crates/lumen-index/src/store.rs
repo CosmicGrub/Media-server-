@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use lumen_identity::{ContentSketch, FileIdentity, FsFingerprint, ScanVerdict, classify};
+use lumen_identity::{
+    ContentSketch, FileDigest, FileIdentity, FsFingerprint, ScanVerdict, classify,
+};
 use lumen_meta::{
     FieldGroup, MetadataBundle, MetadataFragment, ProviderRanking, Source, merge_fragments,
 };
@@ -27,6 +29,14 @@ pub struct ProbeResult {
     pub needs_review: Option<String>,
 }
 
+/// A whole-file digest this record was last confirmed against, and when -- `docs/15` §B, the
+/// Integrity & Self-Healing Engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verified {
+    pub digest: FileDigest,
+    pub at_unix_secs: u64,
+}
+
 /// One file's persisted record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexRecord {
@@ -42,6 +52,17 @@ pub struct IndexRecord {
     /// re-probing would be the same kind of quiet, unverified claim `verify_duplicate_group` exists
     /// to refuse to make about duplicate files.
     pub tombstoned: bool,
+    /// The last whole-file digest [`Index::verify`] confirmed for this record, and when. `None`
+    /// means never verified -- a fresh record from `reindex` always starts here, deliberately: a
+    /// full-file read is real I/O `reindex` exists specifically to avoid paying on every pass, so
+    /// establishing a baseline is `verify`'s job alone, not something a probe does opportunistically.
+    pub last_verified: Option<Verified>,
+    /// The most recent [`Index::verify`] pass over this record found a digest that did not match
+    /// `last_verified` -- which is therefore still the last *confirmed-good* state, not the
+    /// mismatching one. Drives top-priority re-selection (`docs/15` §B) until a later pass either
+    /// confirms the same old digest again (a transient read is the honest read of that outcome) or
+    /// `reindex` sees the file actually change, which starts verification over from a clean baseline.
+    pub mismatch_pending: bool,
 }
 
 impl IndexRecord {
@@ -84,6 +105,36 @@ impl ReindexReport {
     /// `library_version` needs bumping and paired clients need telling.
     pub fn changed(&self) -> bool {
         self.new > 0 || self.modified > 0 || self.moved > 0 || self.tombstoned > 0
+    }
+}
+
+/// What one [`Index::verify`] pass found -- `docs/15` §B.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// Digest matched what was stored from a previous verification.
+    pub confirmed: usize,
+    /// No prior digest existed; this pass recorded the first one. Not a confirmation of anything --
+    /// there was nothing yet to compare against.
+    pub baseline_established: usize,
+    /// Path, plus the unix-seconds timestamp of the *previous* successful verification -- so a
+    /// caller can say how long ago the file was last known good, not just that it currently isn't.
+    /// The record's own stored verification is deliberately left at that previous timestamp too
+    /// (see `Index::verify`'s doc comment) rather than silently overwritten with the mismatching one.
+    pub mismatched: Vec<(PathBuf, u64)>,
+    /// Path and reason, for an entry that could not even be read this pass -- reported, never
+    /// guessed at as either a confirmation or a mismatch.
+    pub read_failed: Vec<(PathBuf, String)>,
+    /// Total bytes actually read this pass, across every entry processed.
+    pub bytes_read: u64,
+    /// Entries that were due for re-verification but did not fit in this pass's budget. Not a
+    /// failure -- they are simply carried over to the next invocation, oldest-verified-first.
+    pub skipped_by_budget: usize,
+}
+
+impl VerifyReport {
+    /// Whether this pass found something a person should look at.
+    pub fn found_a_problem(&self) -> bool {
+        !self.mismatched.is_empty() || !self.read_failed.is_empty()
     }
 }
 
@@ -209,23 +260,39 @@ impl Index {
                         missing_by_sketch.contains_key(&sketch)
                     });
 
+                    // What verification history (if any) survives into the fresh record. A move or a
+                    // same-content "unchanged" both mean the bytes provably have not changed -- see
+                    // the two verdict arms below for why each one is provably safe to carry forward --
+                    // so a previously-established digest (and any unresolved-mismatch flag) is still
+                    // valid, and re-verifying from scratch would be wasted I/O. `New`/`Modified` mean
+                    // the opposite: this content has never been confirmed, so verification -- and any
+                    // suspicion carried over from whatever used to be at this path -- starts clean.
+                    let mut carried: Option<(Option<Verified>, bool)> = None;
+
                     match verdict {
                         ScanVerdict::Unchanged => {
                             // Only reachable if the probe's own fresh sketch happens to match what
                             // was already on file despite the fingerprint differing (e.g. a copy that
                             // preserved mtime to the second but not the nanosecond) -- correct to
-                            // record as unchanged rather than a spurious Modified.
+                            // record as unchanged rather than a spurious Modified, and correct to
+                            // carry the verification forward for the same reason.
                             report.unchanged += 1;
+                            carried = known_here.map(|r| (r.last_verified, r.mismatch_pending));
                         }
                         ScanVerdict::Modified => report.modified += 1,
                         ScanVerdict::New => report.new += 1,
                         ScanVerdict::Moved { from_sketch } => {
                             report.moved += 1;
                             if let Some(old_path) = missing_by_sketch.remove(&from_sketch) {
+                                carried = self
+                                    .by_path
+                                    .get(&old_path)
+                                    .map(|r| (r.last_verified, r.mismatch_pending));
                                 claimed_by_move.insert(old_path);
                             }
                         }
                     }
+                    let (last_verified, mismatch_pending) = carried.unwrap_or((None, false));
                     fresh.insert(
                         path.clone(),
                         IndexRecord {
@@ -233,6 +300,8 @@ impl Index {
                             fingerprint: fp,
                             probe: result,
                             tombstoned: false,
+                            last_verified,
+                            mismatch_pending,
                         },
                     );
                 }
@@ -256,6 +325,144 @@ impl Index {
             self.version += 1;
         }
         Ok(report)
+    }
+
+    /// Re-verify live records against their last confirmed digest, tier-prioritised and
+    /// budget-bounded -- `docs/15` §B.
+    ///
+    /// Selection is a strict four-tier priority order, most urgent first, not a flat
+    /// oldest-verified-first queue:
+    ///
+    /// 1. **Unresolved mismatch.** A previous pass already found this record's bytes did not match
+    ///    what was last confirmed, and nothing since has cleared that (a later match, or `reindex`
+    ///    seeing the file legitimately change). The single most actionable thing this engine can
+    ///    report is a known problem nobody has looked at yet, so these are always selected first,
+    ///    every pass, regardless of the staleness interval below.
+    /// 2. **Never verified.** Unknown integrity status -- this file could already be silently
+    ///    corrupt and nothing would know. Always selected, same as tier 1.
+    /// 3. **Flagged at probe time.** `needs_review` was set when the file was last (re-)indexed
+    ///    (an extension mismatch, a truncated-looking size, ...) -- an unrelated kind of suspicion,
+    ///    but still a reason to check this file's bytes sooner than one nothing has ever flagged.
+    ///    Selected once due, same interval rule as tier 4.
+    /// 4. **Routine.** Due for its regular re-check. Ordered oldest-confirmed-first, and the
+    ///    interval itself is risk-adjusted by file size (see [`risk_adjusted_interval_secs`]) -- a
+    ///    50 GB remux comes due for re-verification sooner than a 200 MB episode on the same base
+    ///    interval, because it has more bytes exposed to the same bit-rot risk over the same time.
+    ///
+    /// `now_unix_secs` is caller-supplied rather than read from the clock in here, so a pass is a
+    /// pure function of its inputs and testable without real time elapsing. `budget_bytes` bounds
+    /// cumulative file size processed this call -- except the first eligible entry always runs
+    /// regardless of its own size, so a library with one enormous file still makes progress instead
+    /// of never being touched. `digest_of` does the actual, expensive, whole-file read; lumen-index
+    /// does not touch a filesystem here any more than it does in [`Index::reindex`]. Its `Err` means
+    /// the path could not be read at all this pass (never guessed at as a mismatch, which is a
+    /// distinct and stronger claim).
+    ///
+    /// A mismatch is **never** silently accepted as the new normal: the record's `last_verified`
+    /// stays at the previous confirmed-good value (see [`VerifyReport::mismatched`]'s own doc), and
+    /// `mismatch_pending` is set so tier 1 picks the record straight back up on the very next pass,
+    /// for as long as the problem remains unresolved.
+    pub fn verify(
+        &mut self,
+        now_unix_secs: u64,
+        reverify_after_secs: u64,
+        budget_bytes: u64,
+        mut digest_of: impl FnMut(&Path) -> Result<FileDigest, String>,
+    ) -> VerifyReport {
+        let mut report = VerifyReport::default();
+
+        let mut due: Vec<(PathBuf, Priority, Option<u64>, u64)> = self
+            .by_path
+            .values()
+            .filter(|r| !r.tombstoned)
+            .filter_map(|r| {
+                priority(r, now_unix_secs, reverify_after_secs).map(|p| {
+                    (r.path.clone(), p, r.last_verified.map(|v| v.at_unix_secs), r.fingerprint.size)
+                })
+            })
+            .collect();
+        due.sort_by_key(|(_, p, last, _)| (*p, *last));
+
+        let mut bytes_budgeted = 0u64;
+        for (path, _, _, size) in due {
+            if bytes_budgeted > 0 && bytes_budgeted + size > budget_bytes {
+                report.skipped_by_budget += 1;
+                continue;
+            }
+            bytes_budgeted += size;
+            report.bytes_read += size;
+
+            match digest_of(&path) {
+                Err(e) => report.read_failed.push((path, e)),
+                Ok(digest) => {
+                    let record = self.by_path.get_mut(&path).expect("path came from self.by_path");
+                    match record.last_verified {
+                        None => {
+                            record.last_verified =
+                                Some(Verified { digest, at_unix_secs: now_unix_secs });
+                            record.mismatch_pending = false;
+                            report.baseline_established += 1;
+                        }
+                        Some(prev) if prev.digest == digest => {
+                            record.last_verified =
+                                Some(Verified { digest, at_unix_secs: now_unix_secs });
+                            record.mismatch_pending = false;
+                            report.confirmed += 1;
+                        }
+                        Some(prev) => {
+                            record.mismatch_pending = true;
+                            report.mismatched.push((path, prev.at_unix_secs));
+                        }
+                    }
+                }
+            }
+        }
+        report
+    }
+}
+
+/// Selection tier for [`Index::verify`] -- derive order is the priority order (earlier variant =
+/// more urgent), so sorting a list of these ascending puts the most urgent entries first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Priority {
+    UnresolvedMismatch,
+    NeverVerified,
+    FlaggedAtProbeTime,
+    Routine,
+}
+
+/// A larger file carries more bit-rot exposure for the same elapsed time than a small one, so it
+/// comes due for re-verification sooner on the same base interval -- halved per doubling in size
+/// above a 4 GiB baseline, floored at a quarter of the base interval so one enormous file can never
+/// demand re-checking every few minutes and dominate every pass's budget indefinitely.
+fn risk_adjusted_interval_secs(base_secs: u64, size: u64) -> u64 {
+    const BASELINE: u64 = 4 * 1024 * 1024 * 1024;
+    if size <= BASELINE || base_secs == 0 {
+        return base_secs;
+    }
+    let doublings = (size / BASELINE).ilog2().min(2);
+    base_secs >> doublings
+}
+
+/// The tier a record belongs in for this pass, or `None` if it is not due at all. `None` for tiers
+/// 1 and 2 (unresolved-mismatch, never-verified) is never returned -- both are always due, by
+/// definition: an unresolved problem and an unknown integrity status do not become less urgent by
+/// waiting.
+fn priority(record: &IndexRecord, now_unix_secs: u64, base_reverify_secs: u64) -> Option<Priority> {
+    if record.mismatch_pending {
+        return Some(Priority::UnresolvedMismatch);
+    }
+    let Some(verified) = record.last_verified else {
+        return Some(Priority::NeverVerified);
+    };
+    let interval = risk_adjusted_interval_secs(base_reverify_secs, record.fingerprint.size);
+    if now_unix_secs.saturating_sub(verified.at_unix_secs) < interval {
+        return None;
+    }
+    if record.probe.needs_review.is_some() {
+        Some(Priority::FlaggedAtProbeTime)
+    } else {
+        Some(Priority::Routine)
     }
 }
 
@@ -512,9 +719,327 @@ mod tests {
                 needs_review: None,
             },
             tombstoned: false,
+            last_verified: None,
+            mismatch_pending: false,
         };
         let bundle = record.bundle();
         assert_eq!(bundle.value(FieldGroup::Titles, "title"), Some("A Movie"));
         assert_eq!(bundle.value(FieldGroup::ReleaseDates, "year"), Some("2020"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Index::verify -- tier/priority/risk-based selection (docs/15 §B)
+    // ---------------------------------------------------------------------------------------
+
+    mod verify_tests {
+        use super::*;
+
+        const DAY: u64 = 24 * 60 * 60;
+
+        fn seeded_index(paths_and_sizes: &[(&str, u64)]) -> Index {
+            let mut idx = Index::default();
+            for (p, size) in paths_and_sizes {
+                idx.insert_loaded(IndexRecord {
+                    path: PathBuf::from(p),
+                    fingerprint: FsFingerprint { device_id: 0, inode: 0, size: *size, mtime_ns: 0 },
+                    probe: ProbeResult {
+                        title: (*p).into(),
+                        year: None,
+                        sketch: None,
+                        needs_review: None,
+                    },
+                    tombstoned: false,
+                    last_verified: None,
+                    mismatch_pending: false,
+                });
+            }
+            idx
+        }
+
+        fn digest(n: u128) -> FileDigest {
+            FileDigest(n)
+        }
+
+        #[test]
+        fn a_never_verified_record_establishes_a_baseline_not_a_confirmation() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            let report = idx.verify(1_000, DAY, u64::MAX, |_| Ok(digest(1)));
+
+            assert_eq!(report.baseline_established, 1);
+            assert_eq!(report.confirmed, 0);
+            assert!(!report.found_a_problem());
+            let rec = idx.get(Path::new("/a.mkv")).unwrap();
+            assert_eq!(
+                rec.last_verified,
+                Some(Verified { digest: digest(1), at_unix_secs: 1_000 })
+            );
+            assert!(!rec.mismatch_pending);
+        }
+
+        #[test]
+        fn a_matching_re_verify_is_confirmed_not_a_second_baseline() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            idx.verify(1_000, DAY, u64::MAX, |_| Ok(digest(1)));
+            // Well past the interval, so the second call is actually due.
+            let report = idx.verify(1_000 + 2 * DAY, DAY, u64::MAX, |_| Ok(digest(1)));
+
+            assert_eq!(report.confirmed, 1);
+            assert_eq!(report.baseline_established, 0);
+        }
+
+        #[test]
+        fn a_mismatch_is_flagged_and_never_silently_folded_into_the_baseline() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            idx.verify(1_000, DAY, u64::MAX, |_| Ok(digest(1)));
+            let report = idx.verify(1_000 + 2 * DAY, DAY, u64::MAX, |_| Ok(digest(2)));
+
+            assert_eq!(report.mismatched, vec![(PathBuf::from("/a.mkv"), 1_000)]);
+            assert!(report.found_a_problem());
+            let rec = idx.get(Path::new("/a.mkv")).unwrap();
+            assert_eq!(
+                rec.last_verified,
+                Some(Verified { digest: digest(1), at_unix_secs: 1_000 }),
+                "the stored record must still say the OLD digest was last confirmed good, not silently \
+                 accept the mismatching one"
+            );
+            assert!(rec.mismatch_pending);
+        }
+
+        #[test]
+        fn an_unresolved_mismatch_is_selected_again_even_before_its_normal_interval_would_be_due() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            idx.verify(1_000, DAY, u64::MAX, |_| Ok(digest(1)));
+            idx.verify(1_000 + 2 * DAY, DAY, u64::MAX, |_| Ok(digest(2))); // flags a mismatch
+
+            // Only one second later -- nowhere near due on the normal interval -- but tier 1 (an
+            // unresolved mismatch) is selected unconditionally.
+            let report = idx.verify(1_000 + 2 * DAY + 1, DAY, u64::MAX, |_| Ok(digest(2)));
+            assert_eq!(report.mismatched.len(), 1, "still unresolved, selected again immediately");
+        }
+
+        #[test]
+        fn a_later_match_clears_a_previously_flagged_mismatch() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            idx.verify(1_000, DAY, u64::MAX, |_| Ok(digest(1)));
+            idx.verify(1_000 + 2 * DAY, DAY, u64::MAX, |_| Ok(digest(2))); // mismatch
+            assert!(idx.get(Path::new("/a.mkv")).unwrap().mismatch_pending);
+
+            // The bytes are back to matching what was last confirmed good (a transient issue that
+            // resolved itself, or a filesystem hiccup) -- must clear the flag, not stay stuck flagged.
+            idx.verify(1_000 + 2 * DAY + 1, DAY, u64::MAX, |_| Ok(digest(1)));
+            assert!(!idx.get(Path::new("/a.mkv")).unwrap().mismatch_pending);
+        }
+
+        #[test]
+        fn tier_order_is_mismatch_then_never_verified_then_flagged_then_routine() {
+            let mut idx = Index::default();
+            idx.insert_loaded(IndexRecord {
+                path: PathBuf::from("/routine.mkv"),
+                fingerprint: FsFingerprint { device_id: 0, inode: 0, size: 100, mtime_ns: 0 },
+                probe: ProbeResult {
+                    title: "r".into(),
+                    year: None,
+                    sketch: None,
+                    needs_review: None,
+                },
+                tombstoned: false,
+                last_verified: Some(Verified { digest: digest(9), at_unix_secs: 0 }),
+                mismatch_pending: false,
+            });
+            idx.insert_loaded(IndexRecord {
+                path: PathBuf::from("/flagged.mkv"),
+                fingerprint: FsFingerprint { device_id: 0, inode: 0, size: 100, mtime_ns: 0 },
+                probe: ProbeResult {
+                    title: "f".into(),
+                    year: None,
+                    sketch: None,
+                    needs_review: Some("extension mismatch".into()),
+                },
+                tombstoned: false,
+                last_verified: Some(Verified { digest: digest(9), at_unix_secs: 0 }),
+                mismatch_pending: false,
+            });
+            idx.insert_loaded(IndexRecord {
+                path: PathBuf::from("/never.mkv"),
+                fingerprint: FsFingerprint { device_id: 0, inode: 0, size: 100, mtime_ns: 0 },
+                probe: ProbeResult {
+                    title: "n".into(),
+                    year: None,
+                    sketch: None,
+                    needs_review: None,
+                },
+                tombstoned: false,
+                last_verified: None,
+                mismatch_pending: false,
+            });
+            idx.insert_loaded(IndexRecord {
+                path: PathBuf::from("/mismatched.mkv"),
+                fingerprint: FsFingerprint { device_id: 0, inode: 0, size: 100, mtime_ns: 0 },
+                probe: ProbeResult {
+                    title: "m".into(),
+                    year: None,
+                    sketch: None,
+                    needs_review: None,
+                },
+                tombstoned: false,
+                last_verified: Some(Verified { digest: digest(9), at_unix_secs: 0 }),
+                mismatch_pending: true,
+            });
+
+            // Budget for exactly one 100-byte file per call -- forces the selection to prove its
+            // order one entry at a time rather than just "everything eligible, in some order".
+            // `skipped_by_budget` is deliberately not asserted here: every still-due entry this
+            // pass didn't reach counts toward it every time, by design (see the dedicated budget
+            // tests below) -- what this test checks is the *order* entries get reached in, across
+            // calls, as higher tiers stop being due once they're processed.
+            let mut order = Vec::new();
+            for _ in 0..4 {
+                idx.verify(10 * DAY, DAY, 100, |p| {
+                    order.push(p.to_path_buf());
+                    Ok(digest(9))
+                });
+            }
+
+            assert_eq!(
+                order,
+                vec![
+                    PathBuf::from("/mismatched.mkv"),
+                    PathBuf::from("/never.mkv"),
+                    PathBuf::from("/flagged.mkv"),
+                    PathBuf::from("/routine.mkv"),
+                ]
+            );
+        }
+
+        #[test]
+        fn not_due_yet_is_not_selected_at_all() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            idx.verify(1_000, DAY, u64::MAX, |_| Ok(digest(1)));
+
+            let mut calls = 0;
+            let report = idx.verify(1_000 + 1, DAY, u64::MAX, |_p| {
+                calls += 1;
+                Ok(digest(9))
+            });
+            let _ = report;
+            assert_eq!(calls, 0, "confirmed one second ago, nowhere near a day-long interval");
+        }
+
+        #[test]
+        fn a_larger_file_becomes_due_sooner_than_a_small_one_on_the_same_base_interval() {
+            let mut idx =
+                seeded_index(&[("/small.mkv", 1024), ("/huge.mkv", 32 * 1024 * 1024 * 1024)]);
+            idx.verify(0, DAY, u64::MAX, |_| Ok(digest(1)));
+
+            // A quarter of the base interval later: the risk-adjusted interval for a 32 GiB file
+            // (3 doublings above the 4 GiB baseline, capped at a quarter) is due; a 1 KiB file's
+            // plain day-long interval is not.
+            let mut seen = Vec::new();
+            idx.verify(DAY / 4, DAY, u64::MAX, |p| {
+                seen.push(p.to_path_buf());
+                Ok(digest(1))
+            });
+
+            assert_eq!(seen, vec![PathBuf::from("/huge.mkv")]);
+        }
+
+        #[test]
+        fn read_failure_is_reported_and_never_guessed_at_as_a_mismatch_or_a_confirmation() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            let report = idx.verify(1_000, DAY, u64::MAX, |_| Err("permission denied".to_string()));
+
+            assert_eq!(
+                report.read_failed,
+                vec![(PathBuf::from("/a.mkv"), "permission denied".into())]
+            );
+            assert_eq!(report.confirmed, 0);
+            assert_eq!(report.baseline_established, 0);
+            assert!(report.mismatched.is_empty());
+            assert!(idx.get(Path::new("/a.mkv")).unwrap().last_verified.is_none());
+        }
+
+        #[test]
+        fn the_first_eligible_entry_always_runs_even_if_it_alone_exceeds_the_budget() {
+            let mut idx = seeded_index(&[("/huge.mkv", 999_999_999)]);
+            let report = idx.verify(1_000, DAY, 10, |_| Ok(digest(1)));
+
+            assert_eq!(
+                report.baseline_established, 1,
+                "a budget of 10 bytes must not starve the only file"
+            );
+            assert_eq!(report.skipped_by_budget, 0);
+        }
+
+        #[test]
+        fn a_budget_that_only_fits_the_first_of_several_stops_there() {
+            let mut idx = seeded_index(&[("/a.mkv", 100), ("/b.mkv", 100), ("/c.mkv", 100)]);
+            let report = idx.verify(1_000, DAY, 150, |_| Ok(digest(1)));
+
+            assert_eq!(report.baseline_established, 1);
+            assert_eq!(report.skipped_by_budget, 2);
+        }
+
+        #[test]
+        fn repeated_bounded_passes_eventually_cover_every_entry_exactly_once() {
+            let entries: Vec<(&str, u64)> =
+                vec![("/a.mkv", 100), ("/b.mkv", 100), ("/c.mkv", 100), ("/d.mkv", 100)];
+            let mut idx = seeded_index(&entries);
+
+            let mut covered = std::collections::BTreeSet::new();
+            for i in 0..entries.len() {
+                let report = idx.verify(1_000 + i as u64, DAY, 100, |p| {
+                    covered.insert(p.to_path_buf());
+                    Ok(digest(1))
+                });
+                assert_eq!(
+                    report.baseline_established, 1,
+                    "each bounded pass makes exactly one entry of progress"
+                );
+            }
+
+            assert_eq!(
+                covered.len(),
+                entries.len(),
+                "no entry starved across repeated bounded passes"
+            );
+        }
+
+        #[test]
+        fn a_tombstoned_record_is_never_selected() {
+            let mut idx = seeded_index(&[("/a.mkv", 100)]);
+            {
+                let rec = idx.by_path.get_mut(Path::new("/a.mkv")).unwrap();
+                rec.tombstoned = true;
+            }
+            let mut calls = 0;
+            idx.verify(1_000, DAY, u64::MAX, |_| {
+                calls += 1;
+                Ok(digest(1))
+            });
+            assert_eq!(calls, 0);
+        }
+
+        #[test]
+        fn risk_adjusted_interval_halves_and_quarters_at_the_documented_thresholds() {
+            let base = 8 * DAY; // divisible by 4, so no rounding ambiguity in the assertions below
+            const GIB: u64 = 1024 * 1024 * 1024;
+            assert_eq!(risk_adjusted_interval_secs(base, GIB), base, "below baseline: unchanged");
+            assert_eq!(risk_adjusted_interval_secs(base, 4 * GIB), base, "at baseline: unchanged");
+            assert_eq!(
+                risk_adjusted_interval_secs(base, 8 * GIB),
+                base / 2,
+                "one doubling: halved"
+            );
+            assert_eq!(
+                risk_adjusted_interval_secs(base, 16 * GIB),
+                base / 4,
+                "two doublings: quartered"
+            );
+            assert_eq!(
+                risk_adjusted_interval_secs(base, 64 * GIB),
+                base / 4,
+                "capped at a quarter, never keeps halving indefinitely"
+            );
+        }
     }
 }

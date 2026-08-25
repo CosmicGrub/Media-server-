@@ -1,9 +1,13 @@
-//! A persistent, incremental library index -- `docs/15-next-generation-engines.md` §A.
+//! A persistent, incremental library index -- `docs/15-next-generation-engines.md` §A -- plus
+//! [`Index::verify`], the tier-prioritised digest-based integrity check from §B.
 //!
 //! `lumen scan` and `lumen serve` currently re-walk and re-probe an entire library on every
 //! invocation; `server.rs` holds one in-memory snapshot from startup that never refreshes. This crate
 //! is the fix: it remembers what it already knows about each file and asks a caller to re-probe only
-//! what a cheap `(size, mtime)` check says has actually changed.
+//! what a cheap `(size, mtime)` check says has actually changed. [`Index::reindex`] answers "what
+//! changed since last time"; [`Index::verify`] answers a different, stronger question a fast
+//! `(size, mtime)` check cannot -- "are these bytes still what they were the last time anyone
+//! actually read them", the question bit rot and a failed write both hide from.
 //!
 //! **What this crate is not, on purpose.** It does not walk a filesystem -- `lumen-play`'s
 //! `scan.rs` already has a careful, tested walker, and a second one here would duplicate exactly the
@@ -40,4 +44,4 @@ mod store;
 
 pub use fingerprint::fs_fingerprint;
 pub use persist::{load, save};
-pub use store::{Index, IndexRecord, ProbeResult, ReindexReport};
+pub use store::{Index, IndexRecord, ProbeResult, ReindexReport, Verified, VerifyReport};

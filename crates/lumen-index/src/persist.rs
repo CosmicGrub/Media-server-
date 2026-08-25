@@ -10,9 +10,9 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use lumen_identity::{ContentSketch, FsFingerprint};
+use lumen_identity::{ContentSketch, FileDigest, FsFingerprint};
 
-use crate::store::{Index, IndexRecord, ProbeResult};
+use crate::store::{Index, IndexRecord, ProbeResult, Verified};
 
 const HEADER: &str = "LUMEN-INDEX v1";
 
@@ -66,12 +66,18 @@ fn read_field(s: &str) -> String {
     if s == "-" { String::new() } else { unescape(s) }
 }
 
+/// Field count for the original format (before `last_verified`/`mismatch_pending` existed) and for
+/// the current one. [`line_to_record`] accepts either, so an index file written by an older build
+/// keeps loading rather than being silently discarded the moment this format grew two columns.
+const FIELDS_V1: usize = 10;
+const FIELDS_CURRENT: usize = 13;
+
 fn record_to_line(r: &IndexRecord) -> String {
     let fp = r.fingerprint;
     let mut line = String::new();
     let _ = write!(
         line,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         field_or_dash(&r.path.to_string_lossy()),
         fp.device_id,
         fp.inode,
@@ -82,6 +88,9 @@ fn record_to_line(r: &IndexRecord) -> String {
         r.probe.year.map_or_else(|| "-".to_string(), |y| y.to_string()),
         field_or_dash(r.probe.needs_review.as_deref().unwrap_or("")),
         u8::from(r.tombstoned),
+        r.last_verified.map_or_else(|| "-".to_string(), |v| v.digest.to_hex()),
+        r.last_verified.map_or_else(|| "-".to_string(), |v| v.at_unix_secs.to_string()),
+        u8::from(r.mismatch_pending),
     );
     line
 }
@@ -91,8 +100,8 @@ fn record_to_line(r: &IndexRecord) -> String {
 /// throughout this codebase (`lumen-probe`'s truncation property, `verify_duplicate_group`'s
 /// per-file error handling). A corrupt line is dropped and rediscovered on the next reindex.
 fn line_to_record(line: &str) -> Option<IndexRecord> {
-    let f: Vec<&str> = line.splitn(10, '\t').collect();
-    if f.len() != 10 {
+    let f: Vec<&str> = line.splitn(FIELDS_CURRENT, '\t').collect();
+    if f.len() != FIELDS_V1 && f.len() != FIELDS_CURRENT {
         return None;
     }
     let path = PathBuf::from(read_field(f[0]));
@@ -106,11 +115,31 @@ fn line_to_record(line: &str) -> Option<IndexRecord> {
     let needs_review = if f[8] == "-" { None } else { Some(read_field(f[8])) };
     let tombstoned = f[9] == "1";
 
+    // A v1 line (10 fields, predating verification entirely) has no history to reconstruct --
+    // `None`/`false` is not a guess, it is the literal truth for a file nothing has ever verified.
+    let (last_verified, mismatch_pending) = if f.len() == FIELDS_CURRENT {
+        let verified = match (f[10], f[11]) {
+            ("-", "-") => None,
+            (digest_hex, secs) if digest_hex != "-" && secs != "-" => Some(Verified {
+                digest: FileDigest::from_hex(digest_hex)?,
+                at_unix_secs: secs.parse().ok()?,
+            }),
+            // One dash and one real value is not a shape this writer ever produces -- treat as
+            // unverified rather than guessing which half to trust.
+            _ => None,
+        };
+        (verified, f[12] == "1")
+    } else {
+        (None, false)
+    };
+
     Some(IndexRecord {
         path,
         fingerprint: FsFingerprint { device_id, inode, size, mtime_ns },
         probe: ProbeResult { title, year, sketch, needs_review },
         tombstoned,
+        last_verified,
+        mismatch_pending,
     })
 }
 
@@ -204,6 +233,11 @@ mod tests {
                 needs_review: None,
             },
             tombstoned: false,
+            last_verified: Some(Verified {
+                digest: FileDigest(0x00C0_FFEE),
+                at_unix_secs: 1_700_000_000,
+            }),
+            mismatch_pending: true,
         });
         index.insert_loaded(IndexRecord {
             path: PathBuf::from("/library/broken\tname\n.mkv"),
@@ -215,6 +249,8 @@ mod tests {
                 needs_review: Some("open() failed: permission denied".into()),
             },
             tombstoned: true,
+            last_verified: None,
+            mismatch_pending: false,
         });
         index.set_version(7);
 
@@ -229,10 +265,40 @@ mod tests {
         assert_eq!(a.probe.year, Some(2017));
         assert_eq!(a.probe.sketch, Some(ContentSketch(0xDEAD_BEEF)));
         assert_eq!(a.fingerprint.mtime_ns, -5);
+        assert_eq!(
+            a.last_verified,
+            Some(Verified { digest: FileDigest(0x00C0_FFEE), at_unix_secs: 1_700_000_000 })
+        );
+        assert!(a.mismatch_pending);
 
         let b = loaded.all_including_tombstoned().find(|r| r.tombstoned).unwrap();
         assert_eq!(b.path, PathBuf::from("/library/broken\tname\n.mkv"));
         assert_eq!(b.probe.needs_review.as_deref(), Some("open() failed: permission denied"));
+        assert!(b.last_verified.is_none());
+        assert!(!b.mismatch_pending);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_v1_line_with_no_verification_columns_still_loads_as_never_verified() {
+        let dir =
+            std::env::temp_dir().join(format!("lumen-index-v1-compat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("library.idx");
+        // Exactly what an older build (before this format grew last_verified/mismatch_pending)
+        // would have written -- ten fields, no trailing columns.
+        std::fs::write(
+            &db,
+            format!("{HEADER} 3\n/library/a.mkv\t1\t2\t500\t9\tabc123\tA Movie\t2020\t-\t0\n"),
+        )
+        .unwrap();
+
+        let loaded = load(&db).unwrap();
+        let rec = loaded.all_including_tombstoned().next().unwrap();
+        assert_eq!(rec.probe.title, "A Movie");
+        assert!(rec.last_verified.is_none(), "a v1 line predates verification entirely");
+        assert!(!rec.mismatch_pending);
 
         std::fs::remove_dir_all(&dir).ok();
     }
