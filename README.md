@@ -25,6 +25,8 @@ optional, off-by-default AI operator agent.
 | **12** | [**Container Conformance**](docs/12-container-conformance.md) | **"Every MP4 and MKV plays perfectly"** — the exhaustive Matroska and ISOBMFF feature surface, track auto-selection, the universal recovery ladder |
 | **13** | [**Remux & Transcode Matrices**](docs/13-remux-transcode-matrix.md) | Remux legality per codec×container, transcode decisions for video/audio/subtitles, segmented delivery, offline optimize jobs |
 | — | [Conformance Corpus](conformance/) | The machine-readable test corpus that proves 11–13, with per-platform expected tiers |
+| 14 | [Metadata, Artwork & Subtitles](docs/14-metadata-and-subtitles.md) | Provider fragments and merge, artwork selection, the subtitle acquisition ladder |
+| **15** | [**Next-Generation Engines**](docs/15-next-generation-engines.md) | Four engines scoped against the code that actually shipped — persistent library index, integrity self-healing, fidelity calibration, paired-server health |
 
 **Architecture Decision Records**
 - [ADR-0001 — libmpv as the playback core](docs/adr/0001-playback-core.md)
