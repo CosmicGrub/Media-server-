@@ -127,6 +127,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -227,6 +237,7 @@ version = "0.1.0"
 name = "lumen-play"
 version = "0.1.0"
 dependencies = [
+ "fs4",
  "getrandom 0.3.4",
  "lumen-caps",
  "lumen-identity",
@@ -238,6 +249,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "sha2",
+ "time",
 ]
 
 [[package]]

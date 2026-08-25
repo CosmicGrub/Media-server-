@@ -20,15 +20,15 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ipc::{self, Mpv};
 use crate::remote::pairing::{self, AttemptLimiter, PairResult, PendingCode, TokenStore};
 use crate::remote::protocol::{
-    ClientMessage, LibraryEntry, NowPlaying, PlaybackState, ReplyBody, ServerMessage,
+    ClientMessage, HealthReport, LibraryEntry, NowPlaying, PlaybackState, ReplyBody, ServerMessage,
 };
 use crate::remote::tls::{self, ServerCert};
 use crate::scan::{self, Scan, ScanOptions};
@@ -58,6 +58,15 @@ enum CommandBody {
     Toggle,
     Seek(i64),
     SetVolume(u8),
+    /// Everything the *connection* thread already knows (it has `ServerContext`, the driver thread
+    /// does not) is gathered before this is sent; the one thing only the driver thread can answer --
+    /// how fast mpv itself responds right now -- is filled in by `execute` alone. See `docs/15` §D.
+    Health {
+        tls_cert_expires_in_secs: Option<i64>,
+        library_last_indexed_unix_secs: Option<u64>,
+        free_disk_bytes: Option<u64>,
+        paired_client_count: u32,
+    },
 }
 
 /// State every connected client can read without going through the driver thread at all.
@@ -89,6 +98,38 @@ impl SharedState {
     }
 }
 
+/// Keeps `ServerContext::active_clients` accurate across every way a connection can end. Increments
+/// at most once, the moment `mark_active` is first called (a socket that reconnects with a stored
+/// token authenticates once, not repeatedly); decrements exactly once, on `Drop`, regardless of which
+/// of `handle_connection`'s several early returns is the one that actually ends the connection — a
+/// counter only manually decremented at every return site is one new return statement away from being
+/// wrong.
+struct ActiveClientGuard<'a> {
+    counter: &'a AtomicU32,
+    active: bool,
+}
+
+impl<'a> ActiveClientGuard<'a> {
+    fn new(counter: &'a AtomicU32) -> Self {
+        Self { counter, active: false }
+    }
+
+    fn mark_active(&mut self) {
+        if !self.active {
+            self.active = true;
+            self.counter.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for ActiveClientGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Everything the accept loop hands each connection.
 struct ServerContext {
     commands: Sender<Command>,
@@ -104,6 +145,12 @@ struct ServerContext {
     /// this before being forwarded to mpv — see `resolve_playable_path` — so a paired client can only
     /// ever open a file the server itself already scanned, not an arbitrary path on the host.
     library_root: PathBuf,
+    /// `docs/15` §D. `None` for a certificate persisted before expiry was tracked — see
+    /// `tls::ServerCert::expires_at`.
+    cert_expires_at: Option<SystemTime>,
+    /// How many sockets are currently connected *and authenticated* — see `ActiveClientGuard`, the
+    /// only thing that ever mutates this.
+    active_clients: Arc<AtomicU32>,
 }
 
 /// Run the server. Blocks until the process is killed — this is meant to run in the foreground of a
@@ -177,6 +224,8 @@ pub fn run(
         pair_attempts: Arc::new(Mutex::new(AttemptLimiter::default_policy())),
         library: Arc::new(Mutex::new(scan)),
         library_root,
+        cert_expires_at: server_cert.expires_at(),
+        active_clients: Arc::new(AtomicU32::new(0)),
     });
 
     let listener = TcpListener::bind((bind, port))
@@ -258,6 +307,30 @@ fn execute(mpv: &mut Mpv, body: CommandBody) -> Result<ReplyBody, String> {
         CommandBody::SetVolume(level) => {
             ok(mpv.command(&["set_property", "volume", &level.to_string()]))
         }
+        CommandBody::Health {
+            tls_cert_expires_in_secs,
+            library_last_indexed_unix_secs,
+            free_disk_bytes,
+            paired_client_count,
+        } => {
+            let start = std::time::Instant::now();
+            // `idle-active` is always answerable, whether or not a file is loaded -- exactly "is the
+            // driver loop still alive and responsive", nothing else needed as a probe. A truly wedged
+            // mpv never gets here at all: `get` shares `command`'s own 5-second internal deadline,
+            // the same bound `run_command`'s reply channel waits on, so a player that never answers
+            // surfaces as the ordinary "timed out waiting for the player" `Error` every other command
+            // already produces, not a silently degraded field in an otherwise-`Ok` reply.
+            if mpv.get("idle-active").is_none() {
+                return Err("mpv did not respond to a basic property query".into());
+            }
+            Ok(ReplyBody::Health(HealthReport {
+                mpv_roundtrip_ms: start.elapsed().as_millis() as u64,
+                tls_cert_expires_in_secs,
+                library_last_indexed_unix_secs,
+                free_disk_bytes,
+                paired_client_count,
+            }))
+        }
     }
 }
 
@@ -299,6 +372,11 @@ fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustl
     let mut last_sent_version = u64::MAX; // Never equal to a real version until one is observed.
     let mut pending = Vec::new(); // Bytes read but not yet forming a complete line.
     let mut chunk = [0u8; 4096];
+    // Counted the moment this socket authenticates, uncounted the moment this function returns by
+    // any path -- an early `return` on a dropped or errored connection must decrement exactly as
+    // reliably as a clean disconnect does, which is what makes this a `Drop` guard rather than a
+    // decrement call threaded through every return site below.
+    let mut active = ActiveClientGuard::new(&ctx.active_clients);
 
     loop {
         match tls.read(&mut chunk) {
@@ -315,8 +393,12 @@ fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustl
             if line.is_empty() {
                 continue;
             }
+            let was_authed = authed;
             if !handle_line(line, ctx, &mut authed, &mut tls) {
                 return; // The write side failed -- the peer is gone, stop driving this connection.
+            }
+            if !was_authed && authed {
+                active.mark_active();
             }
         }
 
@@ -447,7 +529,40 @@ fn dispatch(msg: ClientMessage, ctx: &ServerContext, authed: &mut bool) -> Serve
             id,
             message: "no queue yet; play a specific file instead".into(),
         },
+        ClientMessage::Health { .. } => {
+            // Everything not behind mpv's own IPC is gathered here, on the connection thread, which
+            // is the one place that actually holds `ctx` — the driver thread only fills in the one
+            // field it alone can answer. See `CommandBody::Health`'s own doc comment.
+            let body = CommandBody::Health {
+                tls_cert_expires_in_secs: ctx.cert_expires_at.map(seconds_until),
+                library_last_indexed_unix_secs: library_last_indexed(&ctx.library_root),
+                free_disk_bytes: fs4::available_space(&ctx.library_root).ok(),
+                paired_client_count: ctx.active_clients.load(Ordering::Acquire),
+            };
+            run_command(ctx, id, body)
+        }
     }
+}
+
+/// Seconds from now until `target`. Negative, not clamped to zero, when `target` has already passed —
+/// a client needs to tell "expires in 3 days" and "expired 3 days ago" apart, not see the same "soon"
+/// value for both.
+fn seconds_until(target: SystemTime) -> i64 {
+    match target.duration_since(SystemTime::now()) {
+        Ok(remaining) => remaining.as_secs() as i64,
+        Err(already_past) => -(already_past.duration().as_secs() as i64),
+    }
+}
+
+/// Unix seconds of this library's persisted index's last successful save, if it has ever been
+/// reindexed — the index file's own mtime *is* that timestamp, since `lumen_index::save` rewrites the
+/// whole file fresh every time, so this needs no dependency on `lumen-index` beyond the path
+/// convention `reindex::default_index_path` already establishes. `None` — not 0, not "just now" — for
+/// a library `lumen serve` has only ever scanned in memory and never actually reindexed.
+fn library_last_indexed(library_root: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(crate::reindex::default_index_path(library_root)).ok()?;
+    let modified = meta.modified().ok()?;
+    modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
 }
 
 /// Refuse to hand mpv a path outside the directory `lumen serve` was pointed at.

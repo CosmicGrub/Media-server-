@@ -25,6 +25,16 @@ getrandom = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.13"
 sha2 = "0.10"
+# `rcgen`'s own `not_before`/`not_after` fields are typed `time::OffsetDateTime`, and `time` is
+# already in the dependency graph as one of rcgen's own dependencies -- naming it directly here adds
+# nothing new to the license gate or the build matrix, same reasoning as reusing `xxhash-rust` for
+# Engine B's digest. Only `from_unix_timestamp`, a `const fn` needing no feature at all, is used.
+time = { version = "0.3", default-features = false }
+# `lumen serve health`'s free-disk-space check (docs/15 §D): `unsafe_code` is denied workspace-wide,
+# which rules out a hand-rolled `statvfs`/`GetDiskFreeSpaceExW` call the same way `getrandom` above
+# was needed for the OS random source. Every platform backend this pulls in (`rustix`, `windows-sys`)
+# is already in the dependency graph via `rustls`/`getrandom`, so this adds no new transitive crate.
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 
 [lints]
 workspace = true

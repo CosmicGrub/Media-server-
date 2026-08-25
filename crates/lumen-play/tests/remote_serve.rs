@@ -247,6 +247,23 @@ impl Reply {
     fn ty(&self) -> Option<String> {
         self.str("type")
     }
+    /// A nested object field — `Health`'s reply carries its payload under `result` rather than at the
+    /// top level, the same shape `Library`'s reply already uses.
+    fn map(&self, key: &str) -> Option<serde_json_lite::Map> {
+        match self.0.get(key) {
+            Some(serde_json_lite::Val::Map(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// A numeric field inside any parsed object, not just a top-level [`Reply`] — needed for `Health`'s
+/// `result` object, which [`Reply`]'s own accessors do not reach into.
+fn num_in(m: &serde_json_lite::Map, key: &str) -> Option<f64> {
+    match m.get(key) {
+        Some(serde_json_lite::Val::Num(n)) => Some(*n),
+        _ => None,
+    }
 }
 
 struct TempDir(PathBuf);
@@ -309,6 +326,13 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let dir = TempDir::new("basic");
     let file = encode_probe_file(&dir.0);
 
+    // `dirs_next_config_dir` (pairing tokens, the pinned TLS cert, its expiry sidecar) resolves from
+    // `XDG_CONFIG_HOME`/`HOME`/`APPDATA` depending on platform -- pointed at a fresh directory under
+    // this test's own `TempDir` rather than left to fall through to whatever this machine's real
+    // `~/.config/lumen` happens to already hold. Without this, a cert left over from an earlier run
+    // (generated before, say, expiry tracking existed) gets silently reused, and this test's own
+    // assertions about a *freshly generated* cert would be exercising leftover state instead.
+    let config_dir = dir.0.join("config");
     // A distinct, unlikely-to-collide port per test run, so this test can run alongside CI's other
     // suites without fighting anyone else for a fixed port number.
     let port = 17000 + (std::process::id() % 4000) as u16;
@@ -325,6 +349,9 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
             "--vo=null", // No display in CI or this container; audio/video pipeline still runs.
             "--ao=null", // No audio device either, for the same reason.
         ])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("APPDATA", &config_dir)
+        .env("HOME", &config_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -455,6 +482,46 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
         authed.bool("ok"),
         Some(true),
         "the token from pairing must work on a new connection"
+    );
+
+    // Health -- docs/15 §D. Two connections (`tls` and `stranger`) are authenticated and still open
+    // at this point, so the count must reflect both, not just the one that asked.
+    tls.write_all(request("7", "\"type\":\"health\"").as_bytes()).unwrap();
+    let health = read_reply(&mut tls);
+    assert_eq!(health.bool("ok"), Some(true), "health must be accepted: {:?}", health.0);
+    let result = health.map("result").expect("a health reply must carry a result object");
+
+    let roundtrip = num_in(&result, "mpv_roundtrip_ms")
+        .expect("mpv_roundtrip_ms must be a real number for a live, responsive mpv");
+    assert!(
+        roundtrip < 5000.0,
+        "a live mpv should answer well under the 5s command deadline: {roundtrip}ms"
+    );
+
+    let cert_expiry = num_in(&result, "tls_cert_expires_in_secs")
+        .expect("a freshly generated certificate must report a real expiry, not null");
+    assert!(
+        cert_expiry > 0.0,
+        "a freshly generated cert must not already be expired: {cert_expiry}s"
+    );
+
+    let disk = num_in(&result, "free_disk_bytes")
+        .expect("free disk space on a real, existing temp directory must be a real number");
+    assert!(disk > 0.0, "a real volume must report some free space: {disk}");
+
+    let paired =
+        num_in(&result, "paired_client_count").expect("paired_client_count must be a number");
+    assert!(paired >= 2.0, "both `tls` and `stranger` are authenticated and still open: {paired}");
+
+    // This library was only ever scanned in memory by `lumen serve`, never reindexed via `lumen
+    // reindex`/`lumen verify` -- honestly unknown, not fabricated as "just now".
+    assert!(
+        matches!(
+            result.get("library_last_indexed_unix_secs"),
+            None | Some(serde_json_lite::Val::Null)
+        ),
+        "a never-reindexed library must report unknown freshness, got {:?}",
+        result.get("library_last_indexed_unix_secs")
     );
 
     let _ = server.kill();

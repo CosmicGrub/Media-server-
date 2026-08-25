@@ -252,6 +252,39 @@ never reports a completion event does not silently mark the prediction as confir
 
 ## D. Paired-Server Health & Diagnostics Engine
 
+**Shipped (server side)** — a new `ClientMessage::Health`/`ReplyBody::Health(HealthReport)` pair in
+[`remote/protocol.rs`](../crates/lumen-play/src/remote/protocol.rs), answered in
+[`remote/server.rs`](../crates/lumen-play/src/remote/server.rs) exactly as pitched: mpv IPC
+round-trip time, TLS certificate expiry, library index freshness, free disk space, and active
+paired-client count. Two design calls changed between this pitch and the real build, and one part of
+the original pitch was not built at all this session — all recorded honestly below:
+
+- **The pinned TLS certificate now has a real, finite expiry — 825 days, the historical CA/Browser
+  Forum ceiling on public certificate lifetime — instead of `rcgen::generate_simple_self_signed`'s
+  actual default of year 4096.** The pitch's own framing ("if the certificate is approaching expiry")
+  assumed a certificate that meaningfully expires; the code this session found generates one that, as
+  originally written, effectively never does. Rather than build an expiry check that could only ever
+  report "harmless for the next two thousand years," `tls::ServerCert` now generates an explicit,
+  finite validity window and persists it in a small sidecar file next to the DER cert/key so a restart
+  reuses the same expiry rather than recomputing it. A certificate generated before this change (no
+  sidecar present) reports its expiry as honestly unknown, not a fabricated date — this is a
+  behavioral change to certificate generation, not just to how an existing value gets read.
+- **Paired-client count is tracked with an `Arc<AtomicU32>` incremented once per authenticated
+  connection and decremented by an RAII guard on every path out of `handle_connection`**, rather than
+  derived from the token store (which counts tokens ever issued, not sockets connected *right now* —
+  the pitch's own distinction, made precise in the implementation).
+- **Not shipped this session: the Android "Server" card.** The design's own test strategy calls for
+  reusing `RemoteClient`/`RemoteProtocol` in `RemoteScreen.kt` — straightforward in principle, but
+  this session's sandboxed build environment blocks `dl.google.com` (Google's own Maven repository) at
+  the network policy level, so the Android Gradle Plugin itself cannot be resolved here: there is no
+  way to compile, let alone test, a single line of Kotlin in this environment. Writing the client
+  changes blind, with no way to verify they even build, would contradict the same bar this document
+  holds every other engine to — a real end-to-end test, not just code that reads correctly. The wire
+  protocol side is complete and covered by a real end-to-end test (`remote_serve.rs`'s integration
+  test now makes a genuine `health` request over a real TLS connection to a real `lumen serve`
+  process and asserts on the real reply), so the Android card is a clean, already-compatible follow-on
+  needing no further server-side work — not a partially-built feature.
+
 ### The gap, precisely
 
 `DEVICE.md` documents `lumen serve` running as a Windows Scheduled Task specifically so it can run
