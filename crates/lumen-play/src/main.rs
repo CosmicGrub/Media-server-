@@ -17,6 +17,7 @@ mod fidelity;
 mod ipc;
 mod json;
 mod mpvbin;
+mod reindex;
 mod remote;
 mod report;
 mod scan;
@@ -39,6 +40,7 @@ lumen — media library player and test harness
   lumen test  <paths...>              open every file briefly and report which fail
   lumen serve <path>                  run a persistent player a phone can pair with and control
   lumen unpair [<token>] [--all]      list, or revoke, devices previously paired with `serve`
+  lumen reindex <path> [--index <db>] persist an incremental library index; re-probes only what changed
 
 Options
   --seconds <n>       play only n seconds of each file (default 20 for `test`)
@@ -63,6 +65,12 @@ Options
 full token). With one, revokes whichever token starts with it — the whole token, or the prefix
 `unpair` just showed you. `--all` revokes every paired device at once. The server does not need to
 be running; this edits the same token file `serve` reads on its next start.
+
+`reindex` — a persistent alternative to `scan`: the first run probes everything and writes an index
+file (default `<path>/.lumen-index`, override with `--index`); every run after that re-probes only
+files whose size or modified time actually changed, recognises a renamed-but-identical file as moved
+rather than lost, and keeps a tombstoned record for a file that temporarily disappears rather than
+forgetting it outright. Safe to interrupt and re-run at any time — nothing is left half-written.
 
 Other
   --help              this text
@@ -91,6 +99,13 @@ fn main() -> ExitCode {
             }
         },
         Some("unpair") => match unpair(&args[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        },
+        Some("reindex") => match reindex_cmd(&args[1..]) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -312,6 +327,30 @@ fn unpair(args: &[String]) -> Result<ExitCode, String> {
     }
     store.persist_all(&path).map_err(|e| format!("could not update {}: {e}", path.display()))?;
     println!("revoked {} device{}", removed.len(), if removed.len() == 1 { "" } else { "s" });
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Persist an incremental library index: probe everything the first time, only what changed after
+/// that. See `reindex.rs` for the actual reconciliation; this is just argument parsing and the
+/// human-readable summary line.
+fn reindex_cmd(args: &[String]) -> Result<ExitCode, String> {
+    let root = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .ok_or("usage: lumen reindex <path> [--index <db>]")?;
+    if !root.exists() {
+        return Err(format!("{} does not exist", root.display()));
+    }
+
+    let db =
+        value(args, "--index").map_or_else(|| reindex::default_index_path(&root), PathBuf::from);
+
+    let (index, report) = reindex::run(&root, &db)?;
+    println!("{}", reindex::summarize(&index, &report));
+    if report.failed > 0 {
+        println!("(see the index file for which paths need a look: {})", db.display());
+    }
     Ok(ExitCode::SUCCESS)
 }
 

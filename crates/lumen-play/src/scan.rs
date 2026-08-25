@@ -25,7 +25,10 @@ use lumen_probe::{Candidate, Confidence, sniff};
 const HEAD_BYTES: usize = 4096;
 
 /// Directories never worth descending into. Skipped by name at any depth.
-const SKIP_DIRS: &[&str] = &[
+///
+/// `pub(crate)` so `reindex.rs`'s lightweight candidate walker applies exactly the same skip list
+/// rather than maintaining a second one that could drift from this one.
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     ".svn",
     "node_modules",
@@ -39,11 +42,11 @@ const SKIP_DIRS: &[&str] = &[
 ];
 
 /// Extensions that are sidecar subtitles rather than playable media.
-const SUBTITLE_EXTS: &[&str] = &["srt", "ass", "ssa", "sub", "idx", "vtt", "sup", "smi"];
+pub(crate) const SUBTITLE_EXTS: &[&str] = &["srt", "ass", "ssa", "sub", "idx", "vtt", "sup", "smi"];
 
 /// Extensions for audio-only files. Container sniffing cannot tell an audio-only MP4 from a video
 /// one without parsing tracks, so the extension is the cheap first pass and mpv corrects it later.
-const AUDIO_EXTS: &[&str] =
+pub(crate) const AUDIO_EXTS: &[&str] =
     &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma", "alac", "aiff", "ape", "dsf", "wv"];
 
 /// Extensions worth opening even when the bytes are unrecognised.
@@ -51,7 +54,7 @@ const AUDIO_EXTS: &[&str] =
 /// Sniffing cannot identify a raw elementary stream or a fragmented segment from its head, and
 /// refusing those would violate the "no refusal" guarantee (`docs/11` §G2) at the scan stage — before
 /// the player ever gets a chance to try.
-const VIDEO_EXTS: &[&str] = &[
+pub(crate) const VIDEO_EXTS: &[&str] = &[
     "mkv", "mp4", "m4v", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mts", "mpg", "mpeg",
     "vob", "ogv", "3gp", "divx", "rmvb", "asf", "m2v", "mxf", "iso",
 ];
@@ -246,7 +249,9 @@ fn sketch(path: &Path, size: u64) -> Option<ContentSketch> {
     lumen_identity::sketch_reader(&mut f, size).ok()
 }
 
-fn classify(path: &Path, size: u64, identify: bool) -> ScannedFile {
+/// `pub(crate)` so `reindex.rs` can reuse the exact same sniff/parse/sketch logic as the probe step
+/// of an incremental reindex, rather than a second, drifting copy of it.
+pub(crate) fn classify(path: &Path, size: u64, identify: bool) -> ScannedFile {
     let ext = lower_ext(path);
     let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let parsed = lumen_match::parse(&name);
@@ -481,6 +486,70 @@ fn walk(dir: &Path, depth: usize, opts: &ScanOptions, out: &mut Scan) {
             continue;
         }
         out.files.push(f);
+    }
+}
+
+/// Every path under `roots` that is plausibly worth indexing, discovered by extension alone --
+/// deliberately not the full content-sniffed `MediaKind` decision `classify` makes.
+///
+/// This is `reindex.rs`'s cheap pre-pass: enumerating candidates costs one `read_dir` walk, no file
+/// content read. The real, content-sniffed classification (and its cost -- a magic-byte read, and for
+/// `--identify`, up to a 3 MiB content sketch) only happens inside `classify`, called for a path from
+/// `reindex.rs` *only* when `lumen_index::Index::reindex` says the path is new or changed.
+///
+/// **Known limitation, stated rather than hidden**: a file with a missing or wrong extension that
+/// `classify`'s content-sniffing would still recognise (this scanner's own `MediaKind` decision is
+/// explicitly content-first, never extension-first, for exactly this reason) is invisible to this
+/// candidate pass and so never enters the index. That is a real, narrower guarantee than `docs/11`'s
+/// G0 for playback -- G0 is unaffected, since a file `lumen play`/`scan` finds directly is still
+/// classified by content as always; this limitation is specific to what an *incremental index* will
+/// discover on its own without ever having probed the file at all once before.
+pub(crate) fn candidate_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in roots {
+        match std::fs::metadata(root) {
+            Ok(m) if m.is_file() => {
+                if is_candidate_extension(root) {
+                    out.push(root.clone());
+                }
+            }
+            Ok(_) => walk_candidates(root, &mut out),
+            Err(_) => {} // unreadable roots are the caller's problem to report; this pass just skips them
+        }
+    }
+    out.sort();
+    out
+}
+
+fn is_candidate_extension(path: &Path) -> bool {
+    let Some(ext) = lower_ext(path) else { return false };
+    let ext = ext.as_str();
+    VIDEO_EXTS.contains(&ext) || AUDIO_EXTS.contains(&ext) || SUBTITLE_EXTS.contains(&ext)
+}
+
+fn walk_candidates(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            if SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) || name.starts_with('.') {
+                continue;
+            }
+            walk_candidates(&path, out);
+            continue;
+        }
+        if name.starts_with('.') {
+            continue;
+        }
+        if is_candidate_extension(&path) {
+            out.push(path);
+        }
     }
 }
 
@@ -965,5 +1034,41 @@ mod tests {
         let labels: Vec<String> = s.files.iter().map(ScannedFile::label).collect();
         assert!(labels.iter().any(|l| l.contains("S01E03")), "{labels:?}");
         assert!(labels.iter().any(|l| l.contains("(2016)")), "{labels:?}");
+    }
+
+    #[test]
+    fn candidate_paths_finds_media_and_subtitles_but_not_arbitrary_files() {
+        let d = TempDir::new("candidates");
+        d.file("Film.mkv", &mkv_bytes());
+        d.file("Film.eng.srt", b"1\n00:00:01,000 --> x\n");
+        d.file("cover.jpg", b"not media");
+        d.file("readme.txt", b"not media either");
+        let found = candidate_paths(std::slice::from_ref(&d.0));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().any(|p| p.ends_with("Film.mkv")));
+        assert!(found.iter().any(|p| p.ends_with("Film.eng.srt")));
+    }
+
+    #[test]
+    fn candidate_paths_never_reads_file_content_or_descends_into_skip_dirs() {
+        let d = TempDir::new("candidates-skip");
+        d.file(".git/HEAD", b"ref: refs/heads/main");
+        d.file("node_modules/pkg/index.mkv", &mkv_bytes());
+        d.file("Real Movie.mkv", &mkv_bytes());
+        let found = candidate_paths(std::slice::from_ref(&d.0));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("Real Movie.mkv"));
+    }
+
+    #[test]
+    fn candidate_paths_is_sorted_so_two_runs_over_an_unchanged_tree_agree() {
+        let d = TempDir::new("candidates-sorted");
+        d.file("z.mkv", &mkv_bytes());
+        d.file("a.mkv", &mkv_bytes());
+        d.file("m.mkv", &mkv_bytes());
+        let found = candidate_paths(std::slice::from_ref(&d.0));
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(found, sorted);
     }
 }

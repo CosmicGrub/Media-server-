@@ -13,6 +13,15 @@ gaps found by reading the actual source, not aspirational architecture. Each one
 inventing new infrastructure: no new services, no accounts, no cloud dependency, nothing that
 contradicts "this should function offline primarily."
 
+**Engine A shipped** — [`crates/lumen-index`](../crates/lumen-index) plus `lumen reindex` in
+`lumen-play`. One design call changed between this pitch and the real build: it persists to a flat,
+hand-rolled, tab-separated file (the same convention `TokenStore` already uses in this workspace,
+`persist.rs`'s own doc comment explains why) rather than SQLite via `rusqlite` as first proposed
+below — no new dependency, no C toolchain risk added to a project that already cross-compiles Windows
+via `mingw`, and a personal media library's file count never approaches the scale where a linear
+diff/load actually matters. §A below is left as originally written for the reasoning that still
+holds; only the storage engine changed.
+
 ---
 
 ## A. Library Index Engine

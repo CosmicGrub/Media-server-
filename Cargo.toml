@@ -9,6 +9,7 @@ members = [
     "crates/lumen-match",
     "crates/lumen-meta",
     "crates/lumen-subs",
+    "crates/lumen-index",
     "crates/lumen-play",
     "spikes/s1-compositing",
 ]
@@ -33,6 +34,7 @@ lumen-probe = { path = "crates/lumen-probe" }
 lumen-match = { path = "crates/lumen-match" }
 lumen-meta = { path = "crates/lumen-meta" }
 lumen-subs = { path = "crates/lumen-subs" }
+lumen-index = { path = "crates/lumen-index" }
 lumen-play = { path = "crates/lumen-play" }
 
 [workspace.lints.rust]

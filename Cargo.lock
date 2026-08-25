@@ -197,6 +197,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-index"
+version = "0.1.0"
+dependencies = [
+ "lumen-identity",
+ "lumen-meta",
+]
+
+[[package]]
 name = "lumen-match"
 version = "0.1.0"
 dependencies = [
@@ -222,6 +230,7 @@ dependencies = [
  "getrandom 0.3.4",
  "lumen-caps",
  "lumen-identity",
+ "lumen-index",
  "lumen-match",
  "lumen-model",
  "lumen-playback",
