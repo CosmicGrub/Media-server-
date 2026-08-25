@@ -191,7 +191,9 @@ pub struct HealthReport {
     /// failed — reported as unknown rather than a fabricated number.
     pub free_disk_bytes: Option<u64>,
     /// How many sockets are currently connected and authenticated — not how many tokens have ever
-    /// been issued, which says nothing about who is connected *right now*.
+    /// been issued, which says nothing about who is connected *right now*. An approximation, not a
+    /// guarantee: a peer that vanishes without a clean TCP close (`remote::server::ActiveClientGuard`
+    /// documents exactly why) still counts until something tries to write to it and fails.
     pub paired_client_count: u32,
 }
 

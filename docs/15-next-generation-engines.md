@@ -101,13 +101,17 @@ already extracted.
 ## B. Library Integrity & Self-Healing Engine
 
 **Shipped** — [`Index::verify`](../crates/lumen-index/src/store.rs) plus `lumen verify` in
-`lumen-play`. Three design calls changed between this pitch and the real build, all recorded honestly
-below rather than left for the code to contradict silently:
+`lumen-play`. Several design calls changed between this pitch and the real build, all recorded
+honestly below rather than left for the code to contradict silently:
 
 - **Digest algorithm: `lumen_identity::FileDigest`/`digest_reader` (xxh3-128), not BLAKE3.** Same
   reasoning as Engine A's SQLite→flat-file swap — `xxhash-rust` is already in the dependency graph
   via `lumen-identity`, reusing it adds nothing new to the license gate or the build matrix. It isn't
   cryptographic, same as `ContentSketch` isn't — this defends against bit rot, not an adversary.
+  Chunked in 1 MiB reads of its own (`lumen_identity::CHUNK`), not literally the same 256 KiB
+  constant `scan.rs`'s `same_bytes` uses for duplicate confirmation, as the Design section below
+  originally described — two different functions with two different chunk sizes, not one reused
+  pattern between them.
 - **Rate limiting: a per-invocation byte budget, not a live playback signal.** `lumen serve` has no
   "something is currently playing" state a background pass could consult yet — that integration does
   not exist, so tying a limiter to it would have been claiming a thing that isn't real. `lumen verify`
@@ -119,10 +123,18 @@ below rather than left for the code to contradict silently:
   an unresolved mismatch is always reselected first (regardless of the reverify interval, until a
   later pass confirms it or `reindex` sees the file legitimately change); then anything never
   verified at all; then anything `reindex` itself already flagged via `needs_review`; then everything
-  else due, oldest-confirmed-first — and within that last tier, a larger file's effective interval is
-  shortened (halved per size-doubling above 4 GiB, capped at a quarter) since it carries more bit-rot
-  exposure for the same elapsed time. `mismatch_pending` is a new persisted field specifically to
-  make "unresolved" survive across process restarts, not just within one run.
+  else due, oldest-confirmed-first. The size-based risk adjustment (halved per size-doubling above
+  4 GiB, capped at a quarter) applies to both of the last two, interval-gated tiers — a large flagged
+  file comes due sooner than an unflagged one of the same size, not just a large routine one — not
+  only "that last tier" as an earlier version of this note said. `mismatch_pending` is a new
+  persisted field specifically to make "unresolved" survive across process restarts, not just within
+  one run.
+- **The mismatch diagnostic is a plain formatted string** (`lumen-play/src/verify.rs`'s
+  `summarize`), not a `RejectReason`-shaped value from `lumen-playback`'s taxonomy as the Design
+  section below originally proposed — `RejectReason` describes why a client *can't play* a file,
+  a different question from "these bytes changed since they were last confirmed good." The message
+  still says the thing Rule 3 requires plainly and without guessing at a cause, just as its own
+  string rather than borrowing a type built for something else.
 
 ### The gap, precisely
 

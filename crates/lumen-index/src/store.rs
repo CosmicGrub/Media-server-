@@ -124,7 +124,14 @@ pub struct VerifyReport {
     /// Path and reason, for an entry that could not even be read this pass -- reported, never
     /// guessed at as either a confirmation or a mismatch.
     pub read_failed: Vec<(PathBuf, String)>,
-    /// Total bytes actually read this pass, across every entry processed.
+    /// Total bytes read this pass, across every entry that was actually read (a failed read
+    /// contributes nothing -- see `Index::verify`'s own doc comment). Counted from the entry's
+    /// fingerprint size recorded at the last `reindex`, not a live re-stat of the file: if the file
+    /// has genuinely grown or shrunk since then, this (and the byte budget itself, which uses the
+    /// same figure to decide what fits) reports what was *expected* to be read, not necessarily the
+    /// exact byte count `digest_of` really consumed. The digest comparison itself is unaffected --
+    /// it always hashes the file's real, current bytes regardless of what the stale fingerprint
+    /// says -- only this figure and the budget's own admission decision use the earlier estimate.
     pub bytes_read: u64,
     /// Entries that were due for re-verification but did not fit in this pass's budget. Not a
     /// failure -- they are simply carried over to the next invocation, oldest-verified-first.
@@ -271,11 +278,17 @@ impl Index {
 
                     match verdict {
                         ScanVerdict::Unchanged => {
-                            // Only reachable if the probe's own fresh sketch happens to match what
-                            // was already on file despite the fingerprint differing (e.g. a copy that
-                            // preserved mtime to the second but not the nanosecond) -- correct to
-                            // record as unchanged rather than a spurious Modified, and correct to
-                            // carry the verification forward for the same reason.
+                            // In practice unreachable today: `classify`'s own `Unchanged` condition
+                            // (`lumen_identity::classify`) compares exactly the same two fields --
+                            // `fs.size` and `fs.mtime_ns` -- the fast-path check above (lines ~232-
+                            // 237) already tested and only fell through here because it did *not*
+                            // match. Kept rather than collapsed into `Modified` in case `classify`'s
+                            // own definition of "unchanged" ever grows more tolerant than an exact
+                            // fingerprint match (a copy that preserves size but not mtime to full
+                            // nanosecond precision would be the natural next case) -- carrying
+                            // forward the previous verification is the provably-correct behavior the
+                            // moment that becomes reachable, and there is no honest way to test for
+                            // "unreachable" other than leaving the arm dead until it is not.
                             report.unchanged += 1;
                             carried = known_here.map(|r| (r.last_verified, r.mismatch_pending));
                         }
@@ -356,7 +369,16 @@ impl Index {
     /// of never being touched. `digest_of` does the actual, expensive, whole-file read; lumen-index
     /// does not touch a filesystem here any more than it does in [`Index::reindex`]. Its `Err` means
     /// the path could not be read at all this pass (never guessed at as a mismatch, which is a
-    /// distinct and stronger claim).
+    /// distinct and stronger claim) -- and costs nothing against the budget, since nothing was
+    /// actually read; a permission-denied file must not silently starve a readable one right behind
+    /// it in the same tier.
+    ///
+    /// Budget consumption is a strict prefix of the sorted list, not best-fit bin-packing: the
+    /// moment one entry (after the always-exempt first) does not fit, every entry behind it is
+    /// skipped too, even ones that would themselves fit within what remains. Continuing past a
+    /// skipped entry to find a smaller one further down the list would let a lower-priority tier run
+    /// ahead of a higher-priority entry this same pass just skipped for being too large -- silently
+    /// reordering the tiers `priority` above exists to establish.
     ///
     /// A mismatch is **never** silently accepted as the new normal: the record's `last_verified`
     /// stays at the previous confirmed-good value (see [`VerifyReport::mismatched`]'s own doc), and
@@ -384,17 +406,23 @@ impl Index {
         due.sort_by_key(|(_, p, last, _)| (*p, *last));
 
         let mut bytes_budgeted = 0u64;
-        for (path, _, _, size) in due {
-            if bytes_budgeted > 0 && bytes_budgeted + size > budget_bytes {
-                report.skipped_by_budget += 1;
-                continue;
+        // A dedicated flag for "has anything run yet", not a proxy on `bytes_budgeted > 0` -- a
+        // proxy is wrong the moment the first entry (or a run of them) is legitimately zero bytes,
+        // which would otherwise keep granting the "always exempt" pass to every entry after it too.
+        let mut attempted_any = false;
+        let mut i = 0;
+        while i < due.len() {
+            let (path, _, _, size) = due[i].clone();
+            if attempted_any && bytes_budgeted.saturating_add(size) > budget_bytes {
+                break;
             }
-            bytes_budgeted += size;
-            report.bytes_read += size;
+            attempted_any = true;
 
             match digest_of(&path) {
                 Err(e) => report.read_failed.push((path, e)),
                 Ok(digest) => {
+                    bytes_budgeted = bytes_budgeted.saturating_add(size);
+                    report.bytes_read = report.bytes_read.saturating_add(size);
                     let record = self.by_path.get_mut(&path).expect("path came from self.by_path");
                     match record.last_verified {
                         None => {
@@ -416,7 +444,9 @@ impl Index {
                     }
                 }
             }
+            i += 1;
         }
+        report.skipped_by_budget += due.len() - i;
         report
     }
 }
@@ -574,6 +604,71 @@ mod tests {
     }
 
     #[test]
+    fn a_full_reindex_verify_modify_reindex_verify_cycle_never_confuses_a_real_reencode_with_corruption()
+     {
+        // The end-to-end contract `reindex` and `verify` are jointly supposed to keep: a file that
+        // legitimately changes (a re-encode, an upgraded remux) must reindex as `Modified` and start
+        // verification over clean -- never surface as a "mismatch" against bytes that were never a
+        // fair comparison to begin with. A regression here would either (a) falsely flag every
+        // intentional re-encode as if the media were failing, or (b) the opposite failure this
+        // engine exists to prevent: silently accepting a genuinely corrupted new version as an
+        // unquestioned fresh baseline. Both are exactly the class of bug a green unit-level test
+        // suite for `verify` and `reindex` in isolation would not, on its own, catch.
+        let dir = tmp_dir("full-cycle");
+        let path = write_file(&dir, "a.mkv", b"the original encode's bytes");
+        let digest_of = |p: &Path| -> Result<FileDigest, String> {
+            let mut f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+            lumen_identity::digest_reader(&mut f).map_err(|e| e.to_string())
+        };
+
+        let mut idx = Index::default();
+        idx.reindex(std::slice::from_ref(&path), |p, _fp| {
+            Some(rec(p.to_str().unwrap(), "A Movie", 1))
+        })
+        .unwrap();
+        let first_verify = idx.verify(1_000, 24 * 60 * 60, u64::MAX, digest_of);
+        assert_eq!(first_verify.baseline_established, 1);
+        assert!(!first_verify.found_a_problem());
+
+        // A genuine re-encode: different bytes, at the same path, discovered by a fresh reindex --
+        // not by `verify` stumbling on it, which is the failure this whole engine exists to catch.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, b"a completely different, legitimately re-encoded set of bytes")
+            .unwrap();
+        let reindex_report = idx
+            .reindex(std::slice::from_ref(&path), |p, _fp| {
+                Some(rec(p.to_str().unwrap(), "A Movie (Remastered)", 2))
+            })
+            .unwrap();
+        assert_eq!(reindex_report.modified, 1);
+        assert!(
+            idx.get(&path).unwrap().last_verified.is_none(),
+            "a genuinely modified file must start verification over clean, not compare new bytes \
+             against an old baseline that was never a fair comparison"
+        );
+
+        let second_verify = idx.verify(2_000, 24 * 60 * 60, u64::MAX, digest_of);
+        assert_eq!(
+            second_verify.baseline_established, 1,
+            "the re-encode establishes a fresh baseline, exactly as a first-ever verify would"
+        );
+        assert!(
+            !second_verify.found_a_problem(),
+            "a legitimate re-encode must never be reported as if the media were failing: {:?}",
+            second_verify
+        );
+
+        // Now corrupt the file *without* telling reindex -- the scenario `verify` alone exists to
+        // catch, distinct from the modify-then-reindex case above.
+        std::fs::write(&path, b"corrupted after the fact, reindex never saw this change").unwrap();
+        let corruption_report = idx.verify(2_000 + 24 * 60 * 60, 24 * 60 * 60, u64::MAX, digest_of);
+        assert_eq!(corruption_report.mismatched.len(), 1, "silent corruption must be caught");
+        assert!(corruption_report.found_a_problem());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_renamed_file_with_identical_content_is_recognized_as_moved_not_delete_and_create() {
         let dir = tmp_dir("move");
         let old_path = write_file(&dir, "old-name.mkv", b"identical bytes, new home");
@@ -598,6 +693,52 @@ mod tests {
         assert_eq!(report.tombstoned, 0, "the vacated path is a move source, not a real loss");
         assert!(idx.get(&old_path).is_none(), "the old path is no longer live");
         assert!(idx.get(&new_path).is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_moved_files_verification_history_survives_the_move() {
+        // The end-to-end regression for the carry-forward fix `reindex`'s `Moved` arm applies: real
+        // verification history, established against real bytes on disk, must not reset to "never
+        // verified" just because the same file moved. A real `Index::verify` against the actual
+        // written file, not a hand-built `Verified` value, is what makes this a genuine regression
+        // test rather than one that could pass even if the plumbing between `verify` and `reindex`
+        // were subtly wrong.
+        let dir = tmp_dir("move-carries-verification");
+        let old_path = write_file(&dir, "old-name.mkv", b"identical bytes, new home");
+
+        let mut idx = Index::default();
+        idx.reindex(std::slice::from_ref(&old_path), |p, _fp| {
+            Some(rec(p.to_str().unwrap(), "A Movie", 42))
+        })
+        .unwrap();
+
+        let digest_of = |p: &Path| -> Result<FileDigest, String> {
+            let mut f = std::fs::File::open(p).map_err(|e| e.to_string())?;
+            lumen_identity::digest_reader(&mut f).map_err(|e| e.to_string())
+        };
+        let verify_report = idx.verify(1_000, 24 * 60 * 60, u64::MAX, digest_of);
+        assert_eq!(verify_report.baseline_established, 1);
+        let established = idx.get(&old_path).unwrap().last_verified;
+        assert!(established.is_some(), "the setup itself must have established real history");
+
+        std::fs::rename(&old_path, dir.join("new-name.mkv")).unwrap();
+        let new_path = dir.join("new-name.mkv");
+
+        let reindex_report = idx
+            .reindex(std::slice::from_ref(&new_path), |p, _fp| {
+                Some(rec(p.to_str().unwrap(), "A Movie", 42))
+            })
+            .unwrap();
+        assert_eq!(reindex_report.moved, 1);
+
+        let after_move = idx.get(&new_path).unwrap();
+        assert_eq!(
+            after_move.last_verified, established,
+            "the same bytes moving to a new path must not lose their confirmed-good history"
+        );
+        assert!(!after_move.mismatch_pending);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -971,6 +1112,13 @@ mod tests {
         }
 
         #[test]
+        fn verifying_an_empty_index_is_trivially_a_no_op() {
+            let mut idx = Index::default();
+            let report = idx.verify(1_000, DAY, u64::MAX, |_| Ok(digest(1)));
+            assert_eq!(report, VerifyReport::default());
+        }
+
+        #[test]
         fn a_budget_that_only_fits_the_first_of_several_stops_there() {
             let mut idx = seeded_index(&[("/a.mkv", 100), ("/b.mkv", 100), ("/c.mkv", 100)]);
             let report = idx.verify(1_000, DAY, 150, |_| Ok(digest(1)));
@@ -1017,6 +1165,117 @@ mod tests {
                 Ok(digest(1))
             });
             assert_eq!(calls, 0);
+        }
+
+        #[test]
+        fn a_leading_zero_size_entry_does_not_grant_every_entry_behind_it_an_unbounded_pass() {
+            // Regression: the "first entry always runs" exemption used to be approximated by
+            // `bytes_budgeted > 0`, which stayed false -- and so kept exempting every subsequent
+            // entry too -- for as long as every entry processed so far happened to be zero bytes.
+            let mut idx = seeded_index(&[("/a-empty.mkv", 0), ("/z-huge.mkv", 999_999_999)]);
+            let report = idx.verify(1_000, DAY, 10, |_| Ok(digest(1)));
+
+            assert_eq!(
+                report.baseline_established, 1,
+                "only the true first entry (zero bytes) should run against a 10-byte budget"
+            );
+            assert_eq!(report.skipped_by_budget, 1, "the huge entry must not sneak in behind it");
+        }
+
+        #[test]
+        fn a_failed_read_does_not_consume_the_budget_a_readable_file_behind_it_needs() {
+            // Regression: bytes_budgeted/report.bytes_read used to be charged the entry's nominal
+            // size *before* attempting the read, so a run of unreadable files could exhaust an
+            // entire pass's budget without a single real byte read.
+            let mut idx = seeded_index(&[("/a-unreadable.mkv", 999_999_999), ("/b-real.mkv", 100)]);
+            let report = idx.verify(1_000, DAY, 200, |p| {
+                if p == Path::new("/a-unreadable.mkv") {
+                    Err("permission denied".into())
+                } else {
+                    Ok(digest(1))
+                }
+            });
+
+            assert_eq!(report.read_failed.len(), 1);
+            assert_eq!(
+                report.baseline_established, 1,
+                "the second file must still be reached -- the failed read cost it nothing"
+            );
+            assert_eq!(report.bytes_read, 100, "only the bytes actually read are counted");
+            assert_eq!(report.skipped_by_budget, 0);
+        }
+
+        #[test]
+        fn budget_accumulation_never_overflows_even_with_near_u64_max_sizes() {
+            // Regression: `bytes_budgeted + size` and `bytes_budgeted += size` could overflow (panic
+            // in a debug build, silently wrap and bypass the budget in release) for large enough
+            // sizes. Saturating arithmetic must hold regardless.
+            let mut idx = seeded_index(&[("/a.mkv", u64::MAX), ("/b.mkv", u64::MAX)]);
+            // A finite, realistic-shaped budget rather than `u64::MAX` itself: with the budget also
+            // at the saturation ceiling, `saturating_add` making the true (unsaturated) sum look
+            // exactly equal to an equally-saturated budget would falsely read as "still fits" --
+            // not a wraparound bug, but not what this test means to exercise either.
+            let report = idx.verify(1_000, DAY, 1_000_000_000, |_| Ok(digest(1)));
+
+            // The first entry is always exempt and runs; the second cannot possibly fit behind a
+            // budget already saturated by the first, and must be skipped, not panic or wrap around
+            // into fitting.
+            assert_eq!(report.baseline_established, 1);
+            assert_eq!(report.skipped_by_budget, 1);
+        }
+
+        #[test]
+        fn a_budget_skip_never_lets_a_lower_tier_entry_run_ahead_of_a_skipped_higher_tier_one() {
+            // Regression: the old loop used `continue` on a budget miss, so it kept scanning for a
+            // later entry that *did* fit -- letting a small, low-priority entry run in the same pass
+            // a large, higher-priority entry was skipped from. A bounded pass must consume a strict
+            // prefix of the priority-sorted list, never skip over a miss to reach a smaller one.
+            let mut idx = Index::default();
+            for (path, size, needs_review) in
+                [("/never-a.mkv", 900, None), ("/never-b.mkv", 900, None)]
+            {
+                idx.insert_loaded(IndexRecord {
+                    path: PathBuf::from(path),
+                    fingerprint: FsFingerprint { device_id: 0, inode: 0, size, mtime_ns: 0 },
+                    probe: ProbeResult {
+                        title: path.into(),
+                        year: None,
+                        sketch: None,
+                        needs_review,
+                    },
+                    tombstoned: false,
+                    last_verified: None,
+                    mismatch_pending: false,
+                });
+            }
+            // A same-tier (routine) small file that would fit the budget on its own, but only
+            // because a same-priority large file ahead of it in path order was skipped for size.
+            idx.insert_loaded(IndexRecord {
+                path: PathBuf::from("/z-small-routine.mkv"),
+                fingerprint: FsFingerprint { device_id: 0, inode: 0, size: 10, mtime_ns: 0 },
+                probe: ProbeResult {
+                    title: "z".into(),
+                    year: None,
+                    sketch: None,
+                    needs_review: None,
+                },
+                tombstoned: false,
+                last_verified: Some(Verified { digest: digest(9), at_unix_secs: 0 }),
+                mismatch_pending: false,
+            });
+
+            // Budget fits the first 900-byte entry alone, nothing more.
+            let mut order = Vec::new();
+            let report = idx.verify(10 * DAY, DAY, 950, |p| {
+                order.push(p.to_path_buf());
+                Ok(digest(1))
+            });
+
+            assert_eq!(order, vec![PathBuf::from("/never-a.mkv")], "must stop at the first miss");
+            assert_eq!(
+                report.skipped_by_budget, 2,
+                "both entries behind the miss count as skipped"
+            );
         }
 
         #[test]

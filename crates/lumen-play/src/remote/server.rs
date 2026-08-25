@@ -104,6 +104,23 @@ impl SharedState {
 /// of `handle_connection`'s several early returns is the one that actually ends the connection — a
 /// counter only manually decremented at every return site is one new return statement away from being
 /// wrong.
+///
+/// Two known, accepted imprecisions, both self-correcting and neither worth the added machinery to
+/// close for a value `docs/15` §D scopes as informational, not a hard invariant anything is gated on:
+///
+/// - **A brief window between the Pair/Auth reply landing on the wire and `mark_active` running.**
+///   `handle_line` writes the success reply and returns before its caller checks whether `authed`
+///   just became true; a concurrent `Health` request from a different, already-connected client
+///   could in principle observe the count one low in that gap. No syscall happens in between, so the
+///   window is a handful of instructions on the same thread wide -- and the very next `Health` poll
+///   sees the corrected count regardless.
+/// - **A peer that vanishes without a clean TCP close** (network loss, an OS killing the app, no
+///   `SO_KEEPALIVE` or idle timeout) is never detected until *something* tries to write to that dead
+///   socket -- a `State` push once playback changes, or simply the read loop's own timeout tolerating
+///   the silence indefinitely if nothing does. Until then it still counts as connected. Real liveness
+///   detection (keepalive, a ping/pong) is future work, not something this pass adds -- the same
+///   "left open, not silently claimed" posture Engine A's missing filesystem watcher and Engine B's
+///   playback-unaware rate limiting already document.
 struct ActiveClientGuard<'a> {
     counter: &'a AtomicU32,
     active: bool,

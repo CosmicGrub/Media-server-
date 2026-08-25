@@ -392,6 +392,13 @@ fn unpair(args: &[String]) -> Result<ExitCode, String> {
 /// Persist an incremental library index: probe everything the first time, only what changed after
 /// that. See `reindex.rs` for the actual reconciliation; this is just argument parsing and the
 /// human-readable summary line.
+///
+/// Always exits 0, deliberately unlike `verify` below, even when `report.failed > 0`. A probe
+/// flagging `needs_review` (an extension mismatch, a suspicious size) is the same soft, "worth a
+/// look" signal `Index::verify`'s own tier 3 treats as elevated-but-not-urgent -- distinct from a
+/// verify pass's mismatch or read failure, which is a confirmed problem a script gating on exit code
+/// should actually stop on. Two different exit-code conventions for two genuinely different strengths
+/// of signal, not an inconsistency between siblings.
 fn reindex_cmd(args: &[String]) -> Result<ExitCode, String> {
     let root = args
         .iter()
@@ -420,6 +427,13 @@ fn verify_cmd(args: &[String]) -> Result<ExitCode, String> {
     let root = args.iter().find(|a| !a.starts_with("--")).map(PathBuf::from).ok_or(
         "usage: lumen verify <path> [--index <db>] [--reverify-days <n>] [--budget <bytes>]",
     )?;
+    // `reindex_cmd` checks this; `verify` used to silently accept a nonexistent root and report
+    // "0 confirmed" instead -- misleading either way root actually matters here: with `--index`
+    // given explicitly, the root is otherwise unused entirely and a typo would go unnoticed, and
+    // without it, the derived default index path would just as silently never exist either.
+    if !root.exists() {
+        return Err(format!("{} does not exist", root.display()));
+    }
 
     let db =
         value(args, "--index").map_or_else(|| reindex::default_index_path(&root), PathBuf::from);

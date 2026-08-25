@@ -57,12 +57,15 @@ impl ServerCert {
 
         if let (Ok(cert_der), Ok(key_der)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
             if !cert_der.is_empty() && !key_der.is_empty() {
-                // Missing, unreadable, or unparsable is all the same outcome here: unknown expiry,
-                // not a fabricated date and not a reason to fail loading an otherwise-good cert.
+                // Missing, unreadable, unparsable, or too large to represent as a `SystemTime` at
+                // all (a corrupted or hand-edited sidecar, a torn write) is all the same outcome
+                // here: unknown expiry, not a fabricated date and never a reason to fail loading an
+                // otherwise-good cert -- see `expiry_from_secs`, which is what keeps a value that
+                // merely parses as a valid `u64` from overflowing straight into a startup panic.
                 let expires_at = std::fs::read_to_string(&expiry_path)
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
-                    .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
+                    .and_then(expiry_from_secs);
                 return Ok(Self { cert_der, key_der, expires_at });
             }
         }
@@ -94,23 +97,39 @@ impl ServerCert {
 
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        std::fs::write(&cert_path, &cert_der)
+        // Temp-file-then-rename, the same pattern `lumen_index::save`/`TokenStore::persist_all`
+        // already established: a crash or disk-full mid-write leaves the previous file (if any)
+        // intact rather than a truncated one a later load would have to guess about -- torn writes
+        // are exactly how a corrupted-but-parsable expiry sidecar (see `expiry_from_secs`) happens.
+        write_atomic(&cert_path, &cert_der)
             .map_err(|e| format!("cannot persist {}: {e}", cert_path.display()))?;
-        std::fs::write(&key_path, &key_der)
+        write_atomic(&key_path, &key_der)
             .map_err(|e| format!("cannot persist {}: {e}", key_path.display()))?;
         let expires_secs = not_after
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("system clock is before the unix epoch: {e}"))?
             .as_secs();
-        std::fs::write(&expiry_path, expires_secs.to_string())
-            .map_err(|e| format!("cannot persist {}: {e}", expiry_path.display()))?;
+        // The cert and key just written above are load-bearing -- this server cannot run without
+        // them, so a failure to persist either is fatal, correctly propagated with `?`. The expiry
+        // sidecar is purely diagnostic (`docs/15` §D's health check), and a `lumen serve` that
+        // otherwise started up cleanly must not refuse to run at all just because this one nice-to-
+        // have file could not be written; warn and keep going with the in-memory value for this
+        // session, the same "persistence failed, the thing the user is looking at right now should
+        // not fail because of it" posture `server.rs` already uses for a failed pairing-token save.
+        if let Err(e) = write_atomic(&expiry_path, expires_secs.to_string().as_bytes()) {
+            eprintln!("warning: could not persist {}: {e}", expiry_path.display());
+        }
 
         // Rebuilt from the same whole-second value just persisted, rather than keeping `not_after`'s
         // own sub-second precision, so a fresh `ServerCert` and one reloaded from disk report exactly
-        // the same `expires_at` -- the sidecar file only ever round-trips whole seconds anyway.
-        let expires_at = UNIX_EPOCH + Duration::from_secs(expires_secs);
+        // the same `expires_at` -- the sidecar file only ever round-trips whole seconds anyway. Using
+        // the same checked construction as the reload path rather than assuming it must fit: `secs`
+        // came from a `not_after` this same function just computed as `now + a bounded number of
+        // days`, so it is not expected to overflow, but "not expected to" is not a proof, and the
+        // reload path already has to handle exactly this gracefully.
+        let expires_at = expiry_from_secs(expires_secs);
 
-        Ok(Self { cert_der, key_der, expires_at: Some(expires_at) })
+        Ok(Self { cert_der, key_der, expires_at })
     }
 
     /// When this certificate stops being valid, if known -- `docs/15` §D reads this for the health
@@ -147,6 +166,24 @@ impl ServerCert {
     pub fn default_dir() -> PathBuf {
         dirs_next_config_dir().join("lumen")
     }
+}
+
+/// `UNIX_EPOCH + Duration::from_secs(secs)` panics -- crashing the whole `lumen serve` process on
+/// startup -- the moment `secs` is large enough that the resulting instant cannot be represented as
+/// a `SystemTime` at all. Any `u64` up to ~1.8×10^19 parses successfully from a corrupted, hand-
+/// edited, or torn-write sidecar file, so "parses as a number" is nowhere near "safe to add". `None`
+/// here folds into the same "unknown expiry" outcome every other kind of bad sidecar data already
+/// produces, never a hard failure over what is, in the end, a purely diagnostic value.
+fn expiry_from_secs(secs: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs))
+}
+
+/// Temp-file-then-rename: the destination path is only ever either the previous complete file or the
+/// new complete one, never a truncated write a crash or a full disk caught partway through.
+fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Install rustls's crypto backend once per process. Every `ServerConfig`/`ClientConfig` needs a
@@ -257,6 +294,58 @@ mod tests {
         let reloaded = ServerCert::load_or_generate(&dir).expect("reload must still succeed");
         assert_eq!(reloaded.fingerprint(), legacy.fingerprint(), "the cert itself is untouched");
         assert_eq!(reloaded.expires_at(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupted_oversized_expiry_sidecar_reports_unknown_rather_than_panicking() {
+        // Regression: a sidecar value that parses fine as a `u64` but is too large to represent as a
+        // `SystemTime` (a bit-flipped file, a stray extra digit, a torn write that duplicated
+        // digits) used to panic on `UNIX_EPOCH + Duration::from_secs(secs)`, crashing the entire
+        // `lumen serve` process at startup on every restart until a human fixed the file by hand.
+        let dir = temp_dir("expiry-corrupt-oversized");
+        let original = ServerCert::load_or_generate(&dir).expect("generation must succeed");
+        std::fs::write(dir.join("tls-cert-expires.txt"), u64::MAX.to_string()).unwrap();
+
+        let reloaded = ServerCert::load_or_generate(&dir)
+            .expect("a corrupted sidecar must degrade gracefully, never fail cert loading");
+        assert_eq!(reloaded.fingerprint(), original.fingerprint(), "the cert itself is untouched");
+        assert_eq!(reloaded.expires_at(), None, "unrepresentable, not fabricated as some date");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expiry_from_secs_never_panics_across_the_full_u64_range() {
+        assert!(expiry_from_secs(0).is_some());
+        assert!(expiry_from_secs(1_700_000_000).is_some());
+        assert_eq!(expiry_from_secs(u64::MAX), None, "must degrade, never overflow-panic");
+    }
+
+    #[test]
+    fn a_failed_expiry_sidecar_write_does_not_stop_the_cert_from_being_generated_and_returned() {
+        // Regression: the expiry sidecar is purely diagnostic (docs/15 §D) -- a failure to persist
+        // it must never take down the whole TLS bootstrap when the load-bearing cert and key
+        // themselves wrote successfully. Isolated to just the sidecar's own write by pre-occupying
+        // its temp-file path with a directory, which every platform refuses to write file contents
+        // into -- `tls-cert.tmp`/`tls-key.tmp` are untouched, so their writes and renames proceed
+        // normally.
+        let dir = temp_dir("expiry-write-fails");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("tls-cert-expires.tmp")).unwrap();
+
+        let cert = ServerCert::load_or_generate(&dir)
+            .expect("a cert/key write succeeding must be enough, even if the sidecar write fails");
+        assert!(dir.join("tls-cert.der").exists(), "the load-bearing cert must still be persisted");
+        assert!(dir.join("tls-key.der").exists(), "the load-bearing key must still be persisted");
+        assert!(
+            !dir.join("tls-cert-expires.txt").exists(),
+            "the sidecar genuinely failed to write -- this test would prove nothing otherwise"
+        );
+        assert!(
+            cert.expires_at().is_some(),
+            "this session still knows its own expiry even though the write to disk failed"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

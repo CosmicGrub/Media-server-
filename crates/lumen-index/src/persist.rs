@@ -58,12 +58,30 @@ fn unescape(field: &str) -> String {
     out
 }
 
+/// `-` alone means "this field is empty" -- reserved for exactly that, which means a real field
+/// whose entire content genuinely is one literal hyphen (a file named `-`, a title reduced to one
+/// hyphen by some upstream parsing step) cannot be written as a bare `-` too, or it would read back
+/// as empty on the next load. `escape` never produces a bare `-` for anything except its own literal
+/// input `"-"` (any string containing a real backslash comes out with that backslash doubled), so
+/// `\-` is a safe, unambiguous stand-in reserved for exactly this one collision.
 fn field_or_dash(s: &str) -> String {
-    if s.is_empty() { "-".to_string() } else { escape(s) }
+    if s.is_empty() {
+        "-".to_string()
+    } else if s == "-" {
+        "\\-".to_string()
+    } else {
+        escape(s)
+    }
 }
 
 fn read_field(s: &str) -> String {
-    if s == "-" { String::new() } else { unescape(s) }
+    if s == "-" {
+        String::new()
+    } else if s == "\\-" {
+        "-".to_string()
+    } else {
+        unescape(s)
+    }
 }
 
 /// Field count for the original format (before `last_verified`/`mismatch_pending` existed) and for
@@ -100,7 +118,17 @@ fn record_to_line(r: &IndexRecord) -> String {
 /// throughout this codebase (`lumen-probe`'s truncation property, `verify_duplicate_group`'s
 /// per-file error handling). A corrupt line is dropped and rediscovered on the next reindex.
 fn line_to_record(line: &str) -> Option<IndexRecord> {
-    let f: Vec<&str> = line.splitn(FIELDS_CURRENT, '\t').collect();
+    // Unbounded, not `splitn(FIELDS_CURRENT, ..)` -- every field a real writer produces has its own
+    // tab characters escaped (see `escape`), so a well-formed line never contains more than 9 or 12
+    // real tabs to begin with. Capping the split at `FIELDS_CURRENT` would silently fold any *extra*
+    // real tabs a corrupted line happened to contain into the final field instead of rejecting it;
+    // an exact length check below catches that case instead. (A line truncated to exactly 9 real
+    // tabs is still indistinguishable from a genuine v1 line either way -- the two formats are
+    // deliberately prefix-compatible -- but that residual case degrades safely: the record is read
+    // back as "never verified", which is both the honest answer for what a truncated line actually
+    // proves and self-corrects on the very next `verify` pass, the highest-priority tier after an
+    // unresolved mismatch.)
+    let f: Vec<&str> = line.split('\t').collect();
     if f.len() != FIELDS_V1 && f.len() != FIELDS_CURRENT {
         return None;
     }
@@ -299,6 +327,70 @@ mod tests {
         assert_eq!(rec.probe.title, "A Movie");
         assert!(rec.last_verified.is_none(), "a v1 line predates verification entirely");
         assert!(!rec.mismatch_pending);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_title_that_is_literally_a_single_hyphen_round_trips_rather_than_becoming_empty() {
+        // Regression: `-` alone means "empty field"; a real field whose content genuinely is one
+        // hyphen used to be written as an indistinguishable bare `-` and read back as `""`.
+        let dir =
+            std::env::temp_dir().join(format!("lumen-index-hyphen-title-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("library.idx");
+
+        let mut index = Index::default();
+        index.insert_loaded(IndexRecord {
+            path: PathBuf::from("/library/-.mkv"),
+            fingerprint: FsFingerprint { device_id: 0, inode: 0, size: 0, mtime_ns: 0 },
+            probe: ProbeResult {
+                title: "-".into(),
+                year: None,
+                sketch: None,
+                needs_review: Some("-".into()),
+            },
+            tombstoned: false,
+            last_verified: None,
+            mismatch_pending: false,
+        });
+        save(&db, &index).unwrap();
+
+        let loaded = load(&db).unwrap();
+        let rec = loaded.all_including_tombstoned().next().unwrap();
+        assert_eq!(rec.path, PathBuf::from("/library/-.mkv"));
+        assert_eq!(rec.probe.title, "-", "a literal hyphen title must not become empty");
+        assert_eq!(rec.probe.needs_review.as_deref(), Some("-"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_line_with_more_real_tabs_than_any_valid_format_has_is_rejected_not_silently_folded() {
+        // Regression: `splitn(FIELDS_CURRENT, '\t')` capped the split at 13 pieces, so a corrupted
+        // line with extra real tabs past the 12th silently folded the remainder into the last field
+        // instead of being recognised as malformed.
+        let dir =
+            std::env::temp_dir().join(format!("lumen-index-extra-tabs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("library.idx");
+        // A well-formed 13-field line with one extra bare tab spliced into the last field.
+        std::fs::write(
+            &db,
+            format!(
+                "{HEADER} 3\n/ok/path\t1\t2\t3\t4\t-\tTitle\t-\t-\t0\t-\t-\t0\textra\n\
+                 /good/path\t1\t2\t3\t4\t-\tGood\t-\t-\t0\n"
+            ),
+        )
+        .unwrap();
+
+        let loaded = load(&db).unwrap();
+        assert_eq!(
+            loaded.all_including_tombstoned().count(),
+            1,
+            "the malformed line must be dropped, not misread with the extra tab folded in"
+        );
+        assert_eq!(loaded.all_including_tombstoned().next().unwrap().probe.title, "Good");
 
         std::fs::remove_dir_all(&dir).ok();
     }
