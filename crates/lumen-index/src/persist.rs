@@ -240,6 +240,35 @@ mod tests {
     }
 
     #[test]
+    fn field_or_dash_and_read_field_round_trip_the_dash_collision_they_exist_for() {
+        // `field_or_dash`'s own doc comment reasons at length about why a field whose entire content
+        // is one literal hyphen cannot be written as a bare `-` -- that would read back indistinguish-
+        // able from an empty field on the next load. Reasoned about in prose, but never actually
+        // exercised by a test: nothing here proved the `\-` stand-in the comment describes really
+        // survives a real round trip rather than, say, silently colliding with a field that happens to
+        // start with an escaped hyphen for some other reason.
+        for original in ["", "-", "\\-", "\\", "--", "-a", "a-", "a-b"] {
+            let written = field_or_dash(original);
+            let read_back = read_field(&written);
+            assert_eq!(read_back, original, "{original:?} wrote as {written:?}");
+        }
+        // The two reserved encodings must actually mean what the doc comment says they mean, not just
+        // round-trip through each other by coincidence.
+        assert_eq!(field_or_dash(""), "-", "empty must use the bare dash");
+        assert_eq!(
+            field_or_dash("-"),
+            "\\-",
+            "a literal dash must not collide with empty's own bare dash"
+        );
+        assert_eq!(read_field("-"), "", "a bare dash on disk must read back as empty");
+        assert_eq!(
+            read_field("\\-"),
+            "-",
+            "the escaped dash on disk must read back as a literal dash"
+        );
+    }
+
+    #[test]
     fn save_then_load_reproduces_every_record_field_for_field() {
         let dir = std::env::temp_dir().join(format!("lumen-index-persist-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
