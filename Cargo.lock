@@ -207,6 +207,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lumen-exec"
+version = "0.1.0"
+dependencies = [
+ "lumen-model",
+ "lumen-playback",
+ "lumen-probe",
+]
+
+[[package]]
 name = "lumen-identity"
 version = "0.1.0"
 dependencies = [
