@@ -143,6 +143,40 @@ impl AudioCodec {
     }
 }
 
+/// A still image, distinct from [`VideoCodec`] even where the underlying compression coincides
+/// (`Mjpeg` is a video codec because it is a sequence of frames; a JPEG cover embedded as a
+/// Matroska attachment, an MP4 `covr` atom, or an ID3 `APIC` frame is one image, never decoded
+/// through the video pipeline at all). Conflating the two would make an embedded cover show up as
+/// a spurious video track.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ImageCodec {
+    Jpeg,
+    Png,
+    Gif,
+    Bmp,
+    WebP,
+    Other(String),
+}
+
+impl ImageCodec {
+    /// Guess from a filename extension, the same "never trust the declared MIME type" stance
+    /// `docs/12` §2.7 already takes for font attachments — muxers get MIME wrong constantly, but an
+    /// extension is what the person who embedded the file actually chose.
+    pub fn from_extension(name: &str) -> Option<Self> {
+        let lower = name.to_ascii_lowercase();
+        let ext = lower.rsplit('.').next()?;
+        Some(match ext {
+            "jpg" | "jpeg" | "jfif" => Self::Jpeg,
+            "png" => Self::Png,
+            "gif" => Self::Gif,
+            "bmp" => Self::Bmp,
+            "webp" => Self::WebP,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SubtitleCodec {
@@ -213,6 +247,16 @@ mod tests {
             assert_eq!(core.extractable_core(), None, "cores must not chain");
         }
         assert_eq!(AudioCodec::Flac.extractable_core(), None);
+    }
+
+    #[test]
+    fn image_codec_is_guessed_from_the_extension_case_insensitively() {
+        assert_eq!(ImageCodec::from_extension("cover.jpg"), Some(ImageCodec::Jpeg));
+        assert_eq!(ImageCodec::from_extension("COVER.JPEG"), Some(ImageCodec::Jpeg));
+        assert_eq!(ImageCodec::from_extension("folder.png"), Some(ImageCodec::Png));
+        assert_eq!(ImageCodec::from_extension("art.webp"), Some(ImageCodec::WebP));
+        assert_eq!(ImageCodec::from_extension("font.ttf"), None, "not an image extension");
+        assert_eq!(ImageCodec::from_extension("no-extension"), None);
     }
 
     #[test]

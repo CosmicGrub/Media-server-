@@ -13,7 +13,7 @@ mod container;
 mod source;
 mod stream;
 
-pub use codec::{AudioCodec, Codec, SubtitleCodec, VideoCodec};
+pub use codec::{AudioCodec, Codec, ImageCodec, SubtitleCodec, VideoCodec};
 pub use color::{
     ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, HdrFormat, MasteringDisplay,
 };

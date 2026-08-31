@@ -114,6 +114,13 @@ pub struct MatroskaLayout {
     /// bytes, never by MIME, because muxers emit wrong MIME types constantly.
     pub attachments: Vec<String>,
     pub font_attachment_count: usize,
+    /// Attachments recognised as images by extension -- a Matroska cover is carried exactly like a
+    /// font attachment, just under `cover.jpg`/`folder.png` instead of a font filename. Same "never
+    /// trust the declared MIME" stance as fonts (§2.7).
+    pub image_attachment_count: usize,
+    /// The codec of the first recognised image attachment, if any -- enough to know a cover exists
+    /// and what format it is without reading `FileData`, which this structural reader never does.
+    pub cover_art_codec: Option<lumen_model::ImageCodec>,
     /// Ordered-chapter edition present: a virtual timeline must be built before playback (§2.4).
     pub has_ordered_edition: bool,
     /// Hard linking via `ChapterSegmentUUID`, or an entire linked edition via
@@ -370,6 +377,10 @@ fn walk(r: &mut Reader<'_>, layout: &mut MatroskaLayout, depth: u8) {
                     if looks_like_font(&name) {
                         layout.font_attachment_count += 1;
                     }
+                    if let Some(codec) = lumen_model::ImageCodec::from_extension(&name) {
+                        layout.image_attachment_count += 1;
+                        layout.cover_art_codec.get_or_insert(codec);
+                    }
                     layout.attachments.push(name);
                 }
             }
@@ -575,6 +586,28 @@ mod tests {
         let l = analyze(&file(&matroska_header(), &elem(ID_ATTACHMENTS, &attachments))).unwrap();
         assert_eq!(l.attachments.len(), 4);
         assert_eq!(l.font_attachment_count, 2, "both fonts found despite wrong MIME types");
+        assert_eq!(l.image_attachment_count, 1, "the cover, despite the readme and two fonts");
+        assert_eq!(l.cover_art_codec, Some(lumen_model::ImageCodec::Jpeg));
+    }
+
+    #[test]
+    fn a_wrongly_mimed_cover_is_still_found_by_extension() {
+        // Same principle as fonts: a muxer's declared MIME is not trusted.
+        let mut body = str_elem(ID_FILE_NAME, "folder.png");
+        body.extend(str_elem(ID_FILE_MIME_TYPE, "application/octet-stream"));
+        let attachments = elem(ID_ATTACHED_FILE, &body);
+        let l = analyze(&file(&matroska_header(), &elem(ID_ATTACHMENTS, &attachments))).unwrap();
+        assert_eq!(l.image_attachment_count, 1);
+        assert_eq!(l.cover_art_codec, Some(lumen_model::ImageCodec::Png));
+    }
+
+    #[test]
+    fn no_image_attachments_means_no_cover_art_claim() {
+        let body = str_elem(ID_FILE_NAME, "Roboto-Bold.ttf");
+        let attachments = elem(ID_ATTACHED_FILE, &body);
+        let l = analyze(&file(&matroska_header(), &elem(ID_ATTACHMENTS, &attachments))).unwrap();
+        assert_eq!(l.image_attachment_count, 0);
+        assert_eq!(l.cover_art_codec, None);
     }
 
     #[test]
