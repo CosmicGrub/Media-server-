@@ -11,6 +11,7 @@ members = [
     "crates/lumen-subs",
     "crates/lumen-index",
     "crates/lumen-play",
+    "crates/lumen-discovery",
     "spikes/s1-compositing",
 ]
 
