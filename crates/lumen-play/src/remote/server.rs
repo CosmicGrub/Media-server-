@@ -44,6 +44,15 @@ const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// How often the driver thread re-reads mpv's own properties to build the next `PlaybackState`.
 const MPV_POLL_INTERVAL: Duration = Duration::from_millis(400);
 
+/// The per-property deadline `read_state` gives each of its own polls, deliberately far short of
+/// `ipc::Mpv::command`'s own five-second default. `drive_mpv` is single-threaded: this poll and
+/// every client's own commands (a `Play` a client is actively waiting on, most importantly) share
+/// the same loop, so a slow reply to a routine background poll must never be allowed to block a
+/// real command for anywhere near as long as that command's own generous budget. A stale poll
+/// reading back as "unknown" for one 400ms cycle is a far smaller cost than a client's command
+/// appearing to hang for seconds.
+const STATE_POLL_PROPERTY_TIMEOUT: Duration = Duration::from_millis(500);
+
 type TlsStream = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
 /// A request from a client thread to the mpv driver thread, with its own private reply channel —
@@ -362,15 +371,25 @@ fn execute(mpv: &mut Mpv, body: CommandBody) -> Result<ReplyBody, String> {
 }
 
 fn read_state(mpv: &mut Mpv) -> PlaybackState {
-    let path = mpv.get_string("path");
+    let path = mpv.get_string_timeout("path", STATE_POLL_PROPERTY_TIMEOUT);
     let Some(path) = path else {
         return PlaybackState { now_playing: None, library_version: 0 };
     };
-    let title = mpv.get_string("media-title").unwrap_or_else(|| path.clone());
-    let duration_ms = (mpv.get_f64("duration").unwrap_or(0.0) * 1000.0) as i64;
-    let position_ms = (mpv.get_f64("time-pos").unwrap_or(0.0) * 1000.0) as i64;
-    let paused = mpv.get("pause").and_then(|v| v.as_bool()).unwrap_or(false);
-    let volume = mpv.get_f64("volume").unwrap_or(100.0).clamp(0.0, 100.0) as u8;
+    let title = mpv
+        .get_string_timeout("media-title", STATE_POLL_PROPERTY_TIMEOUT)
+        .unwrap_or_else(|| path.clone());
+    let duration_ms = (mpv.get_f64_timeout("duration", STATE_POLL_PROPERTY_TIMEOUT).unwrap_or(0.0)
+        * 1000.0) as i64;
+    let position_ms = (mpv.get_f64_timeout("time-pos", STATE_POLL_PROPERTY_TIMEOUT).unwrap_or(0.0)
+        * 1000.0) as i64;
+    let paused = mpv
+        .get_timeout("pause", STATE_POLL_PROPERTY_TIMEOUT)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let volume = mpv
+        .get_f64_timeout("volume", STATE_POLL_PROPERTY_TIMEOUT)
+        .unwrap_or(100.0)
+        .clamp(0.0, 100.0) as u8;
     PlaybackState {
         now_playing: Some(NowPlaying { path, title, duration_ms, position_ms, paused, volume }),
         library_version: 0,
