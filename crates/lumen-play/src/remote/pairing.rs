@@ -220,15 +220,11 @@ impl TokenStore {
 }
 
 /// A minimal `dirs`-shaped lookup, hand-written rather than pulling in the crate for one path on
-/// three platforms. `pub(crate)` rather than private: `tls.rs` needs the same directory for the
+/// two platforms. `pub(crate)` rather than private: `tls.rs` needs the same directory for the
 /// persisted server certificate, which belongs beside the token store for the same reason.
 pub(crate) fn dirs_next_config_dir() -> PathBuf {
     if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
-    } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
-            .unwrap_or_else(std::env::temp_dir)
     } else {
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| {
             std::env::var_os("HOME")

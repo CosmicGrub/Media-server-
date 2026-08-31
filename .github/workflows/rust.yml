@@ -2,10 +2,12 @@ name: Rust
 
 # Tests, lints and formatting for the Rust workspace — the desktop player and every crate under it.
 #
-# Runs on all three desktop platforms because the player is platform-specific in exactly the places
-# that matter: the mpv IPC transport is a Unix socket on Linux/macOS and a named pipe on Windows,
-# the environment probe shells out to different tools per OS, and path handling differs. A
-# Linux-only CI would let a Windows-only break reach a release unnoticed.
+# Windows and Linux only: this is primarily a Windows-targeted player, with Linux support kept for
+# the distros it actually ships to (Steam Deck/SteamOS-style handhelds, Arch- and Ubuntu-derived
+# desktops). Runs on both because the player is platform-specific in exactly the places that
+# matter: the mpv IPC transport is a Unix socket on Linux and a named pipe on Windows, the
+# environment probe shells out to different tools per OS, and path handling differs. A Linux-only
+# CI would let a Windows-only break reach a release unnoticed.
 
 on:
   push:
@@ -19,9 +21,9 @@ on:
 
   # No `pull_request` trigger: every PR in this repo is a same-repo branch -> main (or -> the shared
   # development branch), so `push` above already runs this exact commit's checks. A `pull_request` run
-  # would be a second full three-platform matrix, on paid-tier Windows/macOS runners, for the same
-  # commit and the same answer -- see `release.yml`'s `on:` block for the fuller version of this
-  # reasoning, which applies here identically.
+  # would be a second full two-platform matrix, on a paid-tier Windows runner, for the same commit
+  # and the same answer -- see `release.yml`'s `on:` block for the fuller version of this reasoning,
+  # which applies here identically.
 
 # Every `runs-on` below is a repo variable with a hosted-runner fallback (`vars.X || 'x-latest'`), not
 # a hardcoded label. Hosted-runner *allocation* itself can be blocked account-wide -- spend limit
@@ -66,8 +68,6 @@ jobs:
             runner: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
           - os: windows-latest
             runner: ${{ vars.LUMEN_RUNNER_WINDOWS || 'windows-latest' }}
-          - os: macos-latest
-            runner: ${{ vars.LUMEN_RUNNER_MACOS || 'macos-latest' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -86,16 +86,11 @@ jobs:
       # real on any GitHub-hosted runner: nothing before this line ever put mpv on PATH. Installing
       # it here, before Build/Test, is what turns "compiles, and the test didn't complain" into
       # "a real mpv process was actually driven end to end."
-      - name: Install mpv (Linux/macOS)
-        if: matrix.os != 'windows-latest'
-        shell: bash
+      - name: Install mpv (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: |
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq mpv
-          else
-            brew install mpv
-          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mpv
 
       - name: Build
         run: cargo build --workspace --all-targets
@@ -105,8 +100,8 @@ jobs:
 
       # On windows-latest mpv is still absent here (the fetch happens further down), which is itself
       # worth exercising: `doctor` must report the absence and exit 2 rather than panicking. On
-      # Linux/macOS mpv is already installed above, so `doctor` finding it and exiting 0 is the
-      # expected outcome there instead -- either is accepted below, per platform.
+      # Linux mpv is already installed above, so `doctor` finding it and exiting 0 is the expected
+      # outcome there instead -- either is accepted below, per platform.
       - name: Smoke test the CLI
         shell: bash
         run: |
@@ -178,8 +173,8 @@ jobs:
       # The step above deliberately runs before mpv is on PATH, so it exercises `lumen setup`'s own
       # download path rather than short-circuiting on "mpv is already available". Only now, with
       # `target/debug/mpv.exe` fetched and proven, is it safe to put it on PATH and re-run
-      # `remote_serve.rs` for real -- it self-skips otherwise, the same silent gap Linux and macOS
-      # had before mpv was installed for them above. This is the Windows leg of the same fix.
+      # `remote_serve.rs` for real -- it self-skips otherwise, the same silent gap Linux had before
+      # mpv was installed for it above. This is the Windows leg of the same fix.
       - name: Put the fetched mpv on PATH and re-run the real-mpv integration test (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh

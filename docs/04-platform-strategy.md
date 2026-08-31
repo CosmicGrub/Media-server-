@@ -3,6 +3,12 @@
 One shared Rust core. Native shells. This document is the per-platform implementation plan, the honest capability
 matrix, and the build/distribution mechanics.
 
+**Current priority: Windows first, with Linux support kept for the distros it actually ships to
+(Steam Deck/SteamOS-style handhelds, Arch- and Ubuntu-derived desktops).** macOS/Apple platforms
+are out of scope for the actively-built desktop player and its CI for now — the sections below
+that cover them are the original, broader strategic exploration and are kept as reference for a
+possible future revisit, not a description of what is currently being built or tested.
+
 ## 1. The sharing model
 
 ```

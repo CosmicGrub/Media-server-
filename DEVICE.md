@@ -47,10 +47,10 @@ under Wine on a machine with no GPU. Real GPU rendering, on either build path, r
   alongside `lumen.exe`, and `START-HERE.txt` documents it as step 6.
 - The rest of `crates/`, `spikes/`, and the CI workflows here are currently identical to the
   development branch at the point this fork diverged — the Rust workspace already builds for
-  Linux, macOS and Windows from the same source (`.github/workflows/rust.yml`'s three-platform
-  matrix), so there was never a reason to fork *that* three ways. What this fork is for is a place
-  to land genuinely Windows-specific tooling like the task-scheduler script above, without it
-  needing to make sense on a phone.
+  Linux and Windows from the same source (`.github/workflows/rust.yml`'s two-platform matrix), so
+  there was never a reason to fork *that* two ways. What this fork is for is a place to land
+  genuinely Windows-specific tooling like the task-scheduler script above, without it needing to
+  make sense on a phone.
 
 ## How this Windows PC fits with the two Android forks
 

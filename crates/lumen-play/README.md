@@ -9,9 +9,9 @@ library is also the first real test of that code on data that is not a fixture.
 
 ## Install
 
-**Download a build.** `.github/workflows/release.yml` produces one per platform — Windows,
-Linux, and both Mac architectures — on every `v*` tag, and on demand via workflow dispatch. Grab
-the artifact for your platform from the Actions run and unpack it.
+**Download a build.** `.github/workflows/release.yml` produces one per platform — Windows and
+Linux — on every `v*` tag, and on demand via workflow dispatch. Grab the artifact for your
+platform from the Actions run and unpack it.
 
 The **Windows** bundle is self-contained: `lumen.exe`'s C runtime is statically linked
 (`target-feature=+crt-static`, see `.cargo/config.toml`), so it needs no Visual C++ Redistributable
@@ -21,22 +21,21 @@ claims are checked in `release.yml` on every build — the binary's import table
 VCRUNTIME/MSVCP dependency, and mpv's own reported decoder list for the full codec set, TrueHD and
 DTS-HD MA included — rather than assumed to still hold from an earlier release.
 
-**Linux and macOS** are self-contained too, the same way Windows is, just with different tools:
-mpv is vendored beside `lumen`, along with the codec/format/subtitle layer a bare OS install does
-not already have (FFmpeg, libx264/x265, dav1d, libass, and the rest). What is deliberately *not*
+**Linux** is self-contained too, the same way Windows is, just with different tools: mpv is
+vendored beside `lumen`, along with the codec/format/subtitle layer a bare OS install does not
+already have (FFmpeg, libx264/x265, dav1d, libass, and the rest). What is deliberately *not*
 vendored is GL/Vulkan/VA-API, the display server, the audio server, and the security/identity stack
 — those have to be this machine's own, or hardware decode, window rendering, audio routing and
 certificate validation would all be running against a frozen copy nothing ever updates. `lumen`
 finds the vendored copy the same way it finds a bundled Windows one — beside its own executable,
 checked first. `release.yml` proves the vendored pair actually decodes a file, with
-`LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` unset, on every build.
+`LD_LIBRARY_PATH` unset, on every build.
 
-No mpv on the machine and building your own bundle instead of downloading one? Same one prerequisite
-either way, to vendor *from*:
+No mpv on the machine and building your own bundle instead of downloading one? One prerequisite,
+to vendor *from*:
 
 ```bash
-#   macOS     brew install mpv
-#   Linux     apt install mpv     (or dnf / pacman / zypper)
+apt install mpv     # or dnf / pacman / zypper
 ```
 
 **Or build it yourself:**
@@ -50,7 +49,6 @@ Building a bundle with mpv vendored in, on the platform you're building for:
 
 ```bash
 ./crates/lumen-play/package-linux.sh --with-mpv    # -> dist/lumen-linux-x86_64.tar.gz  (needs patchelf)
-./crates/lumen-play/package-macos.sh  --with-mpv    # -> dist/lumen-macos-<arch>.tar.gz
 ```
 
 Cross-compiling a Windows bundle from Linux, which is how the first one was made:
@@ -193,9 +191,9 @@ that substring matching gets wrong silently.
 
 ## Status
 
-CI runs tests, clippy and rustfmt on Linux, macOS and Windows for every push, plus the ADR-0002
-licence gate. The platform matrix is not decoration: the mpv IPC transport is a Unix socket on one
-and a named pipe on the other, and the environment probe shells out to different tools per OS.
+CI runs tests, clippy and rustfmt on Linux and Windows for every push, plus the ADR-0002 licence
+gate. The platform matrix is not decoration: the mpv IPC transport is a Unix socket on one and a
+named pipe on the other, and the environment probe shells out to different tools per OS.
 
 96 tests in this crate and 474 across the workspace, plus end-to-end runs against real encoded media.
 

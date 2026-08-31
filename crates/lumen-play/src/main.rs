@@ -591,7 +591,7 @@ fn setup() -> ExitCode {
     let dir = exe.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
 
     if !cfg!(windows) {
-        // On Linux and macOS the package manager is the right answer and needs no help from here.
+        // On Linux the package manager is the right answer and needs no help from here.
         println!("{}", mpvbin::install_hint());
         return ExitCode::from(2);
     }

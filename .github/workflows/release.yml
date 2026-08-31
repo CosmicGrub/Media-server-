@@ -1,10 +1,12 @@
 name: Desktop release
 
-# Builds the desktop player for Windows, Linux and macOS. Every push that touches the player
-# publishes a rolling `desktop-latest` release with all four platform bundles attached — the same
-# pattern `android.yml` uses for the phone build (`android-latest`), so there is one stable URL for
-# whatever this repository currently builds, on every platform, rather than having to know which
-# Actions run is current. `v*` tags and `workflow_dispatch` still work too, for a pinned build.
+# Builds the desktop player for Windows and Linux -- primarily a Windows-targeted player, with
+# Linux kept for the distros it actually ships to (Steam Deck/SteamOS-style handhelds, Arch- and
+# Ubuntu-derived desktops). Every push that touches the player publishes a rolling `desktop-latest`
+# release with both platform bundles attached — the same pattern `android.yml` uses for the phone
+# build (`android-latest`), so there is one stable URL for whatever this repository currently
+# builds, on every platform, rather than having to know which Actions run is current. `v*` tags and
+# `workflow_dispatch` still work too, for a pinned build.
 #
 # Built natively on each runner rather than cross-compiled from one. Cross-compiling to Windows
 # works — `crates/lumen-play/package-windows.sh` does it — but it silently skips the Windows-only
@@ -12,8 +14,8 @@ name: Desktop release
 # `#[cfg(windows)]` on a Linux host and fails to link on a real one.
 #
 # Verified end to end via PR #2 (device/windows-pc → main), opened specifically to get this running
-# on real windows-latest/ubuntu-latest/macos-latest runners rather than staying theoretical: all four
-# platform legs green, including the CRT-static and codec-coverage checks below.
+# on real windows-latest/ubuntu-latest runners rather than staying theoretical: both platform legs
+# green, including the CRT-static and codec-coverage checks below.
 
 on:
   push:
@@ -29,14 +31,14 @@ on:
   workflow_dispatch:
     inputs:
       bundle_mpv:
-        description: 'Bundle mpv into every platform archive (adds ~30 MB on Windows, ~150 MB on Linux/macOS)'
+        description: 'Bundle mpv into every platform archive (adds ~30 MB on Windows, ~150 MB on Linux)'
         type: boolean
         default: true
 
   # No `pull_request` trigger here on purpose. This workflow's PRs are same-repo branch -> main
   # (device/windows-pc -> main, the device forks' own pattern), never a fork, so a `pull_request` run
   # would build and verify the *exact same commit* the `push` trigger above already does for that
-  # branch — a second full Windows/macOS/Linux matrix, on paid-tier runners, for zero new information.
+  # branch — a second full Windows/Linux matrix, on a paid-tier runner, for zero new information.
   # `publish`'s own gate (`github.ref == 'refs/heads/device/windows-pc'`) never even matches a
   # `pull_request` event's ref (`refs/pull/N/merge`), so that half of the job was always a no-op on a
   # PR run too. `push` alone covers every commit that matters; a fork PR wanting this workflow's
@@ -47,8 +49,8 @@ permissions:
 
 # Cancel a still-running or still-queued run for the same branch the moment a newer push arrives.
 # Without this, pushing three fixes in the five minutes it takes windows-latest to build lets all
-# three burn a full paid-tier Windows/macOS matrix to completion — only the last one's result was
-# ever going to matter, and the other two were purely wasted minutes. Scoped to the ref, not the
+# three burn a full paid-tier Windows matrix to completion — only the last one's result was ever
+# going to matter, and the other two were purely wasted minutes. Scoped to the ref, not the
 # workflow, so device/windows-pc and device/galaxy-tab-s9-fe pushing at the same moment don't cancel
 # each other.
 concurrency:
@@ -62,9 +64,8 @@ jobs:
   build:
     name: ${{ matrix.name }}
     # `matrix.os` stays the logical platform id (steps below key off it); `matrix.runner` is the
-    # actual label. Both macOS legs share `LUMEN_RUNNER_MACOS` since a self-hosted Mac can build
-    # both targets natively/cross just like `macos-latest` does. See rust.yml's `on:` block comment
-    # and `.github/SELF_HOSTED_RUNNERS.md` for why this exists and how to point it at a real machine.
+    # actual label. See rust.yml's `on:` block comment and `.github/SELF_HOSTED_RUNNERS.md` for why
+    # this exists and how to point it at a real machine.
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -79,17 +80,6 @@ jobs:
             os: ubuntu-latest
             runner: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
             target: x86_64-unknown-linux-gnu
-            bin: lumen
-          - name: macos-aarch64
-            os: macos-latest
-            runner: ${{ vars.LUMEN_RUNNER_MACOS || 'macos-latest' }}
-            target: aarch64-apple-darwin
-            bin: lumen
-          # Intel Macs are still in use and the runner can target them from the same host.
-          - name: macos-x86_64
-            os: macos-latest
-            runner: ${{ vars.LUMEN_RUNNER_MACOS || 'macos-latest' }}
-            target: x86_64-apple-darwin
             bin: lumen
 
     steps:
@@ -107,20 +97,15 @@ jobs:
         run: cargo build --release -p lumen-play --target ${{ matrix.target }}
 
       # A release binary that was never run is a release binary nobody has tested. `--version` is
-      # the cheapest possible proof that it links and starts on this platform.
+      # the cheapest possible proof that it links and starts on this platform. Every leg here builds
+      # natively for its own runner, so there is no cross-target case to skip.
       - name: Verify the binary runs
         shell: bash
         run: |
           set -euo pipefail
           BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
           ls -l "$BIN"
-          # Skip execution when the target is not the host — an aarch64 binary will not run on the
-          # x86_64 runner, and failing there would be a false negative.
-          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
-            echo "cross-target build; skipping execution"
-          else
-            "$BIN" --version
-          fi
+          "$BIN" --version
 
       # `.cargo/config.toml` statically links the MSVC CRT for this target specifically, so
       # lumen.exe needs no Visual C++ Redistributable on the machine that runs it — checked here
@@ -268,13 +253,13 @@ jobs:
           }
           Write-Host 'OK -- full video and audio codec set present, including TrueHD and DTS-HD MA (dca)'
 
-      # Linux and macOS get the same self-containment guarantee Windows already has, by the same
+      # Linux gets the same self-containment guarantee Windows already has, by the same
       # evidence-over-assumption standard as everything above: vendor mpv and the libraries a bare
       # install of this OS does not already have (the codec/format/subtitle layer), leave the ones
       # that must track the host alone (GL/Vulkan/VA-API, the display server, the audio server, the
-      # security/identity stack -- see `vendor-mpv-linux.sh` / `vendor-mpv-macos.sh` for the full
-      # reasoning), and prove it by actually decoding a file with the dynamic loader's own search
-      # path variable unset, so only what was just vendored can possibly have answered.
+      # security/identity stack -- see `vendor-mpv-linux.sh` for the full reasoning), and prove it
+      # by actually decoding a file with the dynamic loader's own search path variable unset, so
+      # only what was just vendored can possibly have answered.
       - name: Bundle mpv (Linux)
         if: matrix.os == 'ubuntu-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
         shell: bash
@@ -283,25 +268,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq mpv patchelf
           ./crates/lumen-play/vendor-mpv-linux.sh "dist/lumen-${{ matrix.name }}"
-
-      - name: Bundle mpv (macOS)
-        if: matrix.os == 'macos-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # `brew install mpv` installs a binary matching the *runner's* architecture. Every
-          # macos-latest runner is arm64, so on the macos-x86_64 leg (cross-compiled from that same
-          # host -- see "Verify the binary runs" above) that would vendor an arm64 mpv beside an
-          # x86_64 lumen: two binaries that cannot run together on any real machine. Vendoring an
-          # x86_64 mpv would mean a second, Rosetta-hosted Homebrew prefix, which nothing here has
-          # set up or proven -- shipping without a bundled mpv on this one leg is the honest choice
-          # over shipping one that is silently wrong.
-          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
-            echo "cross-target build on an arm64 runner; a native arm64 brew install cannot supply an x86_64 mpv, so this leg ships unbundled -- see START-HERE.txt"
-            exit 0
-          fi
-          brew install mpv
-          ./crates/lumen-play/vendor-mpv-macos.sh "dist/lumen-${{ matrix.name }}"
 
       # Everything above proves the binary starts and the codec list mpv reports looks right.
       # Neither proves a file actually plays -- android.yml's `emulator` job boots a real device and
@@ -319,14 +285,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Same cross-target case as "Verify the binary runs" and "Bundle mpv (macOS)" above: an
-          # x86_64 binary built on the arm64 runner cannot execute here, and this leg has no bundled
-          # mpv to pair it with either.
-          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
-            echo "cross-target build; skipping execution"
-            exit 0
-          fi
-
           OUT="dist/lumen-${{ matrix.name }}"
           BIN="$OUT/${{ matrix.bin }}"
           PROBE="${RUNNER_TEMP:-/tmp}/lumen-probe.mkv"
@@ -447,7 +405,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # No `name:` filter: pulls every platform's artifact from the matrix build into its own
-      # subdirectory. The release should carry all four bundles or none — a partial rolling release
+      # subdirectory. The release should carry both bundles or none — a partial rolling release
       # would look complete while quietly missing whichever platform's asset never made it in.
       - name: Download every platform's build
         uses: actions/download-artifact@v4
@@ -463,7 +421,7 @@ jobs:
 
           # Flatten out of the per-artifact subdirectories actions/download-artifact created.
           find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} . \;
-          ASSETS=(lumen-windows-x86_64.zip lumen-linux-x86_64.tar.gz lumen-macos-aarch64.tar.gz lumen-macos-x86_64.tar.gz)
+          ASSETS=(lumen-windows-x86_64.zip lumen-linux-x86_64.tar.gz)
           for a in "${ASSETS[@]}"; do
             [ -f "$a" ] || { echo "expected asset $a is missing from the build; refusing to publish a partial release" >&2; exit 1; }
           done
@@ -471,14 +429,14 @@ jobs:
 
           NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
 
-          Four platform bundles from the same commit: Windows, Linux, and both Mac architectures —
-          all four self-contained, nothing to install. \`lumen.exe\`'s C runtime is statically linked
-          (no Visual C++ Redistributable needed); every platform's mpv ships beside its \`lumen\`,
-          full codec set included (TrueHD and DTS-HD MA covered). On Linux/macOS that means the
-          codec/format/subtitle layer is vendored while GL/Vulkan, the display server, the audio
-          server and the security stack still come from this machine, the same as any other app —
-          see each bundle's \`START-HERE.txt\`. All of it checked on this exact build by actually
-          decoding a file, not assumed to still hold from an earlier release.
+          Two platform bundles from the same commit: Windows and Linux — both self-contained,
+          nothing to install. \`lumen.exe\`'s C runtime is statically linked (no Visual C++
+          Redistributable needed); every platform's mpv ships beside its \`lumen\`, full codec set
+          included (TrueHD and DTS-HD MA covered). On Linux that means the codec/format/subtitle
+          layer is vendored while GL/Vulkan, the display server, the audio server and the security
+          stack still come from this machine, the same as any other app — see each bundle's
+          \`START-HERE.txt\`. All of it checked on this exact build by actually decoding a file, not
+          assumed to still hold from an earlier release.
 
           This is a development build, not a versioned release."
 
