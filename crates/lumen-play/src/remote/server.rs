@@ -18,6 +18,7 @@
 //! old writer thread's independent polling tick.
 
 mod http;
+mod vr;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

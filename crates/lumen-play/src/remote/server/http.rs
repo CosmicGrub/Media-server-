@@ -135,6 +135,15 @@ fn handle_request(tls: &mut TlsStream, req: &HttpRequest, ctx: &ServerContext) {
         write_error(tls, 405, "Method Not Allowed");
         return;
     }
+
+    // Needs no token: the page is the same static bytes for everyone and does nothing without a
+    // valid `path`+`token` of its own, at which point it only ever requests `/stream/<path>` -- the
+    // one place a token is actually checked. See `vr`'s own module doc for the full reasoning.
+    if req.path == "/vr" {
+        write_ok(tls, "text/html; charset=\"utf-8\"", super::vr::PAGE.as_bytes());
+        return;
+    }
+
     let Some(requested) = req.path.strip_prefix("/stream/") else {
         write_error(tls, 404, "Not Found");
         return;
@@ -276,6 +285,19 @@ fn write_range_not_satisfiable(tls: &mut TlsStream, total_len: u64) {
         body.len()
     );
     let _ = tls.write_all(head.as_bytes());
+}
+
+/// A whole in-memory response body in one shot -- only for the static `/vr` shell, which is small
+/// and fixed, not the general-purpose path `serve_file` already owns for range-aware file streaming.
+fn write_ok(tls: &mut TlsStream, content_type: &str, body: &[u8]) {
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    if tls.write_all(head.as_bytes()).is_ok() {
+        let _ = tls.write_all(body);
+    }
 }
 
 fn write_error(tls: &mut TlsStream, code: u16, reason: &str) {

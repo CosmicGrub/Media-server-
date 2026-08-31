@@ -639,7 +639,11 @@ mod tests {
     fn percent_decoding_handles_spaces_and_leaves_a_bad_escape_literal() {
         assert_eq!(percent_decode("a%20b"), "a b");
         assert_eq!(percent_decode("no-escapes"), "no-escapes");
-        assert_eq!(percent_decode("bad%"), "bad%", "a truncated escape passes through, not a panic");
+        assert_eq!(
+            percent_decode("bad%"),
+            "bad%",
+            "a truncated escape passes through, not a panic"
+        );
         assert_eq!(percent_decode("bad%zz"), "bad%zz", "non-hex digits pass through literally");
     }
 

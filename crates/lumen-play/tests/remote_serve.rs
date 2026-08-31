@@ -577,6 +577,20 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let (status, _, _) = read_http_response(&mut anon);
     assert_eq!(status, 401, "streaming without a token must be refused");
 
+    // Tier 3d: the VR cinema shell is the same static bytes for anyone, no token required to fetch
+    // the page itself -- only the `/stream/<path>` URL it builds client-side is ever checked.
+    let mut vr = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    vr.write_all(b"GET /vr HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (status, headers, body) = read_http_response(&mut vr);
+    assert_eq!(status, 200, "the VR shell needs no token to fetch");
+    assert!(
+        headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("html")),
+        "expected an HTML content-type, got {headers:?}"
+    );
+    let page = String::from_utf8(body).expect("the VR page must be valid UTF-8");
+    assert!(page.contains("requestSession"), "the page must actually request an XR session");
+    assert!(page.contains("/stream/"), "the page must build a /stream/ URL, not invent a new one");
+
     let _ = server.kill();
     let _ = server.wait();
 }
