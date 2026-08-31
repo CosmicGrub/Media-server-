@@ -41,6 +41,11 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "target",
 ];
 
+/// Directory names that mark a disc structure. `docs/05` §_ (server-library): "Disc structures
+/// (`BDMV/`, `VIDEO_TS/`) are recognised as *one item*, not hundreds of `.m2ts` files." Matched
+/// case-insensitively, mirroring every other name-based check in this scanner.
+const DISC_STRUCTURE_DIRS: &[&str] = &["BDMV", "VIDEO_TS"];
+
 /// Extensions that are sidecar subtitles rather than playable media.
 pub(crate) const SUBTITLE_EXTS: &[&str] = &["srt", "ass", "ssa", "sub", "idx", "vtt", "sup", "smi"];
 
@@ -238,6 +243,48 @@ fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
     let n = f.read(&mut buf)?;
     buf.truncate(n);
     Ok(buf)
+}
+
+/// Build the single [`ScannedFile`] representing a disc structure, from the folder it was found in
+/// (`title_dir`, whose name is what a real rip is conventionally named after) and the `BDMV`/
+/// `VIDEO_TS` marker directory itself (`disc_dir`, used only for its total size).
+fn disc_structure(title_dir: &Path, disc_dir: &Path) -> ScannedFile {
+    let name = title_dir.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    ScannedFile {
+        path: title_dir.to_path_buf(),
+        size: dir_total_size(disc_dir),
+        extension: None,
+        kind: MediaKind::Video,
+        container: Some(Container::DiscStructure),
+        confidence: Some(Confidence::Certain),
+        evidence: Some("BDMV/VIDEO_TS directory structure"),
+        extension_mismatch: false,
+        unidentified: false,
+        // A disc structure has no single byte stream to sketch; content identity for it is out of
+        // scope here regardless of `--identify`.
+        identity: None,
+        parsed: lumen_match::parse(&name),
+    }
+}
+
+/// Sum of file sizes under `path`, recursively. Best-effort: an unreadable entry contributes 0
+/// rather than aborting the sum, the same "one bad folder must not sink the scan" stance `walk`
+/// itself takes.
+fn dir_total_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total += dir_total_size(&entry.path());
+        } else if let Ok(m) = entry.metadata() {
+            total += m.len();
+        }
+    }
+    total
 }
 
 /// Content identity for one file.
@@ -467,6 +514,14 @@ fn walk(dir: &Path, depth: usize, opts: &ScanOptions, out: &mut Scan) {
         }
         if ft.is_dir() {
             if SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) || name.starts_with('.') {
+                continue;
+            }
+            // A disc structure is one playable item, not a pile of `.m2ts`/`.vob` fragments. The
+            // title lives on `dir` (the folder a real rip is conventionally named after), not on
+            // `BDMV`/`VIDEO_TS` itself, so the synthesized entry points at the parent and the whole
+            // subtree is skipped rather than walked file by file.
+            if DISC_STRUCTURE_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                out.files.push(disc_structure(dir, &path));
                 continue;
             }
             walk(&path, depth + 1, opts, out);
@@ -805,6 +860,64 @@ mod tests {
             "{:?}",
             s.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_video_ts_folder_is_one_item_not_a_pile_of_vobs() {
+        // docs/05 §_ (server-library): recognised as *one item*, not hundreds of `.m2ts`/`.vob`
+        // files. A real DVD rip splits a single title across several VOBs at the old FAT32 limit.
+        let d = TempDir::new("videots");
+        d.file("Interstellar (2014)/VIDEO_TS/VTS_01_1.VOB", &[0u8; 1_000_000]);
+        d.file("Interstellar (2014)/VIDEO_TS/VTS_01_2.VOB", &[0u8; 1_000_000]);
+        d.file("Interstellar (2014)/VIDEO_TS/VIDEO_TS.IFO", &[0u8; 1_000]);
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert_eq!(
+            s.playable().count(),
+            1,
+            "{:?}",
+            s.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+
+        let disc = &s.files[0];
+        assert!(disc.path.ends_with("Interstellar (2014)"), "{:?}", disc.path);
+        assert_eq!(disc.container, Some(Container::DiscStructure));
+        assert_eq!(disc.confidence, Some(Confidence::Certain));
+        assert_eq!(disc.kind, MediaKind::Video);
+        assert!(!disc.unidentified);
+        assert_eq!(disc.parsed.title, "Interstellar");
+        assert_eq!(disc.parsed.year, Some(2014));
+        assert_eq!(disc.size, 2_001_000, "sums every file under the disc structure");
+    }
+
+    #[test]
+    fn a_bdmv_folder_is_also_recognised_case_insensitively() {
+        let d = TempDir::new("bdmv");
+        d.file("Some Movie/bdmv/STREAM/00000.m2ts", &[0u8; 500_000]);
+        d.file("Some Movie/bdmv/PLAYLIST/00000.mpls", &[0u8; 200]);
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert_eq!(s.playable().count(), 1);
+        let disc = &s.files[0];
+        assert!(disc.path.ends_with("Some Movie"), "{:?}", disc.path);
+        assert_eq!(disc.container, Some(Container::DiscStructure));
+    }
+
+    #[test]
+    fn a_regular_library_next_to_a_disc_structure_is_unaffected() {
+        let d = TempDir::new("mixed");
+        d.file("Interstellar (2014)/VIDEO_TS/VTS_01_1.VOB", &[0u8; 100_000]);
+        d.file("Arrival (2016).mkv", &mkv_bytes());
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert_eq!(
+            s.playable().count(),
+            2,
+            "{:?}",
+            s.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(s.files.iter().any(|f| f.container == Some(Container::DiscStructure)));
+        assert!(s.files.iter().any(|f| f.container == Some(Container::Matroska)));
     }
 
     #[test]
