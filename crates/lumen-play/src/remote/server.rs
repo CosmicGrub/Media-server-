@@ -543,6 +543,9 @@ fn is_timeout(e: &std::io::Error) -> bool {
 /// `false` means the write failed and the caller should stop driving this connection, the same signal
 /// the old writer thread gave by returning early.
 fn handle_line(line: &str, ctx: &ServerContext, authed: &mut bool, tls: &mut TlsStream) -> bool {
+    // TODO(diagnostic, remove once the Windows Play-timeout investigation concludes): proves
+    // whether a line the client wrote is actually reaching this parser at all.
+    eprintln!("conn: got line: {line}");
     let Some(msg) = ClientMessage::parse(line) else {
         return send(
             tls,
@@ -708,10 +711,14 @@ fn contain_within_library(library_root: &Path, requested: &str) -> Result<String
 }
 
 fn run_command(ctx: &ServerContext, id: String, body: CommandBody) -> ServerMessage {
+    // TODO(diagnostic, remove once the Windows Play-timeout investigation concludes).
+    eprintln!("conn: run_command({}) sending to driver", body.name());
     let (reply_tx, reply_rx) = mpsc::channel();
     if ctx.commands.send(Command { body, reply: reply_tx }).is_err() {
+        eprintln!("conn: send() to driver failed -- receiver already dropped");
         return ServerMessage::Error { id, message: "the player is not responding".into() };
     }
+    eprintln!("conn: send() to driver succeeded, waiting up to 5s for a reply");
     match reply_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(result)) => ServerMessage::Reply { id, result },
         Ok(Err(e)) => ServerMessage::Error { id, message: e },
