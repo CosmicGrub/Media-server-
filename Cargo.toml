@@ -37,6 +37,7 @@ lumen-meta = { path = "crates/lumen-meta" }
 lumen-subs = { path = "crates/lumen-subs" }
 lumen-index = { path = "crates/lumen-index" }
 lumen-play = { path = "crates/lumen-play" }
+lumen-discovery = { path = "crates/lumen-discovery" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"

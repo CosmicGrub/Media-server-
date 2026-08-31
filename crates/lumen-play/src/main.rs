@@ -14,6 +14,7 @@
 //! evening rather than a fortnight, and the output is a list of exactly which ones failed and why.
 
 mod calibration;
+mod dlna;
 mod fidelity;
 mod ipc;
 mod json;
@@ -66,6 +67,12 @@ Options
 `serve` options
   --port <n>          TCP port to listen on (default 7890)
   --bind <addr>       address to bind (default 0.0.0.0 — every interface)
+  --dlna              also announce this library over SSDP/DLNA for smart TVs and other renderers to
+                      browse and stream with no pairing at all -- unauthenticated by protocol
+                      design, opt-in, off by default
+  --dlna-port <n>     TCP port for the DLNA HTTP listener (default 7891)
+  --dlna-bind <addr>  address for the DLNA HTTP listener to bind (default 0.0.0.0)
+  --dlna-name <name>  friendly name this server announces itself as (default \"lumen\")
 
 `unpair` — with no arguments, lists every currently-paired device (by a short prefix, never the
 full token). With one, revokes whichever token starts with it — the whole token, or the prefix
@@ -320,7 +327,12 @@ fn serve(args: &[String]) -> Result<ExitCode, String> {
     let mut i = 0;
     while i < stop {
         let a = &args[i];
-        if a == "--port" || a == "--bind" {
+        if a == "--port"
+            || a == "--bind"
+            || a == "--dlna-bind"
+            || a == "--dlna-port"
+            || a == "--dlna-name"
+        {
             i += 2;
             continue;
         }
@@ -329,7 +341,10 @@ fn serve(args: &[String]) -> Result<ExitCode, String> {
         }
         i += 1;
     }
-    let root = root.ok_or("usage: lumen serve <path> [--port <n>] [--bind <addr>]")?;
+    let root = root.ok_or(
+        "usage: lumen serve <path> [--port <n>] [--bind <addr>] [--dlna] [--dlna-port <n>] \
+         [--dlna-bind <addr>] [--dlna-name <name>]",
+    )?;
 
     if !root.exists() {
         return Err(format!("{} does not exist", root.display()));
@@ -344,6 +359,28 @@ fn serve(args: &[String]) -> Result<ExitCode, String> {
     println!(
         "lumen serve — do not forward this port through your router; it is meant for your own LAN"
     );
+
+    if flag(args, "--dlna") {
+        let dlna_root = root.clone();
+        let dlna_bind = value(args, "--dlna-bind").unwrap_or_else(|| "0.0.0.0".to_string());
+        let dlna_port: u16 = value(args, "--dlna-port")
+            .map(|v| v.parse().map_err(|_| format!("--dlna-port must be a number, got {v:?}")))
+            .transpose()?
+            .unwrap_or(7891);
+        let dlna_name = value(args, "--dlna-name").unwrap_or_else(|| "lumen".to_string());
+        println!(
+            "lumen serve: --dlna is unauthenticated by protocol design -- any device on this LAN \
+             can browse and stream this library with no pairing or token"
+        );
+        std::thread::spawn(move || {
+            if let Err(e) =
+                dlna::run(dlna_root, &dlna_bind, dlna_port, dlna_name, |line| println!("{line}"))
+            {
+                eprintln!("dlna: {e}");
+            }
+        });
+    }
+
     remote::server::run(&root, &bind, port, &passthrough(args), |line| println!("{line}"))?;
     Ok(ExitCode::SUCCESS)
 }
