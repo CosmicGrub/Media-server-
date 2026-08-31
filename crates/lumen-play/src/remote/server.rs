@@ -339,7 +339,21 @@ fn drive_mpv(
 ) {
     log("driver: command loop starting");
     let mut last_poll = std::time::Instant::now() - MPV_POLL_INTERVAL;
+    // TODO(diagnostic, remove once the Windows Play-timeout investigation concludes): send() to
+    // this thread's own channel is confirmed to succeed, yet the command is never seen coming out
+    // the other end. This proves -- or disproves -- the one remaining explanation every other
+    // diagnostic so far has failed to rule out: that this loop itself has stopped iterating
+    // (scheduling starvation, or a silent panic/exit this thread's default panic hook somehow
+    // never got to report) rather than genuinely being unable to see a message that is really
+    // sitting in the channel.
+    let mut heartbeat: u64 = 0;
+    let mut last_heartbeat_log = std::time::Instant::now();
     loop {
+        heartbeat += 1;
+        if last_heartbeat_log.elapsed() >= Duration::from_secs(1) {
+            log(&format!("driver: heartbeat {heartbeat} (loop is still iterating)"));
+            last_heartbeat_log = std::time::Instant::now();
+        }
         if mpv.is_closed() {
             log("driver: mpv's socket closed; command loop exiting");
             return;
