@@ -194,8 +194,15 @@ pub fn run(
         .map_err(|e| format!("cannot set up TLS: {e}"))?;
     let tls_config = server_cert.server_config().map_err(|e| format!("cannot set up TLS: {e}"))?;
 
-    let scan =
-        scan::scan(std::slice::from_ref(&library_path.to_path_buf()), &ScanOptions::default());
+    // Scanned from `library_root`, the canonicalized path, not the original `library_path` --
+    // `contain_within_library` canonicalizes every requested path before comparing it against a
+    // `ScannedFile.path`, so if the scan itself walked from an uncanonicalized root the two would
+    // silently disagree whenever the root sits behind a symlink (e.g. macOS's default temp
+    // directory, `/var/folders/...`, is itself a symlink to `/private/var/folders/...`). That
+    // mismatch does not fail the request outright -- it just makes `http.rs`'s container lookup
+    // find nothing, so every response falls back to a bare `application/octet-stream` regardless
+    // of the file's real container.
+    let scan = scan::scan(std::slice::from_ref(&library_root), &ScanOptions::default());
     log(&format!(
         "library: {} playable files under {}",
         scan.playable().count(),
