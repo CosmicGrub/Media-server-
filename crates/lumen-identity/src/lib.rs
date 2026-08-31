@@ -282,6 +282,29 @@ mod tests {
     }
 
     #[test]
+    fn the_smallest_file_that_enters_sampling_does_not_underflow_its_offsets() {
+        // sketch_reader's sampling branch computes `size / 2 - CHUNK / 2` and `size - CHUNK` as plain
+        // u64 subtraction -- either going negative would underflow-panic in a debug build and wrap to
+        // a huge, wrong seek offset in a release one (overflow checks are off there by construction).
+        // Both stay safely positive only because `FULL_READ_THRESHOLD` (the smallest size that takes
+        // this branch at all, at `threshold + 1`) is fixed at exactly `3 * CHUNK`: worked through by
+        // hand, `size > 3*CHUNK` guarantees `size - CHUNK > 2*CHUNK` and `size/2 - CHUNK/2 > CHUNK`,
+        // both comfortably positive -- but that guarantee lives entirely in the relationship between
+        // two constants, nothing enforces it if either one is ever tuned independently later. Proven
+        // here at the tightest possible case (`threshold + 1`, the smallest input that ever reaches
+        // this code) rather than trusted from the constants' current values alone.
+        let size = FULL_READ_THRESHOLD + 1;
+        let data = bytes(size as usize, 42);
+        let sketch = sketch_of(&data); // must not panic
+        // And it must still be a real sketch, not an artifact of a seek gone to the wrong place:
+        // changing a byte in the tail sample (the region `size - CHUNK` reads from) must move it.
+        let mut tail_flipped = data.clone();
+        let tail_start = (size - CHUNK) as usize;
+        tail_flipped[tail_start] ^= 1;
+        assert_ne!(sketch_of(&tail_flipped), sketch, "a change in the tail sample went undetected");
+    }
+
+    #[test]
     fn hex_round_trips() {
         let s = ContentSketch(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
         assert_eq!(s.to_hex().len(), 32);
