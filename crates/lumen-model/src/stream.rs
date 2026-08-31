@@ -67,6 +67,25 @@ pub enum StereoMode {
     Mvc,
 }
 
+/// Chroma sample density relative to luma, in ascending order of what a decoder must support.
+///
+/// Ordered deliberately: hardware decoders that handle a given level almost always handle every
+/// level below it too (a 4:4:4-capable decoder decodes 4:2:0 trivially), so a single `max_chroma`
+/// ceiling on [`crate::VideoDecodeCaps`]-shaped types can be compared with `<=` rather than needing
+/// an exhaustive support list. `docs/11` §8 notes 4:2:2/4:4:4 profiles (H.264 High 4:2:2/4:4:4
+/// Predictive, HEVC Rext) as the case hardware decoders most often lack entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[non_exhaustive]
+pub enum ChromaSubsampling {
+    /// Quarter chroma resolution — the overwhelming majority of consumer video.
+    #[default]
+    Yuv420,
+    /// Half-horizontal chroma resolution — broadcast and professional mezzanine formats.
+    Yuv422,
+    /// Full chroma resolution — screen recordings, professional masters, rarely hardware-decoded.
+    Yuv444,
+}
+
 /// Pixels to discard from each edge before display, in decoded-frame coordinates. Distinct from
 /// [`Rational`] sample-aspect scaling: crop removes rows/columns the encoder padded in (macroblock
 /// alignment padding, cropped-for-broadcast masters), while SAR reshapes the pixels that remain.
@@ -144,6 +163,7 @@ pub struct VideoStream {
     pub crop: CropRect,
     /// Film cadence hidden inside a fixed-rate container, if detected.
     pub telecine: TelecinePattern,
+    pub chroma: ChromaSubsampling,
 }
 
 impl VideoStream {
@@ -247,6 +267,7 @@ mod tests {
             flags: StreamFlags::enabled(),
             crop: CropRect::default(),
             telecine: TelecinePattern::default(),
+            chroma: ChromaSubsampling::default(),
         }
     }
 
@@ -318,5 +339,12 @@ mod tests {
     fn telecine_defaults_to_none() {
         let s = video(1920, 1080, Rational::new(1, 1));
         assert_eq!(s.telecine, TelecinePattern::None);
+    }
+
+    #[test]
+    fn chroma_subsampling_orders_from_least_to_most_demanding() {
+        assert!(ChromaSubsampling::Yuv420 < ChromaSubsampling::Yuv422);
+        assert!(ChromaSubsampling::Yuv422 < ChromaSubsampling::Yuv444);
+        assert_eq!(ChromaSubsampling::default(), ChromaSubsampling::Yuv420);
     }
 }

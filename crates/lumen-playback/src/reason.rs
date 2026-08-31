@@ -7,7 +7,7 @@
 //! Consequently `explain()` is a product surface with the same status as a UI string, and the
 //! conformance corpus asserts on these variants directly via `reasons_absent` / `reasons_present`.
 
-use lumen_model::{AudioCodec, Container, HdrFormat, SubtitleCodec, VideoCodec};
+use lumen_model::{AudioCodec, ChromaSubsampling, Container, HdrFormat, SubtitleCodec, VideoCodec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitrateCause {
@@ -45,6 +45,12 @@ pub enum RejectReason {
     BitDepthUnsupported {
         have: u8,
         max: u8,
+    },
+    /// The decoder cannot handle this chroma layout — 4:2:2/4:4:4 profiles hardware decoders most
+    /// often lack entirely (`docs/11` §8), distinct from bit depth or profile.
+    ChromaSubsamplingUnsupported {
+        have: ChromaSubsampling,
+        max: ChromaSubsampling,
     },
     BitrateCeiling {
         have_bps: u64,
@@ -117,6 +123,9 @@ impl RejectReason {
             ),
             Self::BitDepthUnsupported { have, max } => {
                 format!("The video is {have}-bit; this device decodes up to {max}-bit.")
+            }
+            Self::ChromaSubsamplingUnsupported { have, max } => {
+                format!("The video is {have:?}; this device decodes up to {max:?}.",)
             }
             Self::BitrateCeiling { have_bps, max_bps, cause } => {
                 let why = match cause {
@@ -196,6 +205,7 @@ impl RejectReason {
             Self::VideoCodecUnsupported { .. } => "VideoCodecUnsupported",
             Self::VideoTooLarge { .. } => "VideoTooLarge",
             Self::BitDepthUnsupported { .. } => "BitDepthUnsupported",
+            Self::ChromaSubsamplingUnsupported { .. } => "ChromaSubsamplingUnsupported",
             Self::BitrateCeiling { .. } => "BitrateCeiling",
             Self::NoHardwareDecoder { .. } => "NoHardwareDecoder",
             Self::SinkLacksEncoding { .. } => "SinkLacksEncoding",
@@ -261,6 +271,10 @@ mod tests {
             },
             RejectReason::VideoTooLarge { have: (7680, 4320), max: (3840, 2160) },
             RejectReason::BitDepthUnsupported { have: 10, max: 8 },
+            RejectReason::ChromaSubsamplingUnsupported {
+                have: ChromaSubsampling::Yuv444,
+                max: ChromaSubsampling::Yuv420,
+            },
             RejectReason::BitrateCeiling {
                 have_bps: 92_000_000,
                 max_bps: 20_000_000,

@@ -11,7 +11,8 @@
 #![forbid(unsafe_code)]
 
 use lumen_model::{
-    AudioCodec, ChannelLayout, Container, HdrFormat, Rational, SubtitleCodec, VideoCodec,
+    AudioCodec, ChannelLayout, ChromaSubsampling, Container, HdrFormat, Rational, SubtitleCodec,
+    VideoCodec,
 };
 
 /// What a decoder can actually do for one codec.
@@ -24,6 +25,9 @@ pub struct VideoDecodeCaps {
     pub profiles: Vec<String>,
     pub max_level: Option<u16>,
     pub max_bit_depth: u8,
+    /// The most demanding chroma layout this decoder accepts. Ordered, so anything at or below
+    /// this on [`ChromaSubsampling`]'s scale is implicitly supported too — see its doc comment.
+    pub max_chroma: ChromaSubsampling,
     pub max_width: u32,
     pub max_height: u32,
     pub max_bitrate_bps: Option<u64>,
@@ -32,12 +36,17 @@ pub struct VideoDecodeCaps {
 
 impl VideoDecodeCaps {
     /// Convenience constructor for a broadly capable hardware decoder.
+    ///
+    /// `max_chroma` defaults to 4:2:0: `docs/11` §8 names 4:2:2/4:4:4 profiles as the case hardware
+    /// decoders most often lack entirely, so assuming support would misreport a real limit. Override
+    /// the field directly for a decoder actually probed to go wider.
     pub fn hardware(codec: VideoCodec, max_bit_depth: u8, max_width: u32, max_height: u32) -> Self {
         Self {
             codec,
             profiles: Vec::new(),
             max_level: None,
             max_bit_depth,
+            max_chroma: ChromaSubsampling::Yuv420,
             max_width,
             max_height,
             max_bitrate_bps: None,
@@ -52,6 +61,19 @@ impl VideoDecodeCaps {
             (true, _) | (_, None) => true,
             (false, Some(p)) => self.profiles.iter().any(|x| x.eq_ignore_ascii_case(p)),
         }
+    }
+
+    /// An unknown level (`None`) is never rejected — the same "no restriction known" stance
+    /// [`Self::accepts_profile`] takes, for the same reason: several probes cannot report it.
+    pub fn accepts_level(&self, level: Option<u16>) -> bool {
+        match (self.max_level, level) {
+            (None, _) | (_, None) => true,
+            (Some(max), Some(l)) => l <= max,
+        }
+    }
+
+    pub fn accepts_chroma(&self, chroma: ChromaSubsampling) -> bool {
+        chroma <= self.max_chroma
     }
 }
 
@@ -359,6 +381,35 @@ mod tests {
         let restricted = VideoDecodeCaps { profiles: vec!["Main".into(), "Main 10".into()], ..c };
         assert!(restricted.accepts_profile(Some("main 10")), "case-insensitive");
         assert!(!restricted.accepts_profile(Some("Main 4:4:4 12")));
+    }
+
+    #[test]
+    fn unknown_level_is_unrestricted_not_unsupported() {
+        let c = VideoDecodeCaps {
+            max_level: Some(41),
+            ..VideoDecodeCaps::hardware(VideoCodec::H264, 8, 1920, 1080)
+        };
+        assert!(c.accepts_level(Some(41)), "at the ceiling");
+        assert!(c.accepts_level(Some(30)), "below the ceiling");
+        assert!(!c.accepts_level(Some(51)), "above the ceiling");
+        assert!(c.accepts_level(None), "unreported level is not a claim it fails");
+
+        let unrestricted = VideoDecodeCaps::hardware(VideoCodec::H264, 8, 1920, 1080);
+        assert!(unrestricted.accepts_level(Some(51)), "no known ceiling means no rejection");
+    }
+
+    #[test]
+    fn chroma_ceiling_admits_everything_at_or_below_it() {
+        let c = VideoDecodeCaps::hardware(VideoCodec::Hevc, 10, 3840, 2160);
+        assert_eq!(c.max_chroma, ChromaSubsampling::Yuv420, "the honest default for hardware(..)");
+        assert!(c.accepts_chroma(ChromaSubsampling::Yuv420));
+        assert!(!c.accepts_chroma(ChromaSubsampling::Yuv422));
+        assert!(!c.accepts_chroma(ChromaSubsampling::Yuv444));
+
+        let wide = VideoDecodeCaps { max_chroma: ChromaSubsampling::Yuv444, ..c };
+        assert!(wide.accepts_chroma(ChromaSubsampling::Yuv420));
+        assert!(wide.accepts_chroma(ChromaSubsampling::Yuv422));
+        assert!(wide.accepts_chroma(ChromaSubsampling::Yuv444));
     }
 
     #[test]

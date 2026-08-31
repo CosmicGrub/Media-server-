@@ -181,10 +181,31 @@ fn decide_video(
                 );
                 must_transcode = true;
             }
+            if !dc.accepts_level(v.level) {
+                ctx.reject(
+                    Tier::T1FullFidelity,
+                    RejectReason::VideoCodecUnsupported {
+                        codec: v.codec.clone(),
+                        profile: v.profile.clone(),
+                        level: v.level,
+                    },
+                );
+                must_transcode = true;
+            }
             if v.bit_depth > dc.max_bit_depth {
                 ctx.reject(
                     Tier::T1FullFidelity,
                     RejectReason::BitDepthUnsupported { have: v.bit_depth, max: dc.max_bit_depth },
+                );
+                must_transcode = true;
+            }
+            if !dc.accepts_chroma(v.chroma) {
+                ctx.reject(
+                    Tier::T1FullFidelity,
+                    RejectReason::ChromaSubsamplingUnsupported {
+                        have: v.chroma,
+                        max: dc.max_chroma,
+                    },
                 );
                 must_transcode = true;
             }

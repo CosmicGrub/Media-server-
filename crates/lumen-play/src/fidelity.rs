@@ -17,9 +17,10 @@
 
 use lumen_caps::ClientCapabilities;
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange,
-    ColorTransfer, Container, HdrFormat, Integrity, Language, MediaSource, Rational, StreamFlags,
-    SubtitleCodec, SubtitleStream, Transport, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, ChromaSubsampling, ColorInfo, ColorMatrix,
+    ColorPrimaries, ColorRange, ColorTransfer, Container, HdrFormat, Integrity, Language,
+    MediaSource, Rational, StreamFlags, SubtitleCodec, SubtitleStream, Transport, VideoCodec,
+    VideoStream,
 };
 use lumen_playback::{Selection, Tier, TrackPreferences, plan, select};
 
@@ -153,6 +154,7 @@ pub fn media_source(r: &FileResult, scanned: &ScannedFile) -> Option<MediaSource
                 // defaults rather than being guessed.
                 crop: lumen_model::CropRect::default(),
                 telecine: lumen_model::TelecinePattern::default(),
+                chroma: chroma_from_pixel_format(r.pixel_format.as_deref()),
             }),
             "audio" => source.audio.push(AudioStream {
                 index: t.id,
@@ -228,6 +230,20 @@ fn bit_depth_from_pixel_format(pf: Option<&str>) -> u8 {
     match digits.parse::<u8>() {
         Ok(n) if (8..=16).contains(&n) => n,
         _ => 8,
+    }
+}
+
+/// `yuv444p10le` -> 4:4:4, `yuv422p` -> 4:2:2, everything else (including no report at all) -> the
+/// 4:2:0 default, which is both the overwhelming common case and the honest floor: nothing here
+/// claims wider chroma support than what mpv actually reported.
+fn chroma_from_pixel_format(pf: Option<&str>) -> ChromaSubsampling {
+    let Some(pf) = pf else { return ChromaSubsampling::default() };
+    if pf.starts_with("yuv444") || pf.starts_with("yuva444") || pf.starts_with("gbr") {
+        ChromaSubsampling::Yuv444
+    } else if pf.starts_with("yuv422") || pf.starts_with("yuva422") {
+        ChromaSubsampling::Yuv422
+    } else {
+        ChromaSubsampling::default()
     }
 }
 
@@ -613,6 +629,21 @@ mod tests {
         assert_eq!(color_info(&r).hdr, HdrFormat::Hdr10);
         r.gamma = Some("hlg".into());
         assert_eq!(color_info(&r).hdr, HdrFormat::Hlg);
+    }
+
+    #[test]
+    fn chroma_is_read_from_the_pixel_format_and_defaults_honestly() {
+        assert_eq!(chroma_from_pixel_format(Some("yuv420p")), ChromaSubsampling::Yuv420);
+        assert_eq!(chroma_from_pixel_format(Some("yuv420p10le")), ChromaSubsampling::Yuv420);
+        assert_eq!(chroma_from_pixel_format(Some("yuv422p")), ChromaSubsampling::Yuv422);
+        assert_eq!(chroma_from_pixel_format(Some("yuv444p10le")), ChromaSubsampling::Yuv444);
+        assert_eq!(chroma_from_pixel_format(Some("gbrp")), ChromaSubsampling::Yuv444);
+        assert_eq!(
+            chroma_from_pixel_format(None),
+            ChromaSubsampling::default(),
+            "unreported chroma is not a claim of anything wider than the honest floor"
+        );
+        assert_eq!(chroma_from_pixel_format(Some("nv12")), ChromaSubsampling::Yuv420);
     }
 
     #[test]

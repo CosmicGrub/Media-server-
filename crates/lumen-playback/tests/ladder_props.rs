@@ -13,9 +13,9 @@ use lumen_caps::{
     VideoDecodeCaps,
 };
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, ColorInfo, Container, CropRect, FieldOrder, HdrFormat,
-    Integrity, Language, MediaSource, Rational, StereoMode, StreamFlags, SubtitleCodec,
-    SubtitleStream, TelecinePattern, Transport, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, ChromaSubsampling, ColorInfo, Container, CropRect,
+    FieldOrder, HdrFormat, Integrity, Language, MediaSource, Rational, StereoMode, StreamFlags,
+    SubtitleCodec, SubtitleStream, TelecinePattern, Transport, VideoCodec, VideoStream,
 };
 use lumen_playback::{
     AudioPath, ContainerPlan, PlaybackPlan, Selection, SubtitleDelivery, Tier, VideoPath, plan,
@@ -293,6 +293,7 @@ prop_compose! {
             flags: StreamFlags::enabled(),
             crop: CropRect::default(),
             telecine: TelecinePattern::default(),
+            chroma: ChromaSubsampling::default(),
         });
         s.audio.push(AudioStream {
             index: 1,
@@ -564,6 +565,7 @@ fn uhd_remux() -> MediaSource {
         flags: StreamFlags::enabled(),
         crop: CropRect::default(),
         telecine: TelecinePattern::default(),
+        chroma: ChromaSubsampling::default(),
     });
     s.audio.push(AudioStream {
         index: 1,
@@ -705,6 +707,7 @@ fn hi10p_anime_direct_plays_on_a_software_decoder_and_notes_it() {
         flags: StreamFlags::enabled(),
         crop: CropRect::default(),
         telecine: TelecinePattern::default(),
+        chroma: ChromaSubsampling::default(),
     });
     src.audio.push(AudioStream {
         index: 1,
@@ -722,4 +725,51 @@ fn hi10p_anime_direct_plays_on_a_software_decoder_and_notes_it() {
     let p = plan(&src, full_selection(&src), &ClientCapabilities::reference_native());
     assert!(p.video.is_copy(), "{p:#?}");
     assert!(p.tier <= Tier::T1FullFidelity, "tier {:?}", p.tier);
+}
+
+#[test]
+fn a_level_above_the_decoders_ceiling_forces_a_transcode() {
+    // The decoder can decode HEVC Main 10 in general, but not at this level -- e.g. a mobile SoC's
+    // HEVC block that tops out at Level 5.0 seeing a Level 5.1 UHD Blu-ray remux.
+    let mut caps = ClientCapabilities::reference_native();
+    caps.video = vec![VideoDecodeCaps {
+        max_level: Some(50),
+        ..VideoDecodeCaps::hardware(VideoCodec::Hevc, 10, 3840, 2160)
+    }];
+    let src = uhd_remux();
+    let p = plan(&src, full_selection(&src), &caps);
+
+    assert!(!p.video.is_copy(), "a level past the decoder's ceiling must not direct play: {p:#?}");
+    assert!(p.reason_keys().contains(&"VideoCodecUnsupported"), "{:?}", p.reason_keys());
+}
+
+#[test]
+fn a_level_at_or_below_the_ceiling_direct_plays() {
+    let mut caps = ClientCapabilities::reference_native();
+    caps.video = vec![VideoDecodeCaps {
+        max_level: Some(51),
+        ..VideoDecodeCaps::hardware(VideoCodec::Hevc, 10, 3840, 2160)
+    }];
+    let src = uhd_remux();
+    let p = plan(&src, full_selection(&src), &caps);
+    assert!(p.video.is_copy(), "level 51 against a ceiling of 51 must direct play: {p:#?}");
+}
+
+#[test]
+fn chroma_beyond_the_decoders_ceiling_forces_a_transcode() {
+    // docs/11 §8: 4:2:2/4:4:4 profiles are the case hardware decoders most often lack entirely.
+    let mut src = uhd_remux();
+    src.video[0] = VideoStream { chroma: ChromaSubsampling::Yuv444, ..src.video[0].clone() };
+    let p = plan(&src, full_selection(&src), &ClientCapabilities::reference_native());
+
+    assert!(!p.video.is_copy(), "4:4:4 past a 4:2:0-only decoder must not direct play: {p:#?}");
+    assert!(p.reason_keys().contains(&"ChromaSubsamplingUnsupported"), "{:?}", p.reason_keys());
+}
+
+#[test]
+fn ordinary_420_chroma_direct_plays() {
+    let src = uhd_remux();
+    assert_eq!(src.video[0].chroma, ChromaSubsampling::Yuv420);
+    let p = plan(&src, full_selection(&src), &ClientCapabilities::reference_native());
+    assert!(p.video.is_copy(), "{p:#?}");
 }
