@@ -23,8 +23,18 @@
 
 #![forbid(unsafe_code)]
 
+mod content_directory;
+mod descriptor;
 mod message;
 
+pub use content_directory::{
+    BrowseFlag, BrowseRequest, DidlObject, DidlResource, ObjectClass, build_browse_response,
+    build_didl_lite, build_soap_fault, parse_browse_request,
+};
+pub use descriptor::{
+    DeviceIdentity, build_device_description, build_get_current_connection_ids_response,
+    build_get_protocol_info_response, connection_manager_scpd, content_directory_scpd,
+};
 pub use message::{
     Announcement, MSearchRequest, build_notify_alive, build_notify_byebye, build_search_response,
     matches_search_target, parse_msearch, server_header,
