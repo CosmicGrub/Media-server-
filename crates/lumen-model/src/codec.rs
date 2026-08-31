@@ -34,6 +34,21 @@ pub enum VideoCodec {
     Mjpeg,
     Dv,
     Uncompressed,
+    /// ITU-T H.263 — pre-AVC videoconferencing and early mobile video (3GP).
+    H263,
+    /// Cinepak — early-90s CD-ROM video, still turns up in archival AVI/MOV rips.
+    Cinepak,
+    /// Indeo (3/4/5) — legacy AVI codec, same era and use case as Cinepak.
+    Indeo,
+    /// Sorenson Video 3 — the codec early iPod-era QuickTime `.mov` files were commonly encoded
+    /// with, distinct from the Sorenson Spark (`flv1`) used in early Flash video.
+    Svq3,
+    /// QuickTime Animation / RLE — ubiquitous in screen-recording `.mov` files, not a mastering
+    /// format despite being lossless.
+    QtRle,
+    /// Ut Video — a lossless intermediate codec, the open-source alternative to the commercial
+    /// mastering formats already modelled here.
+    UtVideo,
     Other(String),
 }
 
@@ -55,6 +70,12 @@ impl VideoCodec {
                 | Self::Uncompressed
                 | Self::Mpeg1
                 | Self::Mpeg4Part2
+                | Self::H263
+                | Self::Cinepak
+                | Self::Indeo
+                | Self::Svq3
+                | Self::QtRle
+                | Self::UtVideo
                 | Self::Other(_)
         )
     }
@@ -70,6 +91,7 @@ impl VideoCodec {
                 | Self::Apv
                 | Self::Ffv1
                 | Self::Uncompressed
+                | Self::UtVideo
         )
     }
 }
@@ -88,6 +110,9 @@ pub enum AudioCodec {
     MonkeysAudio,
     Pcm,
     Dsd,
+    /// Windows Media Audio 9 Lossless — bit-exact, unlike the lossy WMA family it is otherwise
+    /// grouped with by name.
+    WmaLossless,
     // Lossy
     Ac3,
     EAc3,
@@ -99,6 +124,9 @@ pub enum AudioCodec {
     Mp3,
     Mp2,
     Wma,
+    /// Adaptive Differential PCM — the near-universal audio codec in legacy game FMVs and camcorder
+    /// AVI files (`ms-adpcm`, `ima-adpcm`, and the format's many other container-specific variants).
+    Adpcm,
     Other(String),
 }
 
@@ -115,6 +143,7 @@ impl AudioCodec {
                 | Self::MonkeysAudio
                 | Self::Pcm
                 | Self::Dsd
+                | Self::WmaLossless
         )
     }
 
@@ -187,6 +216,8 @@ pub enum SubtitleCodec {
     Ttml,
     MicroDvd,
     SubViewer,
+    /// MP4 timed text (`tx3g`) — plain text with basic styling, distinct from SRT/ASS.
+    MovText,
     // Bitmap
     Pgs,
     VobSub,
@@ -225,6 +256,37 @@ mod tests {
         assert!(AudioCodec::DtsHdMa.is_lossless());
         assert!(!AudioCodec::Ac3.is_lossless());
         assert!(!AudioCodec::Aac.is_lossless());
+    }
+
+    #[test]
+    fn wma_lossless_is_lossless_unlike_the_rest_of_the_wma_family() {
+        // Grouping WMA Lossless under the lossy `Wma` variant would misreport a bit-exact track as
+        // one that must be treated like a lossy source (e.g. never trusted as a remux's "safe" audio).
+        assert!(AudioCodec::WmaLossless.is_lossless());
+        assert!(!AudioCodec::Wma.is_lossless());
+    }
+
+    #[test]
+    fn legacy_video_codecs_are_recognised_as_software_only() {
+        for c in [
+            VideoCodec::H263,
+            VideoCodec::Cinepak,
+            VideoCodec::Indeo,
+            VideoCodec::Svq3,
+            VideoCodec::QtRle,
+            VideoCodec::UtVideo,
+        ] {
+            assert!(c.is_typically_software_only(), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn ut_video_is_intermediate_but_qtrle_is_not() {
+        // Both are lossless, but Ut Video is a mastering-grade intermediate codec while QuickTime
+        // Animation/RLE is a legacy screen-capture format -- treating the latter as intermediate
+        // would misclassify what is usually a small, low-bitrate file.
+        assert!(VideoCodec::UtVideo.is_intermediate());
+        assert!(!VideoCodec::QtRle.is_intermediate());
     }
 
     #[test]

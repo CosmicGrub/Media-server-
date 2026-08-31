@@ -352,6 +352,12 @@ pub fn video_codec(name: Option<&str>) -> VideoCodec {
         "mjpeg" => VideoCodec::Mjpeg,
         "dvvideo" => VideoCodec::Dv,
         "rawvideo" | "v210" | "yuv4" => VideoCodec::Uncompressed,
+        "h263" | "h263p" | "h263i" => VideoCodec::H263,
+        "cinepak" => VideoCodec::Cinepak,
+        "indeo2" | "indeo3" | "indeo4" | "indeo5" => VideoCodec::Indeo,
+        "svq3" => VideoCodec::Svq3,
+        "qtrle" => VideoCodec::QtRle,
+        "utvideo" => VideoCodec::UtVideo,
         other => VideoCodec::Other(other.to_string()),
     }
 }
@@ -369,6 +375,9 @@ pub fn audio_codec(name: Option<&str>, profile: Option<&str>) -> AudioCodec {
     }
     if name.starts_with("dsd_") {
         return AudioCodec::Dsd;
+    }
+    if name.starts_with("adpcm_") {
+        return AudioCodec::Adpcm;
     }
     match name.as_str() {
         "truehd" | "mlp" => AudioCodec::TrueHd,
@@ -398,7 +407,8 @@ pub fn audio_codec(name: Option<&str>, profile: Option<&str>) -> AudioCodec {
         "vorbis" => AudioCodec::Vorbis,
         "mp3" | "mp3float" => AudioCodec::Mp3,
         "mp2" | "mp2float" => AudioCodec::Mp2,
-        "wmav1" | "wmav2" | "wmapro" | "wmalossless" => AudioCodec::Wma,
+        "wmav1" | "wmav2" | "wmapro" => AudioCodec::Wma,
+        "wmalossless" => AudioCodec::WmaLossless,
         other => AudioCodec::Other(other.to_string()),
     }
 }
@@ -412,6 +422,7 @@ pub fn subtitle_codec(name: Option<&str>) -> SubtitleCodec {
         "ttml" | "stl" => SubtitleCodec::Ttml,
         "microdvd" => SubtitleCodec::MicroDvd,
         "subviewer" | "subviewer1" => SubtitleCodec::SubViewer,
+        "mov_text" | "tx3g" => SubtitleCodec::MovText,
         "hdmv_pgs_subtitle" | "pgssub" => SubtitleCodec::Pgs,
         "dvd_subtitle" | "dvdsub" => SubtitleCodec::VobSub,
         "dvb_subtitle" | "dvbsub" => SubtitleCodec::DvbSub,
@@ -587,6 +598,25 @@ mod tests {
         assert_eq!(subtitle_codec(Some("hdmv_pgs_subtitle")), SubtitleCodec::Pgs);
         assert_eq!(subtitle_codec(Some("ass")), SubtitleCodec::Ass);
         assert_eq!(subtitle_codec(Some("eia_608")), SubtitleCodec::Cea608);
+    }
+
+    #[test]
+    fn legacy_and_previously_uncatalogued_codecs_now_map_to_a_real_variant() {
+        // Proposal 4: these previously fell through to `Other`, which is correct for a codec this
+        // product has never heard of but wrong for ones it now recognises by name.
+        assert_eq!(video_codec(Some("cinepak")), VideoCodec::Cinepak);
+        assert_eq!(video_codec(Some("indeo5")), VideoCodec::Indeo);
+        assert_eq!(video_codec(Some("h263p")), VideoCodec::H263);
+        assert_eq!(video_codec(Some("svq3")), VideoCodec::Svq3);
+        assert_eq!(video_codec(Some("qtrle")), VideoCodec::QtRle);
+        assert_eq!(video_codec(Some("utvideo")), VideoCodec::UtVideo);
+
+        assert_eq!(audio_codec(Some("adpcm_ms"), None), AudioCodec::Adpcm);
+        assert_eq!(audio_codec(Some("adpcm_ima_wav"), None), AudioCodec::Adpcm);
+        assert_eq!(audio_codec(Some("wmalossless"), None), AudioCodec::WmaLossless);
+        assert_eq!(audio_codec(Some("wmapro"), None), AudioCodec::Wma, "lossy WMA stays lossy");
+
+        assert_eq!(subtitle_codec(Some("mov_text")), SubtitleCodec::MovText);
     }
 
     #[test]
