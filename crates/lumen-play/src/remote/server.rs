@@ -347,6 +347,12 @@ fn drive_mpv(
         // Drain whatever commands arrived since the last pass without blocking the poll behind them.
         while let Ok(cmd) = commands.try_recv() {
             let name = cmd.body.name();
+            // Logged before execute() runs, not just after: if execute() itself were ever to hang
+            // outright (rather than the bounded wait its own `Mpv::command` call already enforces),
+            // this line -- not the one after it -- is what would still show up, and prove the
+            // command was at least dequeued and attempted rather than never reaching this loop at
+            // all.
+            log(&format!("driver: executing {name}"));
             let start = std::time::Instant::now();
             let result = execute(&mut mpv, cmd.body);
             // Every command, not just slow ones: at the volume real clients send these, one line per

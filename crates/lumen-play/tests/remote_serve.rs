@@ -378,6 +378,10 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
         let Some(Ok(line)) = lines.next() else { break };
+        // Every line the server prints before this point was previously discarded silently unless
+        // it happened to be the one this loop was looking for -- which swallowed whole diagnostics
+        // (`drive_mpv`'s own startup/timing lines among them) before a human ever saw them.
+        println!("[lumen serve stdout] {line}");
         if let Some(rest) = line.strip_prefix("pairing code: ") {
             code = Some(rest.split_whitespace().next().unwrap().to_string());
             break;
@@ -394,6 +398,7 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         let Some(Ok(line)) = lines.next() else { break };
+        println!("[lumen serve stdout] {line}");
         if let Some(rest) = line.strip_prefix("tls fingerprint: ") {
             fingerprint = Some(rest.split("  ").next().unwrap().to_string());
             break;
