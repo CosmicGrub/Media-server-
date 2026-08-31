@@ -13,6 +13,7 @@ members = [
     "crates/lumen-play",
     "crates/lumen-discovery",
     "crates/lumen-exec",
+    "crates/lumen-segment",
     "spikes/s1-compositing",
 ]
 
@@ -40,6 +41,7 @@ lumen-index = { path = "crates/lumen-index" }
 lumen-play = { path = "crates/lumen-play" }
 lumen-discovery = { path = "crates/lumen-discovery" }
 lumen-exec = { path = "crates/lumen-exec" }
+lumen-segment = { path = "crates/lumen-segment" }
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
