@@ -172,8 +172,17 @@ impl VideoStream {
     /// Ignoring SAR shows anamorphic DVD content at 3:2 instead of 16:9 (`docs/11` §6.1); ignoring
     /// crop shows the padding the encoder never meant to display.
     pub fn display_size(&self) -> (u32, u32) {
-        let cropped_w = self.width.saturating_sub(self.crop.left + self.crop.right).max(1);
-        let cropped_h = self.height.saturating_sub(self.crop.top + self.crop.bottom).max(1);
+        // `saturating_add`, not `+`: crop values are meant to come from a probed container's own
+        // crop atoms eventually (`PixelCropLeft`/`PixelCropRight` and friends), the same kind of
+        // attacker-controlled numeric field this codebase never trusts to be sane on its own --
+        // `left + right` panics outright on overflow in a debug build (`cargo test`'s own default
+        // profile) the moment two crop values sum past `u32::MAX`, and silently wraps to a small
+        // number in release instead. `saturating_sub` right after this already treats the *width*
+        // side defensively; the crop-value addition feeding it deserves the same treatment.
+        let cropped_w =
+            self.width.saturating_sub(self.crop.left.saturating_add(self.crop.right)).max(1);
+        let cropped_h =
+            self.height.saturating_sub(self.crop.top.saturating_add(self.crop.bottom)).max(1);
         if !self.sample_aspect.is_valid() || self.sample_aspect.num == self.sample_aspect.den {
             return (cropped_w, cropped_h);
         }
@@ -333,6 +342,18 @@ mod tests {
         let mut s = video(100, 100, Rational::new(1, 1));
         s.crop = CropRect { left: 60, top: 0, right: 60, bottom: 0 };
         assert_eq!(s.display_size(), (1, 100));
+    }
+
+    #[test]
+    fn crop_values_that_would_overflow_u32_clamp_rather_than_panicking() {
+        // Crop values are meant to eventually come from a probed container's own crop atoms --
+        // exactly the kind of attacker/corruption-controlled numeric field this codebase never
+        // trusts to be sane. `left + right` used to be a plain addition, which panicked outright
+        // in a debug build (`cargo test`'s own default profile) the moment two crop values summed
+        // past `u32::MAX`, rather than degrading the same way an over-wide crop already does above.
+        let mut s = video(100, 100, Rational::new(1, 1));
+        s.crop = CropRect { left: u32::MAX, top: u32::MAX, right: u32::MAX, bottom: u32::MAX };
+        assert_eq!(s.display_size(), (1, 1));
     }
 
     #[test]
