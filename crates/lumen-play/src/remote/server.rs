@@ -17,6 +17,8 @@
 //! `SharedState` has moved on and push a `State` line if so. The timeout is what stands in for the
 //! old writer thread's independent polling tick.
 
+mod http;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -389,6 +391,23 @@ fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustl
     let mut last_sent_version = u64::MAX; // Never equal to a real version until one is observed.
     let mut pending = Vec::new(); // Bytes read but not yet forming a complete line.
     let mut chunk = [0u8; 4096];
+
+    // Peek at whatever this connection sends first to decide which protocol it speaks: an HTTP
+    // `GET`/`HEAD` for media streaming (`http::handle_connection`), or the JSON-line control protocol
+    // this function otherwise drives. A single read at the connection's own poll cadence is enough in
+    // the overwhelming common case — a real request line arrives as one write, not trickled in — and
+    // when nothing has arrived yet (an idle JSON client that just connected), `pending` stays empty
+    // and the loop below behaves exactly as it always has.
+    match tls.read(&mut chunk) {
+        Ok(0) => return,
+        Ok(n) => pending.extend_from_slice(&chunk[..n]),
+        Err(e) if is_timeout(&e) => {}
+        Err(_) => return,
+    }
+    if http::looks_like_http_request(&pending) {
+        http::handle_connection(&mut tls, pending, ctx);
+        return;
+    }
     // Counted the moment this socket authenticates, uncounted the moment this function returns by
     // any path -- an early `return` on a dropped or errored connection must decrement exactly as
     // reliably as a clean disconnect does, which is what makes this a `Drop` guard rather than a

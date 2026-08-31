@@ -9,7 +9,7 @@
 //! mpv-dependent tests use — this is infrastructure, not a defect, when it happens in CI on a
 //! platform without mpv preinstalled.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -524,6 +524,59 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
         result.get("library_last_indexed_unix_secs")
     );
 
+    // Tier 3a: HTTP media streaming, multiplexed onto the same TLS listener and pinned fingerprint --
+    // no second port, no second certificate to trust. A real GET, authenticated with the token pairing
+    // already issued, must return the file's real bytes with a container-derived Content-Type.
+    let full_bytes = std::fs::read(&file).unwrap();
+    let encoded_path = file.to_str().unwrap().replace(' ', "%20");
+
+    let mut whole = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    whole
+        .write_all(
+            format!("GET /stream/{encoded_path}?token={token} HTTP/1.1\r\nHost: x\r\n\r\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    let (status, headers, body) = read_http_response(&mut whole);
+    assert_eq!(status, 200, "a plain GET with a valid token must succeed");
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("matroska")),
+        "expected a Matroska content-type, got {headers:?}"
+    );
+    assert_eq!(body, full_bytes, "the streamed bytes must match the file on disk exactly");
+
+    // A ranged request -- the mechanism every real player uses to seek -- gets back exactly the slice
+    // asked for, as 206, not the whole file.
+    let mut ranged = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    ranged
+        .write_all(
+            format!(
+                "GET /stream/{encoded_path}?token={token} HTTP/1.1\r\nHost: x\r\n\
+                 Range: bytes=0-99\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let (status, headers, body) = read_http_response(&mut ranged);
+    assert_eq!(status, 206, "a Range request must be answered as Partial Content");
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-range") && v.starts_with("bytes 0-99/")),
+        "expected a Content-Range header naming the served slice, got {headers:?}"
+    );
+    assert_eq!(body, &full_bytes[0..100], "a ranged GET must return exactly that slice");
+
+    // No token at all -- the whole point of putting streaming behind the same auth as control -- must
+    // be refused, not silently served.
+    let mut anon = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    anon.write_all(format!("GET /stream/{encoded_path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+        .unwrap();
+    let (status, _, _) = read_http_response(&mut anon);
+    assert_eq!(status, 401, "streaming without a token must be refused");
+
     let _ = server.kill();
     let _ = server.wait();
 }
@@ -562,6 +615,57 @@ fn read_message(tls: &mut ClientTls) -> Reply {
     tls.read_line(&mut line).expect("the server must not have closed the connection");
     assert!(!line.is_empty(), "connection closed while a message was expected");
     Reply::parse(&line)
+}
+
+/// Read one full HTTP/1.1 response -- status code, headers, and a body read to exactly
+/// `Content-Length` (or nothing, if the header is absent). A minimal, purpose-built reader, the same
+/// "test independently of the crate's own parser" reasoning [`serde_json_lite`] states for the JSON
+/// side of this file.
+fn read_http_response(tls: &mut ClientTls) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = tls.read(&mut chunk).expect("reading the HTTP response must not fail");
+        assert!(n > 0, "connection closed before a complete header block arrived");
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    let head = std::str::from_utf8(&buf[..header_end]).expect("headers must be valid UTF-8");
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().expect("a response must have a status line");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .expect("a status line must carry a code")
+        .parse()
+        .expect("the status code must be numeric");
+
+    let mut headers = Vec::new();
+    let mut content_length = None;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let (k, v) = (k.trim().to_string(), v.trim().to_string());
+        if k.eq_ignore_ascii_case("content-length") {
+            content_length = v.parse::<usize>().ok();
+        }
+        headers.push((k, v));
+    }
+
+    let mut body = buf[header_end..].to_vec();
+    let want = content_length.unwrap_or(0);
+    while body.len() < want {
+        let n = tls.read(&mut chunk).expect("reading the HTTP body must not fail");
+        assert!(n > 0, "connection closed before the full body arrived");
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(want);
+    (status, headers, body)
 }
 
 fn connect_with_retry(port: u16, timeout: Duration) -> TcpStream {
