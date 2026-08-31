@@ -348,6 +348,15 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
             "--",
             "--vo=null", // No display in CI or this container; audio/video pipeline still runs.
             "--ao=null", // No audio device either, for the same reason.
+            // `spawn_idle_mpv` hardcodes `--force-window=yes` so a real desktop `lumen serve` shows a
+            // window the moment it starts, before any file is loaded. `--vo=null` alone does not
+            // cancel that: mpv still tries to create the window, and on a Windows CI runner (which has
+            // no interactive window station — it runs as a service session) that creation call can
+            // block indefinitely, well before mpv ever reaches its IPC command loop. That is why every
+            // property/command sent over the pipe just sat there un-drained: mpv was never getting far
+            // enough into startup to read it, not any bug in the client-side IPC or driver code. Extra
+            // args come last and win (see `spawn_idle_mpv`'s doc comment), so this cancels it.
+            "--force-window=no",
         ])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("APPDATA", &config_dir)
