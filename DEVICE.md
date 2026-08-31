@@ -26,10 +26,25 @@ tool that walks a filesystem, speaks JSON over a socket, and launches `mpv.exe`.
 compatibility is a property of not doing anything version-specific, not a feature that needed
 building**, and that has been true since the first Windows build in this project.
 
-**Not yet exercised end to end on either target:** `release.yml` has not produced a real tagged
-release — tag pushes are blocked (403) in the environment this was built in. The
-`package-windows.sh` cross-compiled path *has* been verified, including a five-file real-media run
-under Wine on a machine with no GPU. Real GPU rendering, on either build path, remains unverified.
+`release.yml`'s actual release mechanism is the rolling `desktop-latest` prerelease it publishes on
+every push to this branch, not a `vX.Y.Z` tag — the workflow was built that way deliberately, so a
+build always exists at the tip of active work rather than only at the versions someone remembered to
+tag. That path **has** been exercised for real, confirmed against the GitHub API rather than
+assumed: `desktop-latest` has been live since 2026-08-09, its `lumen-windows-x86_64.zip` and
+`lumen-linux-x86_64.tar.gz` assets rebuilt and re-uploaded by a real `windows-latest`/`ubuntu-latest`
+run on every push since, most recently confirmed 2026-08-31.
+
+A genuine `vX.Y.Z` tag push, separately, is still blocked (403) — confirmed again on 2026-08-31,
+after the repo went public, so this is a property of the environment this project is developed in,
+not of the repo's visibility. It would not itself produce a different or more-verified artifact even
+if it worked, since nothing in `release.yml` treats a tag push differently from the rolling release
+above; it just is not exercisable from here.
+
+**Still not exercised on either build target:** real GPU rendering. The `package-windows.sh`
+cross-compiled path *has* been verified beyond compiling, including a five-file real-media run under
+Wine on a machine with no GPU; the natively-built `release.yml` path decodes a real file as part of
+its own CI run (`Verify real playback`) but that CI runner has no GPU either. Neither has been run on
+a machine with one.
 
 ## What is actually specific to this fork
 
