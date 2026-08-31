@@ -25,8 +25,18 @@ on:
     # fine until the day someone expects `desktop-latest` to have updated and it hasn't.
     branches: ['**']
     tags: ['v*']
+    # The whole workspace, not just `crates/lumen-play/**`: `lumen-play`'s own Cargo.toml depends on
+    # lumen-model, lumen-caps, lumen-playback, lumen-probe, lumen-match, lumen-identity, lumen-index
+    # and lumen-discovery, so a fix landing in any of *those* changes what actually gets compiled into
+    # lumen.exe just as much as a change inside lumen-play's own src/ does -- and with the narrower
+    # filter, such a fix would silently never trigger a rebuild here at all. This is exactly the gap
+    # `rust.yml`'s own paths list (which already watches the whole workspace) never had; mirroring it
+    # here is what closes it, rather than trying to keep an explicit, easily-stale list of which
+    # crates lumen-play currently happens to depend on in sync by hand.
     paths:
-      - 'crates/lumen-play/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
