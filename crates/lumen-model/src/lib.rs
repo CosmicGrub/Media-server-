@@ -15,13 +15,13 @@ mod stream;
 
 pub use codec::{AudioCodec, Codec, SubtitleCodec, VideoCodec};
 pub use color::{
-    ColorInfo, ColorPrimaries, ColorRange, ColorTransfer, HdrFormat, MasteringDisplay,
+    ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, ColorTransfer, HdrFormat, MasteringDisplay,
 };
 pub use container::Container;
 pub use source::{Integrity, MediaSource, Transport};
 pub use stream::{
-    AudioStream, ChannelLayout, FieldOrder, Rational, StereoMode, StreamFlags, StreamKind,
-    SubtitleStream, VideoStream,
+    AudioStream, ChannelLayout, CropRect, FieldOrder, Rational, StereoMode, StreamFlags,
+    StreamKind, SubtitleStream, TelecinePattern, VideoStream,
 };
 
 /// Language tag. Accepts ISO 639-2 and BCP-47; `und` when absent.

@@ -83,6 +83,8 @@ pub struct FileResult {
     pub primaries: Option<String>,
     /// Transfer function. `pq` is HDR10/Dolby Vision, `hlg` is broadcast HDR, anything else is SDR.
     pub gamma: Option<String>,
+    /// YUV-to-RGB matrix coefficients, e.g. `bt.2020-ncl`.
+    pub colormatrix: Option<String>,
     /// Whether mpv can seek in this file. A long video that reports `false` has lost its index —
     /// Matroska Cues or an MP4 `moov` — which plays start-to-finish but cannot be navigated. It is
     /// the defect a play-through test would never notice, because playing forward still works.
@@ -157,6 +159,7 @@ impl FileResult {
             pixel_format: None,
             primaries: None,
             gamma: None,
+            colormatrix: None,
             seekable: None,
             audio_channels: None,
             track_counts: TrackCounts::default(),
@@ -510,6 +513,7 @@ fn collect_properties(mpv: &mut Mpv, r: &mut FileResult) {
     r.pixel_format = mpv.get_string("video-params/pixelformat");
     r.primaries = mpv.get_string("video-params/primaries");
     r.gamma = mpv.get_string("video-params/gamma");
+    r.colormatrix = mpv.get_string("video-params/colormatrix");
     r.seekable = mpv.get("seekable").and_then(|v| v.as_bool());
     r.audio_channels = mpv.get_string("audio-params/channel-count");
     if let Some(list) = mpv.get("track-list") {

@@ -17,9 +17,9 @@
 
 use lumen_caps::ClientCapabilities;
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, ColorInfo, ColorPrimaries, ColorRange, ColorTransfer,
-    Container, HdrFormat, Integrity, Language, MediaSource, Rational, StreamFlags, SubtitleCodec,
-    SubtitleStream, Transport, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange,
+    ColorTransfer, Container, HdrFormat, Integrity, Language, MediaSource, Rational, StreamFlags,
+    SubtitleCodec, SubtitleStream, Transport, VideoCodec, VideoStream,
 };
 use lumen_playback::{Selection, Tier, TrackPreferences, plan, select};
 
@@ -149,6 +149,10 @@ pub fn media_source(r: &FileResult, scanned: &ScannedFile) -> Option<MediaSource
                 stereo_mode: lumen_model::StereoMode::default(),
                 bitrate_bps: t.bitrate_bps,
                 flags: flags_of(t),
+                // mpv exposes no per-track crop or telecine detection; both stay at their honest
+                // defaults rather than being guessed.
+                crop: lumen_model::CropRect::default(),
+                telecine: lumen_model::TelecinePattern::default(),
             }),
             "audio" => source.audio.push(AudioStream {
                 index: t.id,
@@ -245,6 +249,16 @@ fn color_info(r: &FileResult) -> ColorInfo {
         Some("display-p3") => ColorPrimaries::DisplayP3,
         _ => ColorPrimaries::Unspecified,
     };
+    // mpv's `video-params/colormatrix` uses the same naming family as `primaries`/`gamma`.
+    let matrix = match r.colormatrix.as_deref() {
+        Some("bt.709") => ColorMatrix::Bt709,
+        Some("bt.601") => ColorMatrix::Bt601,
+        Some("bt.2020-ncl") => ColorMatrix::Bt2020Ncl,
+        Some("bt.2020-cl") => ColorMatrix::Bt2020Cl,
+        Some("ycgco") => ColorMatrix::YCgCo,
+        Some("ictcp") => ColorMatrix::IcTcP,
+        _ => ColorMatrix::Unspecified,
+    };
     // The transfer function decides HDR, not the primaries: BT.2020 with a conventional gamma curve
     // is wide-gamut SDR, and conflating the two would misreport a distinction this product exists to
     // get right. Dolby Vision is not detectable from these properties, so PQ is reported as HDR10 —
@@ -254,7 +268,7 @@ fn color_info(r: &FileResult) -> ColorInfo {
         ColorTransfer::Hlg => HdrFormat::Hlg,
         _ => HdrFormat::Sdr,
     };
-    ColorInfo { primaries, transfer, range: ColorRange::Unspecified, hdr, mastering: None }
+    ColorInfo { primaries, transfer, matrix, range: ColorRange::Unspecified, hdr, mastering: None }
 }
 
 /// mpv's `file-format` is FFmpeg's demuxer name, which is often a comma-separated family.
@@ -450,6 +464,7 @@ mod tests {
             pixel_format: Some("yuv420p10le".into()),
             primaries: Some("bt.2020".into()),
             gamma: Some("pq".into()),
+            colormatrix: Some("bt.2020-ncl".into()),
             seekable: Some(true),
             audio_channels: Some("8".into()),
             track_counts: Default::default(),
@@ -598,6 +613,17 @@ mod tests {
         assert_eq!(color_info(&r).hdr, HdrFormat::Hdr10);
         r.gamma = Some("hlg".into());
         assert_eq!(color_info(&r).hdr, HdrFormat::Hlg);
+    }
+
+    #[test]
+    fn colormatrix_is_read_the_same_way_as_primaries_and_gamma() {
+        let mut r = result(Vec::new());
+        r.colormatrix = Some("bt.2020-ncl".into());
+        assert_eq!(color_info(&r).matrix, ColorMatrix::Bt2020Ncl);
+        r.colormatrix = Some("bt.709".into());
+        assert_eq!(color_info(&r).matrix, ColorMatrix::Bt709);
+        r.colormatrix = None;
+        assert_eq!(color_info(&r).matrix, ColorMatrix::Unspecified, "unknown is not a guess");
     }
 
     #[test]

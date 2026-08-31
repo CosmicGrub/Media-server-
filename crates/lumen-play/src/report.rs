@@ -448,7 +448,8 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
                         "      {{\"path\":{},\"outcome\":{},\"error\":{},\"seconds_played\":{},\
                          \"file_format\":{},\"video_codec\":{},\"audio_codec\":{},\"width\":{},\
                          \"height\":{},\"fps\":{},\"duration\":{},\"hwdec\":{},\"seekable\":{},\
-                         \"pixel_format\":{},\"primaries\":{},\"gamma\":{},\"hdr\":{},\
+                         \"pixel_format\":{},\"primaries\":{},\"gamma\":{},\"colormatrix\":{},\
+                         \"hdr\":{},\
                          \"tracks\":{{\"video\":{},\"audio\":{},\"subtitle\":{}}},\
                          \"fidelity\":{},\"delayed_frames\":{},\"dropped_frames\":{}}}",
                         quote(&r.path.to_string_lossy()),
@@ -467,6 +468,7 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
                         opt_str(r.pixel_format.as_deref()),
                         opt_str(r.primaries.as_deref()),
                         opt_str(r.gamma.as_deref()),
+                        opt_str(r.colormatrix.as_deref()),
                         r.is_hdr(),
                         r.track_counts.video,
                         r.track_counts.audio,
@@ -710,6 +712,7 @@ mod tests {
             pixel_format: None,
             primaries: None,
             gamma: None,
+            colormatrix: None,
             seekable: None,
             audio_channels: None,
             track_counts: crate::session::TrackCounts::default(),

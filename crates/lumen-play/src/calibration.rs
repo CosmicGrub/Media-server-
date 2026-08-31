@@ -49,7 +49,28 @@ pub struct CalibrationEntry {
     /// Carried along as context, not compared against a prediction -- the ladder does not predict a
     /// frame-drop count, so there is nothing here to call a hit or a miss.
     pub dropped_frames: Option<u64>,
+    /// How long this session actually played, in seconds -- the denominator [`drop_rate_flagged`]
+    /// needs to turn a raw dropped-frame count into a rate: a long session naturally accumulates more
+    /// drops than a short one at the same underlying rate, so the count alone says nothing.
+    ///
+    /// [`drop_rate_flagged`]: CalibrationEntry::drop_rate_flagged
+    pub seconds_played: f64,
+    /// The file's own reported frame rate, when known -- the other half of the expected-frame-count
+    /// calculation `drop_rate_flagged` needs. `None` for VFR content or a build too old to have
+    /// reported it, both of which mean there is nothing to judge a raw drop count against.
+    pub expected_fps: Option<f64>,
 }
+
+/// Below this many seconds played, any dropped-frame count is noise, not signal -- a session that
+/// barely started (an immediate seek away, a quick preview) can report a handful of drops purely
+/// from startup that would never recur in normal viewing.
+const MIN_SECONDS_FOR_DROP_RATE: f64 = 2.0;
+
+/// A visually perceptible amount of stutter starts well under "most frames are fine" -- 2% is a
+/// commonly cited threshold for when dropped frames become noticeable rather than lost in normal
+/// playback jitter, and matches the order of magnitude this module's own doc comment already uses
+/// elsewhere ("a real, checkable miss," not a statistical curiosity).
+const DROP_RATE_THRESHOLD: f64 = 0.02;
 
 impl CalibrationEntry {
     /// `None` when there is nothing to compare (an unrecognised codec, or hardware decode was never
@@ -62,16 +83,37 @@ impl CalibrationEntry {
         Some(predicted == observed_hardware)
     }
 
+    /// `Some(true)` when this session's dropped-frame *rate* -- not the raw count -- exceeds
+    /// [`DROP_RATE_THRESHOLD`], a real, visually-relevant stutter signal the ladder never predicts a
+    /// value for and so cannot be judged against a prediction the way hardware decode is; this is a
+    /// threshold check against reality, not a hit/miss against a claim. `None` when there is nothing
+    /// to judge: no drop count was reported, the frame rate is unknown (VFR content, or a build too
+    /// old to have reported it), or the session played too briefly for a count to mean anything (see
+    /// [`MIN_SECONDS_FOR_DROP_RATE`]).
+    pub fn drop_rate_flagged(&self) -> Option<bool> {
+        let dropped = self.dropped_frames?;
+        let fps = self.expected_fps.filter(|f| *f > 0.0)?;
+        if self.seconds_played < MIN_SECONDS_FOR_DROP_RATE {
+            return None;
+        }
+        let expected_frames = fps * self.seconds_played;
+        let rate = dropped as f64 / expected_frames;
+        Some(rate > DROP_RATE_THRESHOLD)
+    }
+
     fn to_json_line(&self) -> String {
         format!(
             "{{\"path\":{},\"unix_secs\":{},\"video_codec\":{},\"predicted_hardware_decode\":{},\
-             \"observed_hwdec\":{},\"dropped_frames\":{}}}",
+             \"observed_hwdec\":{},\"dropped_frames\":{},\"seconds_played\":{},\
+             \"expected_fps\":{}}}",
             quote(&self.path.to_string_lossy()),
             self.unix_secs,
             opt_str(self.video_codec.as_deref()),
             opt_bool(self.predicted_hardware_decode),
             opt_str(self.observed_hwdec.as_deref()),
             opt_num(self.dropped_frames),
+            self.seconds_played,
+            opt_f64(self.expected_fps),
         )
     }
 
@@ -89,6 +131,11 @@ impl CalibrationEntry {
                 .and_then(json::Value::as_str)
                 .map(str::to_string),
             dropped_frames: v.get("dropped_frames").and_then(json::Value::as_f64).map(|n| n as u64),
+            // Absent in a line written before this field existed -- 0.0 reads back as "too brief to
+            // judge" via `MIN_SECONDS_FOR_DROP_RATE`, the same honest "nothing to compare" outcome an
+            // old entry genuinely earns rather than a fabricated duration.
+            seconds_played: v.get("seconds_played").and_then(json::Value::as_f64).unwrap_or(0.0),
+            expected_fps: v.get("expected_fps").and_then(json::Value::as_f64),
         })
     }
 }
@@ -101,6 +148,9 @@ fn opt_num(n: Option<u64>) -> String {
 }
 fn opt_bool(b: Option<bool>) -> String {
     b.map_or_else(|| "null".to_string(), |v| v.to_string())
+}
+fn opt_f64(f: Option<f64>) -> String {
+    f.map_or_else(|| "null".to_string(), |v| v.to_string())
 }
 
 /// Build a calibration entry from one real playback result -- `None` when there is nothing to record
@@ -118,6 +168,8 @@ pub fn observe(r: &FileResult) -> Option<CalibrationEntry> {
         predicted_hardware_decode: predicted_hardware_decode(r),
         observed_hwdec: r.hwdec.clone(),
         dropped_frames: r.dropped_frames,
+        seconds_played: r.seconds_played,
+        expected_fps: r.fps,
     })
 }
 
@@ -170,6 +222,15 @@ pub fn read_all(path: &Path) -> std::io::Result<Vec<CalibrationEntry>> {
 /// A short, human-readable summary for `lumen doctor` -- turns the raw log into "how often has the
 /// hardware-decode prediction actually held", the number the fidelity model's own honesty depends on.
 pub fn summarize(entries: &[CalibrationEntry]) -> String {
+    let mut s = hardware_decode_summary(entries);
+    if let Some(drop_section) = drop_rate_summary(entries) {
+        s.push('\n');
+        s.push_str(&drop_section);
+    }
+    s
+}
+
+fn hardware_decode_summary(entries: &[CalibrationEntry]) -> String {
     let checkable: Vec<&CalibrationEntry> =
         entries.iter().filter(|e| e.hardware_decode_as_predicted().is_some()).collect();
     if checkable.is_empty() {
@@ -210,6 +271,50 @@ pub fn summarize(entries: &[CalibrationEntry]) -> String {
     }
 }
 
+/// `None` when no session has anything to judge -- unlike the hardware-decode section above, this is
+/// worth omitting entirely rather than printing an empty "no data" line every time, since a build
+/// that never reported an fps (an older client, or a run of VFR-only content) would otherwise print
+/// two redundant "nothing to compare" sentences back to back.
+fn drop_rate_summary(entries: &[CalibrationEntry]) -> Option<String> {
+    let checkable: Vec<&CalibrationEntry> =
+        entries.iter().filter(|e| e.drop_rate_flagged().is_some()).collect();
+    if checkable.is_empty() {
+        return None;
+    }
+    let flagged: Vec<&&CalibrationEntry> =
+        checkable.iter().filter(|e| e.drop_rate_flagged() == Some(true)).collect();
+    if flagged.is_empty() {
+        return Some(format!(
+            "{}/{} real playback session{} stayed under the {:.0}% dropped-frame threshold",
+            checkable.len(),
+            checkable.len(),
+            if checkable.len() == 1 { "" } else { "s" },
+            DROP_RATE_THRESHOLD * 100.0,
+        ));
+    }
+    let mut s = format!(
+        "{}/{} real playback sessions exceeded the {:.0}% dropped-frame threshold:",
+        flagged.len(),
+        checkable.len(),
+        DROP_RATE_THRESHOLD * 100.0,
+    );
+    for e in flagged {
+        // Both are `Some` here: `drop_rate_flagged` only returns `Some(_)` when `dropped_frames` and
+        // a positive `expected_fps` are both present, so re-deriving the same rate to display is
+        // exactly what was just judged, not a second, possibly-inconsistent computation.
+        let dropped = e.dropped_frames.unwrap_or(0);
+        let expected_frames = e.expected_fps.unwrap_or(0.0) * e.seconds_played;
+        let rate =
+            if expected_frames > 0.0 { dropped as f64 / expected_frames * 100.0 } else { 0.0 };
+        s.push_str(&format!(
+            "\n  {} -- {dropped} dropped over {:.0}s ({rate:.1}%)",
+            e.path.display(),
+            e.seconds_played,
+        ));
+    }
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +342,7 @@ mod tests {
             pixel_format: None,
             primaries: None,
             gamma: None,
+            colormatrix: None,
             seekable: None,
             audio_channels: None,
             track_counts: TrackCounts::default(),
@@ -314,6 +420,58 @@ mod tests {
         assert_eq!(entry.hardware_decode_as_predicted(), None);
     }
 
+    fn played_result_with_drops(fps: f64, seconds_played: f64, dropped_frames: u64) -> FileResult {
+        let mut r = played_result(Some("hevc"), Some("videotoolbox"));
+        r.fps = Some(fps);
+        r.seconds_played = seconds_played;
+        r.dropped_frames = Some(dropped_frames);
+        r
+    }
+
+    #[test]
+    fn a_drop_rate_under_the_threshold_is_not_flagged() {
+        // 24 fps for 60s expects 1440 frames; 10 dropped is ~0.7%, under the 2% threshold.
+        let entry = observe(&played_result_with_drops(24.0, 60.0, 10)).unwrap();
+        assert_eq!(entry.drop_rate_flagged(), Some(false));
+    }
+
+    #[test]
+    fn a_drop_rate_over_the_threshold_is_flagged() {
+        // 24 fps for 60s expects 1440 frames; 100 dropped is ~7%, well over the 2% threshold.
+        let entry = observe(&played_result_with_drops(24.0, 60.0, 100)).unwrap();
+        assert_eq!(entry.drop_rate_flagged(), Some(true));
+    }
+
+    #[test]
+    fn no_known_frame_rate_is_not_a_confirmed_judgement() {
+        // VFR content, or a build too old to have reported fps -- nothing to divide by, so nothing
+        // to judge, not a fabricated rate against an assumed frame rate.
+        let mut r = played_result(Some("hevc"), Some("videotoolbox"));
+        r.fps = None;
+        r.dropped_frames = Some(500);
+        let entry = observe(&r).unwrap();
+        assert_eq!(entry.drop_rate_flagged(), None);
+    }
+
+    #[test]
+    fn a_session_too_brief_to_mean_anything_is_not_judged() {
+        let entry = observe(&played_result_with_drops(24.0, 0.5, 5)).unwrap();
+        assert_eq!(
+            entry.drop_rate_flagged(),
+            None,
+            "a fraction of a second played is not enough signal to judge, however many drops"
+        );
+    }
+
+    #[test]
+    fn no_dropped_frame_count_at_all_is_not_judged() {
+        let mut r = played_result(Some("hevc"), Some("videotoolbox"));
+        r.fps = Some(24.0);
+        r.dropped_frames = None;
+        let entry = observe(&r).unwrap();
+        assert_eq!(entry.drop_rate_flagged(), None);
+    }
+
     #[test]
     fn append_then_read_all_round_trips_every_field() {
         let dir = std::env::temp_dir().join(format!("lumen-calibration-{}", std::process::id()));
@@ -330,10 +488,69 @@ mod tests {
         assert_eq!(loaded[0].video_codec.as_deref(), Some("hevc"));
         assert_eq!(loaded[0].predicted_hardware_decode, Some(true));
         assert_eq!(loaded[0].dropped_frames, Some(3));
+        assert_eq!(loaded[0].seconds_played, 5.0);
         assert_eq!(loaded[1].video_codec.as_deref(), Some("vc1"));
         assert_eq!(loaded[1].predicted_hardware_decode, Some(false));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn expected_fps_round_trips_and_a_missing_one_reads_back_as_null() {
+        let dir =
+            std::env::temp_dir().join(format!("lumen-calibration-fps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("calibration.jsonl");
+
+        let with_fps = observe(&played_result_with_drops(24.0, 60.0, 10)).unwrap();
+        let without_fps = observe(&played_result(Some("hevc"), Some("no"))).unwrap();
+        append(&path, &with_fps).unwrap();
+        append(&path, &without_fps).unwrap();
+
+        let loaded = read_all(&path).unwrap();
+        assert_eq!(loaded[0].expected_fps, Some(24.0));
+        assert_eq!(loaded[0].seconds_played, 60.0);
+        assert_eq!(loaded[1].expected_fps, None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_v1_line_with_no_drop_rate_columns_still_loads_with_nothing_to_judge() {
+        // Exactly what a build before this field existed would have written -- no seconds_played or
+        // expected_fps keys at all.
+        let line = r#"{"path":"/a.mkv","unix_secs":1000,"video_codec":"hevc","predicted_hardware_decode":true,"observed_hwdec":"no","dropped_frames":500}"#;
+        let entry = CalibrationEntry::from_json_line(line).unwrap();
+        assert_eq!(entry.seconds_played, 0.0);
+        assert_eq!(entry.expected_fps, None);
+        assert_eq!(
+            entry.drop_rate_flagged(),
+            None,
+            "an old entry with no duration on record must not be judged as if it played 0 seconds \
+             worth of a real session"
+        );
+    }
+
+    #[test]
+    fn summarize_reports_a_drop_rate_section_only_when_there_is_something_to_judge() {
+        let no_data = summarize(&[]);
+        assert!(
+            !no_data.contains("dropped-frame threshold"),
+            "an empty log has nothing to say about drop rate either: {no_data}"
+        );
+
+        let nothing_checkable =
+            summarize(&[observe(&played_result(Some("hevc"), Some("no"))).unwrap()]);
+        assert!(
+            !nothing_checkable.contains("dropped-frame threshold"),
+            "no fps ever reported means nothing to judge: {nothing_checkable}"
+        );
+
+        let mut flagged = observe(&played_result_with_drops(24.0, 60.0, 100)).unwrap();
+        flagged.path = PathBuf::from("/lib/stuttery.mkv");
+        let with_a_flag = summarize(&[flagged]);
+        assert!(with_a_flag.contains("dropped-frame threshold"), "{with_a_flag}");
+        assert!(with_a_flag.contains("stuttery.mkv"), "{with_a_flag}");
     }
 
     #[test]

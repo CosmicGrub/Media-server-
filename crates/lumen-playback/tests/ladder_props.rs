@@ -13,9 +13,9 @@ use lumen_caps::{
     VideoDecodeCaps,
 };
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, ColorInfo, Container, FieldOrder, HdrFormat, Integrity,
-    Language, MediaSource, Rational, StereoMode, StreamFlags, SubtitleCodec, SubtitleStream,
-    Transport, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, ColorInfo, Container, CropRect, FieldOrder, HdrFormat,
+    Integrity, Language, MediaSource, Rational, StereoMode, StreamFlags, SubtitleCodec,
+    SubtitleStream, TelecinePattern, Transport, VideoCodec, VideoStream,
 };
 use lumen_playback::{
     AudioPath, ContainerPlan, PlaybackPlan, Selection, SubtitleDelivery, Tier, VideoPath, plan,
@@ -291,6 +291,8 @@ prop_compose! {
             stereo_mode: StereoMode::Mono,
             bitrate_bps: None,
             flags: StreamFlags::enabled(),
+            crop: CropRect::default(),
+            telecine: TelecinePattern::default(),
         });
         s.audio.push(AudioStream {
             index: 1,
@@ -560,6 +562,8 @@ fn uhd_remux() -> MediaSource {
         stereo_mode: StereoMode::Mono,
         bitrate_bps: None,
         flags: StreamFlags::enabled(),
+        crop: CropRect::default(),
+        telecine: TelecinePattern::default(),
     });
     s.audio.push(AudioStream {
         index: 1,
@@ -699,6 +703,8 @@ fn hi10p_anime_direct_plays_on_a_software_decoder_and_notes_it() {
         stereo_mode: StereoMode::Mono,
         bitrate_bps: None,
         flags: StreamFlags::enabled(),
+        crop: CropRect::default(),
+        telecine: TelecinePattern::default(),
     });
     src.audio.push(AudioStream {
         index: 1,

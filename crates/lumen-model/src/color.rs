@@ -42,6 +42,27 @@ impl ColorTransfer {
     }
 }
 
+/// The coefficients used to convert YUV to RGB. A distinct dimension from [`ColorPrimaries`]/
+/// [`ColorTransfer`] -- getting this wrong produces the same class of visible colour-shift defect
+/// range mishandling does (`docs/11` §6.3 groups them together for exactly that reason), but nothing
+/// about knowing a stream's primaries or transfer function tells a decoder which matrix to invert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ColorMatrix {
+    #[default]
+    Unspecified,
+    Bt709,
+    Bt601,
+    /// Non-constant-luminance YCgCo, used by some screen-capture and lossless encodes.
+    YCgCo,
+    /// BT.2020 non-constant luminance -- the common case for HDR content.
+    Bt2020Ncl,
+    /// BT.2020 constant luminance -- rare, but a real, distinct matrix from NCL.
+    Bt2020Cl,
+    /// ICtCp, the matrix Dolby Vision and some HDR mastering pipelines use in place of BT.2020.
+    IcTcP,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorRange {
     #[default]
@@ -137,6 +158,7 @@ impl HdrFormat {
 pub struct ColorInfo {
     pub primaries: ColorPrimaries,
     pub transfer: ColorTransfer,
+    pub matrix: ColorMatrix,
     pub range: ColorRange,
     pub hdr: HdrFormat,
     pub mastering: Option<MasteringDisplay>,
@@ -169,6 +191,12 @@ mod tests {
         // MEL's enhancement layer carries no picture detail, so base-layer playback is complete.
         assert!(!HdrFormat::DolbyVisionP7Mel.is_lossy_to_reproduce());
         assert!(!HdrFormat::Hdr10Plus.is_lossy_to_reproduce());
+    }
+
+    #[test]
+    fn color_matrix_defaults_to_unspecified() {
+        assert_eq!(ColorMatrix::default(), ColorMatrix::Unspecified);
+        assert_eq!(ColorInfo::default().matrix, ColorMatrix::Unspecified);
     }
 
     #[test]
