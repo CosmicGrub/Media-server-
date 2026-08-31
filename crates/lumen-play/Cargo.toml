@@ -37,5 +37,16 @@ time = { version = "0.3", default-features = false }
 # is already in the dependency graph via `rustls`/`getrandom`, so this adds no new transitive crate.
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 
+[target.'cfg(windows)'.dependencies]
+# `ipc.rs`'s Windows named-pipe transport: two `File`s duplicated from one `CreateFileW` handle (via
+# `try_clone`) deadlocked the moment a real command was sent, because Windows serializes synchronous
+# (non-overlapped) I/O per file object -- a pending read on one duplicated handle blocks a write on
+# the other, and mpv was never going to reply until it received that write. `unsafe_code` is denied
+# workspace-wide, which rules out driving Windows' overlapped I/O by hand the same way `getrandom`
+# above was needed for the OS random source; this crate's named-pipe support gives each split half
+# its own overlapped I/O state so a read and a write on the same connection genuinely don't contend.
+# `default-features = false` keeps it to plain synchronous named pipes -- no tokio, no async runtime.
+interprocess = { version = "2.4.3", default-features = false }
+
 [lints]
 workspace = true

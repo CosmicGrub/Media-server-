@@ -77,11 +77,23 @@ impl Mpv {
         Ok(Self::spawn_reader(Box::new(stream), Box::new(reader)))
     }
 
+    // `std::fs::OpenOptions`/`File::try_clone` used to be used here, the same pattern as the Unix
+    // branch above: open once, `DuplicateHandle` a second handle for the reader thread. It compiled
+    // and connected fine, and then deadlocked the instant a real command was sent -- every write
+    // blocked forever, and so did the reader thread's very next read. The two duplicated handles are
+    // still the *same* underlying kernel pipe object, and Windows serializes synchronous (i.e.
+    // non-overlapped, which `File` always is) I/O per file object: a pending blocking `ReadFile` on
+    // one handle holds up a `WriteFile` on the other, and since mpv was never going to reply until it
+    // received that write, the two sides waited on each other forever. `interprocess`'s named-pipe
+    // support exists specifically to give each half its own overlapped I/O state instead of sharing
+    // one synchronous handle across threads, which is what actually lets a read and a write happen
+    // concurrently without contention.
     #[cfg(windows)]
     fn try_connect(path: &str) -> std::io::Result<Self> {
-        let pipe = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-        let reader = pipe.try_clone()?;
-        Ok(Self::spawn_reader(Box::new(pipe), Box::new(reader)))
+        use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode};
+        let conn = DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path(path)?;
+        let (reader, writer) = conn.split();
+        Ok(Self::spawn_reader(Box::new(writer), Box::new(reader)))
     }
 
     #[cfg(not(any(unix, windows)))]
