@@ -427,6 +427,24 @@ jobs:
           done
           ls -lh "${ASSETS[@]}"
 
+          # Drop anything already attached to the release that this run did not just build. Without
+          # this, an asset from a platform later removed from the matrix (macOS, here, on 2026-08-31)
+          # sits on the "latest" release forever: `--clobber` below only ever overwrites or adds, never
+          # removes, so `desktop-latest` would keep offering a macOS bundle years after the workflow
+          # stopped building one -- silently wrong in exactly the way a rolling release is supposed to
+          # never be. `gh release view --json` and `gh release delete-asset` no-op cleanly when the
+          # release doesn't exist yet or carries no extra assets.
+          if gh release view desktop-latest >/dev/null 2>&1; then
+            while IFS= read -r stale; do
+              [ -z "$stale" ] && continue
+              echo "removing stale asset from a previous platform matrix: $stale"
+              gh release delete-asset desktop-latest "$stale" --yes
+            done < <(
+              gh release view desktop-latest --json assets --jq '.assets[].name' \
+                | grep -vxF -f <(printf '%s\n' "${ASSETS[@]}")
+            )
+          fi
+
           NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
 
           Two platform bundles from the same commit: Windows and Linux — both self-contained,
