@@ -401,6 +401,17 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     }
     let fingerprint = fingerprint.expect("the server must print a TLS fingerprint on startup");
 
+    // Everything the server logs after this point (including `drive_mpv`'s own per-command timing)
+    // still has to be drained, or two real bugs follow: the lines themselves are invisible to this
+    // test's own output, and -- worse -- once the OS pipe buffer behind `Stdio::piped()` fills, the
+    // server's next `println!` blocks waiting for a reader that will never come back, which would
+    // make the server itself appear to hang for a reason that has nothing to do with mpv at all.
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            println!("[lumen serve stdout] {line}");
+        }
+    });
+
     rustls::crypto::ring::default_provider().install_default().ok();
 
     // Give the listener a moment to actually be accepting connections — it starts after the

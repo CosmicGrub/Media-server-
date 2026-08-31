@@ -81,6 +81,22 @@ enum CommandBody {
     },
 }
 
+impl CommandBody {
+    /// For diagnostics only -- naming which command a slow `execute` call was, without a full
+    /// `Debug` impl that would print a played file's whole path into the log.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Play(_) => "play",
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Toggle => "toggle",
+            Self::Seek(_) => "seek",
+            Self::SetVolume(_) => "set_volume",
+            Self::Health { .. } => "health",
+        }
+    }
+}
+
 /// State every connected client can read without going through the driver thread at all.
 struct SharedState {
     state: Mutex<PlaybackState>,
@@ -191,6 +207,10 @@ pub fn run(
     extra_mpv_args: &[String],
     log: impl Fn(&str) + Send + Sync + 'static,
 ) -> Result<(), String> {
+    // `Arc`-wrapped so `drive_mpv`'s own thread below can log its own timing independently, without
+    // this function needing to be generic over the closure type at every call site that logs.
+    let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(log);
+
     // Canonicalized once, up front: every `Play` request is checked against this root later, and
     // resolving symlinks/`..` here rather than per-request is both cheaper and means a single
     // definition of "inside the library" is shared by the scan and the containment check.
@@ -222,15 +242,18 @@ pub fn run(
     let _ = std::fs::remove_file(&ipc_path);
     let mut child = spawn_idle_mpv(&ipc_path, extra_mpv_args)
         .map_err(|e| format!("cannot launch mpv: {e}\n\n{}", crate::mpvbin::install_hint()))?;
+    let connect_start = std::time::Instant::now();
     let mpv = Mpv::connect(&ipc_path, Duration::from_secs(20)).map_err(|e| {
         let _ = child.kill();
         format!("mpv started but its IPC socket never appeared ({e})")
     })?;
+    log(&format!("mpv IPC connected after {:?}", connect_start.elapsed()));
 
     let (tx, rx) = mpsc::channel::<Command>();
     let shared = Arc::new(SharedState::new());
     let driver_shared = Arc::clone(&shared);
-    std::thread::spawn(move || drive_mpv(mpv, rx, &driver_shared));
+    let driver_log = Arc::clone(&log);
+    std::thread::spawn(move || drive_mpv(mpv, rx, &driver_shared, &*driver_log));
 
     let token_path = TokenStore::default_path();
     let tokens = Arc::new(Mutex::new(TokenStore::load(&token_path)));
@@ -308,18 +331,44 @@ fn spawn_idle_mpv(ipc_path: &str, extra_args: &[String]) -> std::io::Result<std:
 /// properties into `shared`. Interleaved in a loop rather than two threads for the same reason
 /// `session.rs`'s run loop interleaves control and events — a command and a property read can never
 /// race each other if the same loop iteration is the only place either happens.
-fn drive_mpv(mut mpv: Mpv, commands: Receiver<Command>, shared: &SharedState) {
+fn drive_mpv(
+    mut mpv: Mpv,
+    commands: Receiver<Command>,
+    shared: &SharedState,
+    log: &(dyn Fn(&str) + Send + Sync),
+) {
+    log("driver: command loop starting");
     let mut last_poll = std::time::Instant::now() - MPV_POLL_INTERVAL;
     loop {
         if mpv.is_closed() {
+            log("driver: mpv's socket closed; command loop exiting");
             return;
         }
         // Drain whatever commands arrived since the last pass without blocking the poll behind them.
         while let Ok(cmd) = commands.try_recv() {
-            let _ = cmd.reply.send(execute(&mut mpv, cmd.body));
+            let name = cmd.body.name();
+            let start = std::time::Instant::now();
+            let result = execute(&mut mpv, cmd.body);
+            // Every command, not just slow ones: at the volume real clients send these, one line per
+            // command is not noise, and it is exactly what turns "a command appeared to hang" into
+            // "here is precisely how long mpv took to answer, and with what".
+            log(&format!(
+                "driver: {name} -> {} in {:?}",
+                if result.is_ok() { "ok" } else { "err" },
+                start.elapsed()
+            ));
+            let _ = cmd.reply.send(result);
         }
         if last_poll.elapsed() >= MPV_POLL_INTERVAL {
-            shared.publish(read_state(&mut mpv));
+            let start = std::time::Instant::now();
+            let state = read_state(&mut mpv);
+            let elapsed = start.elapsed();
+            // Only when it is unexpectedly slow -- every 400ms would be pure noise, since a healthy
+            // poll finishes in well under a millisecond.
+            if elapsed > Duration::from_millis(50) {
+                log(&format!("driver: read_state took {elapsed:?} (expected well under 50ms)"));
+            }
+            shared.publish(state);
             last_poll = std::time::Instant::now();
         }
         // A short blocking wait on mpv's own event socket doubles as the loop's tick rate, so this
