@@ -7,7 +7,9 @@
 //! Consequently `explain()` is a product surface with the same status as a UI string, and the
 //! conformance corpus asserts on these variants directly via `reasons_absent` / `reasons_present`.
 
-use lumen_model::{AudioCodec, ChromaSubsampling, Container, HdrFormat, SubtitleCodec, VideoCodec};
+use lumen_model::{
+    AudioCodec, ChromaSubsampling, ColorPrimaries, Container, HdrFormat, SubtitleCodec, VideoCodec,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitrateCause {
@@ -78,6 +80,12 @@ pub enum RejectReason {
     },
     HdrUnsupportedByDisplay {
         format: HdrFormat,
+    },
+    /// The display's physical gamut does not cover the stream's mastering primaries -- a separate
+    /// question from `HdrUnsupportedByDisplay`, since a display can support the HDR10 *format*
+    /// outright while still being unable to show every colour BT.2020 content specifies.
+    GamutUnsupportedByDisplay {
+        primaries: ColorPrimaries,
     },
     /// Reproduction is incomplete even on fully capable hardware — currently only Dolby Vision
     /// Profile 7 FEL, whose enhancement layer no open-source renderer can reconstruct.
@@ -167,6 +175,10 @@ impl RejectReason {
             Self::HdrUnsupportedByDisplay { format } => {
                 format!("This display does not support {format:?}, so the picture was tone mapped.")
             }
+            Self::GamutUnsupportedByDisplay { primaries } => format!(
+                "This display's colour gamut does not cover the source's {primaries:?} primaries, \
+                 so the picture was gamut mapped."
+            ),
             Self::EnhancementLayerUnsupported { format } => format!(
                 "{format:?} carries an enhancement layer that cannot be reconstructed. \
                  Playing the HDR10 base layer, which is the full picture minus the extra \
@@ -212,6 +224,7 @@ impl RejectReason {
             Self::ChannelCountUnsupported { .. } => "ChannelCountUnsupported",
             Self::SampleRateUnsupported { .. } => "SampleRateUnsupported",
             Self::HdrUnsupportedByDisplay { .. } => "HdrUnsupportedByDisplay",
+            Self::GamutUnsupportedByDisplay { .. } => "GamutUnsupportedByDisplay",
             Self::EnhancementLayerUnsupported { .. } => "EnhancementLayerUnsupported",
             Self::SubtitleBurnInRequired { .. } => "SubtitleBurnInRequired",
             Self::NetworkHeadroom { .. } => "NetworkHeadroom",
@@ -289,6 +302,7 @@ mod tests {
             RejectReason::ChannelCountUnsupported { have: 8, max: 2 },
             RejectReason::SampleRateUnsupported { have: 192_000, sink: "x".into() },
             RejectReason::HdrUnsupportedByDisplay { format: HdrFormat::Hdr10 },
+            RejectReason::GamutUnsupportedByDisplay { primaries: ColorPrimaries::Bt2020 },
             RejectReason::EnhancementLayerUnsupported { format: HdrFormat::DolbyVisionP7Fel },
             RejectReason::SubtitleBurnInRequired {
                 format: SubtitleCodec::Pgs,

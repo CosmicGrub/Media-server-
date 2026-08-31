@@ -13,9 +13,10 @@ use lumen_caps::{
     VideoDecodeCaps,
 };
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, ChromaSubsampling, ColorInfo, Container, CropRect,
-    FieldOrder, HdrFormat, Integrity, Language, MediaSource, Rational, StereoMode, StreamFlags,
-    SubtitleCodec, SubtitleStream, TelecinePattern, Transport, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, ChromaSubsampling, ColorInfo, ColorPrimaries,
+    Container, CropRect, FieldOrder, HdrFormat, Integrity, Language, MediaSource, Rational,
+    StereoMode, StreamFlags, SubtitleCodec, SubtitleStream, TelecinePattern, Transport, VideoCodec,
+    VideoStream,
 };
 use lumen_playback::{
     AudioPath, ContainerPlan, PlaybackPlan, Selection, SubtitleDelivery, Tier, VideoPath, plan,
@@ -772,4 +773,46 @@ fn ordinary_420_chroma_direct_plays() {
     assert_eq!(src.video[0].chroma, ChromaSubsampling::Yuv420);
     let p = plan(&src, full_selection(&src), &ClientCapabilities::reference_native());
     assert!(p.video.is_copy(), "{p:#?}");
+}
+
+#[test]
+fn bt2020_content_on_a_p3_gamut_display_tone_maps_but_keeps_the_bitstream() {
+    // The reference native client can tone/gamut map, so this is a render-side adaptation, not a
+    // reason to touch the video stream at all -- mirrors exactly how the HDR-format check behaves.
+    let mut src = uhd_remux();
+    src.video[0] = VideoStream {
+        color: ColorInfo { primaries: ColorPrimaries::Bt2020, ..src.video[0].color },
+        ..src.video[0].clone()
+    };
+    let p = plan(&src, full_selection(&src), &ClientCapabilities::reference_native());
+
+    assert!(p.video.is_copy(), "gamut mapping is a render decision, not a stream one: {p:#?}");
+    assert!(p.reason_keys().contains(&"GamutUnsupportedByDisplay"), "{:?}", p.reason_keys());
+}
+
+#[test]
+fn bt2020_content_forces_a_transcode_when_the_client_cannot_gamut_map() {
+    let mut caps = ClientCapabilities::reference_native();
+    caps.can_tone_map = false;
+    let mut src = uhd_remux();
+    src.video[0] = VideoStream {
+        color: ColorInfo { primaries: ColorPrimaries::Bt2020, ..src.video[0].color },
+        ..src.video[0].clone()
+    };
+    let p = plan(&src, full_selection(&src), &caps);
+
+    assert!(!p.video.is_copy(), "no gamut mapping available means the stream must adapt: {p:#?}");
+    assert!(p.reason_keys().contains(&"GamutUnsupportedByDisplay"), "{:?}", p.reason_keys());
+}
+
+#[test]
+fn p3_content_fits_the_reference_displays_gamut_exactly() {
+    let mut src = uhd_remux();
+    src.video[0] = VideoStream {
+        color: ColorInfo { primaries: ColorPrimaries::DciP3, ..src.video[0].color },
+        ..src.video[0].clone()
+    };
+    let p = plan(&src, full_selection(&src), &ClientCapabilities::reference_native());
+    assert!(p.video.is_copy(), "{p:#?}");
+    assert!(!p.reason_keys().contains(&"GamutUnsupportedByDisplay"), "{:?}", p.reason_keys());
 }

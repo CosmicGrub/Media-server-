@@ -11,8 +11,8 @@
 #![forbid(unsafe_code)]
 
 use lumen_model::{
-    AudioCodec, ChannelLayout, ChromaSubsampling, Container, HdrFormat, Rational, SubtitleCodec,
-    VideoCodec,
+    AudioCodec, ChannelLayout, ChromaSubsampling, ColorPrimaries, Container, HdrFormat, Rational,
+    SubtitleCodec, VideoCodec,
 };
 
 /// What a decoder can actually do for one codec.
@@ -152,6 +152,16 @@ pub struct DisplayCaps {
     pub refresh_modes: Vec<Rational>,
     /// Display-mode switching for frame-rate matching (`docs/03` §4.2).
     pub can_switch_mode: bool,
+    /// The widest colour gamut this display can reproduce. Distinct from `hdr_formats`: a display can
+    /// support the HDR10 *format* (correct EOTF, metadata) while still being unable to show every
+    /// colour BT.2020 content specifies, because its backlight/filter stack physically covers a
+    /// narrower gamut -- DCI-P3 is the common case on real consumer HDR displays, not full BT.2020.
+    pub gamut: ColorPrimaries,
+    /// Peak luminance the display can sustain, in nits. Captured for a future finer-grained
+    /// tone-map decision (how hard to roll off highlights depends on how much headroom the target
+    /// actually has) but not yet consulted anywhere -- modelled ahead of being wired in, the same
+    /// "represent the fact before acting on it" approach `stream::TelecinePattern` already took.
+    pub peak_luminance_nits: Option<u32>,
 }
 
 impl DisplayCaps {
@@ -162,9 +172,14 @@ impl DisplayCaps {
             hdr_formats: vec![HdrFormat::Sdr],
             refresh_modes: vec![Rational::new(60, 1)],
             can_switch_mode: false,
+            gamut: ColorPrimaries::Bt709,
+            peak_luminance_nits: Some(250),
         }
     }
 
+    /// A representative modern HDR TV. `gamut: DciP3` and `peak_luminance_nits: 1000` are the
+    /// documented spec sheet of a real flagship consumer panel, not full-BT.2020/mastering-monitor
+    /// figures -- claiming either of those would overstate what actually ships in living rooms.
     pub fn hdr_4k() -> Self {
         Self {
             width: 3840,
@@ -182,11 +197,17 @@ impl DisplayCaps {
                 Rational::new(60, 1),
             ],
             can_switch_mode: true,
+            gamut: ColorPrimaries::DciP3,
+            peak_luminance_nits: Some(1000),
         }
     }
 
     /// A display handles a stream's HDR without tone mapping either by supporting the format
     /// outright, or — for Dolby Vision with an HDR10-compatible base layer — by supporting HDR10.
+    ///
+    /// Format support alone, deliberately: gamut coverage is a separate question answered by
+    /// [`Self::handles_gamut`], because a display can support the HDR10 *format* while still being
+    /// unable to show every colour a BT.2020-mastered file specifies.
     pub fn handles_hdr(&self, format: HdrFormat) -> bool {
         if self.hdr_formats.contains(&format) {
             return true;
@@ -196,6 +217,12 @@ impl DisplayCaps {
             f if f.has_hdr10_compatible_base() => self.hdr_formats.contains(&HdrFormat::Hdr10),
             _ => false,
         }
+    }
+
+    /// Whether this display's gamut covers a stream's mastering primaries -- see
+    /// [`ColorPrimaries::is_covered_by`] for the containment rule and its untagged-primaries default.
+    pub fn handles_gamut(&self, primaries: ColorPrimaries) -> bool {
+        primaries.is_covered_by(self.gamut)
     }
 }
 
@@ -370,6 +397,25 @@ mod tests {
         assert!(d.handles_hdr(HdrFormat::Sdr));
         assert!(!d.handles_hdr(HdrFormat::Hdr10));
         assert!(!d.handles_hdr(HdrFormat::Hlg));
+    }
+
+    #[test]
+    fn hdr_format_support_and_gamut_coverage_are_independent_questions() {
+        // The reference HDR display supports the HDR10 format outright, but its DCI-P3 gamut does
+        // not cover full BT.2020 -- a real UHD Blu-ray remux mastered in BT.2020 primaries would still
+        // need gamut mapping even though HDR10 format support says yes.
+        let hdr = DisplayCaps::hdr_4k();
+        assert!(hdr.handles_hdr(HdrFormat::Hdr10), "format support says yes");
+        assert!(!hdr.handles_gamut(ColorPrimaries::Bt2020), "but the panel cannot show all of it");
+        assert!(hdr.handles_gamut(ColorPrimaries::DciP3), "P3 content fits exactly");
+        assert!(hdr.handles_gamut(ColorPrimaries::Bt709), "ordinary content is well within range");
+    }
+
+    #[test]
+    fn an_sdr_displays_narrow_gamut_still_covers_ordinary_bt709_content() {
+        let sdr = DisplayCaps::sdr_1080p();
+        assert!(sdr.handles_gamut(ColorPrimaries::Bt709));
+        assert!(!sdr.handles_gamut(ColorPrimaries::Bt2020));
     }
 
     #[test]

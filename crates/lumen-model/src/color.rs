@@ -17,6 +17,29 @@ pub enum ColorPrimaries {
     Smpte240M,
 }
 
+impl ColorPrimaries {
+    /// Whether `self` (a stream's mastering primaries) sits entirely inside `display`'s gamut, so
+    /// every colour the content specifies is reproducible without out-of-gamut clipping.
+    ///
+    /// This is the standard nesting every HDR display spec sheet documents: BT.2020 is a superset of
+    /// DCI-P3, which is a superset of the narrower standard-gamut set (BT.709/BT.601/SMPTE 240M, all
+    /// close enough in practice to be interchangeable for this purpose). `Unspecified` on *either*
+    /// side resolves to BT.709 before comparing -- the same "untagged is the narrow, common case"
+    /// reasoning [`ColorRange::or_default_for_yuv`] already applies to range: the overwhelming
+    /// majority of untagged content genuinely is BT.709, and assuming a display's gamut is at least
+    /// that wide when unconfirmed is the safe direction to be wrong in, exactly mirroring why
+    /// untagged range defaults to limited rather than full.
+    pub fn is_covered_by(self, display: Self) -> bool {
+        use ColorPrimaries::*;
+        let rank = |p: Self| match p {
+            Bt2020 => 3,
+            DciP3 | DisplayP3 => 2,
+            Bt709 | Bt601_525 | Bt601_625 | Smpte240M | Unspecified => 1,
+        };
+        rank(self) <= rank(display)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ColorTransfer {
@@ -172,6 +195,37 @@ mod tests {
     fn untagged_yuv_range_defaults_to_limited() {
         assert_eq!(ColorRange::Unspecified.or_default_for_yuv(), ColorRange::Limited);
         assert_eq!(ColorRange::Full.or_default_for_yuv(), ColorRange::Full);
+    }
+
+    #[test]
+    fn wider_gamuts_nest_the_narrower_ones() {
+        assert!(ColorPrimaries::Bt709.is_covered_by(ColorPrimaries::Bt2020));
+        assert!(ColorPrimaries::DciP3.is_covered_by(ColorPrimaries::Bt2020));
+        assert!(ColorPrimaries::Bt709.is_covered_by(ColorPrimaries::DciP3));
+        assert!(
+            !ColorPrimaries::Bt2020.is_covered_by(ColorPrimaries::DciP3),
+            "P3 is not wide enough"
+        );
+        assert!(!ColorPrimaries::Bt2020.is_covered_by(ColorPrimaries::Bt709));
+        assert!(
+            ColorPrimaries::Bt709.is_covered_by(ColorPrimaries::Bt709),
+            "a gamut covers itself"
+        );
+    }
+
+    #[test]
+    fn untagged_primaries_on_either_side_resolve_to_bt709_not_an_extreme() {
+        // The overwhelming majority of untagged content genuinely is BT.709 -- treating unknown as
+        // "covers nothing" would flag ordinary SDR files with no declared primaries as a gamut
+        // mismatch against every display, including one explicitly built wide; treating it as "covers
+        // everything" would hide a real BT.2020-on-a-narrow-display mismatch on the display side.
+        assert!(ColorPrimaries::Unspecified.is_covered_by(ColorPrimaries::Bt709));
+        assert!(ColorPrimaries::Unspecified.is_covered_by(ColorPrimaries::Bt2020));
+        assert!(ColorPrimaries::Bt709.is_covered_by(ColorPrimaries::Unspecified));
+        assert!(
+            !ColorPrimaries::Bt2020.is_covered_by(ColorPrimaries::Unspecified),
+            "an unconfirmed display gamut must not silently absorb real BT.2020 content"
+        );
     }
 
     #[test]

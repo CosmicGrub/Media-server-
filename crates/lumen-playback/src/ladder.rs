@@ -274,6 +274,18 @@ fn decide_video(
         ctx.reject(Tier::T0BitExact, RejectReason::EnhancementLayerUnsupported { format: hdr });
     }
 
+    // Gamut coverage is a separate question from HDR *format* support: a display can support the
+    // HDR10 format outright while its physical gamut still cannot show every colour a BT.2020-
+    // mastered file specifies. Checked independently of HDR-ness, since wide-gamut SDR content is a
+    // real (if rare) case too.
+    let primaries = v.color.primaries;
+    if !caps.display.handles_gamut(primaries) {
+        ctx.reject(Tier::T1FullFidelity, RejectReason::GamutUnsupportedByDisplay { primaries });
+        if !caps.can_tone_map {
+            must_transcode = true;
+        }
+    }
+
     if !must_transcode {
         return VideoPath::Copy;
     }
