@@ -7,15 +7,16 @@
 //! queries it for every real playback session (`lumen play`/`lumen test`) -- it just never gets
 //! compared to anything. This module is that comparison.
 //!
-//! **Scope, stated honestly.** The native profile's declared [`lumen_caps::VideoDecodeCaps::hardware`]
-//! claim is the one thing checked here. The original design also proposed comparing predicted audio
-//! passthrough (TrueHD/DTS-HD MA reaching the AVR as a bitstream) against `audio-out-params` -- left
-//! out of this build because it would not measure anything real yet: nothing in `session.rs` asks mpv
-//! for spdif passthrough in the first place (no `--audio-spdif` is ever passed), so mpv decodes every
-//! bitstream format to PCM by default regardless of what the AVR could do, and every single file would
-//! "miss" for a reason that has nothing to do with the fidelity model. Checking a thing this codebase
-//! never actually requested would be evidence about a missing feature, not about the model's honesty
-//! -- worth doing once passthrough is actually requested, not before.
+//! **Two predictions, both gated on what was actually asked for.** Hardware decode is always checked
+//! -- `--hwdec` is on by default, so mpv always at least attempts it. Audio passthrough is different:
+//! by default mpv decodes every bitstream format (TrueHD, DTS-HD, E-AC-3, AC-3) to PCM regardless of
+//! what the sink could take, so a miss there would say nothing about the fidelity model's honesty,
+//! only that passthrough was never attempted. `PlayOptions::audio_passthrough` (`--audio-passthrough`
+//! on `lumen test`/`lumen play`) makes it opt-in and off by default -- unlike hardware decode, this
+//! changes what actually reaches the audio device, and a sink that cannot bitstream would get silence
+//! rather than mpv's usual PCM fallback. `CalibrationEntry::predicted_audio_passthrough` is `None`
+//! whenever a session did not turn it on, the same "nothing requested, nothing to compare" stance this
+//! paragraph used to describe as future work.
 //!
 //! **Strictly local, on purpose.** The log lives at [`default_log_path`], in the same
 //! `XDG`-style config directory `TokenStore` and the TLS certificate already use, in plain JSON
@@ -59,6 +60,17 @@ pub struct CalibrationEntry {
     /// calculation `drop_rate_flagged` needs. `None` for VFR content or a build too old to have
     /// reported it, both of which mean there is nothing to judge a raw drop count against.
     pub expected_fps: Option<f64>,
+    /// What the reference native profile's own declared capabilities say about this file's selected
+    /// audio codec: `Some(true)` if it claims the sink can take it as a bitstream, `Some(false)` if
+    /// not, `None` when the codec is not recognised, when the selected track had no codec at all, or
+    /// -- crucially -- when this session never asked mpv to attempt passthrough in the first place
+    /// (`docs/15` §C's own scope note: checking a prediction against a thing this codebase never
+    /// requested would be evidence about a missing feature, not about the model's honesty).
+    pub predicted_audio_passthrough: Option<bool>,
+    /// mpv's `audio-out-params/format` for this session -- `Some("spdif-ac3")` and similar when a
+    /// bitstream reached the sink, `Some("s16")`/a PCM format when mpv decoded it instead, `None` when
+    /// passthrough was never requested or the property was never reported.
+    pub observed_audio_out_format: Option<String>,
 }
 
 /// Below this many seconds played, any dropped-frame count is noise, not signal -- a session that
@@ -101,11 +113,26 @@ impl CalibrationEntry {
         Some(rate > DROP_RATE_THRESHOLD)
     }
 
+    /// `None` when there is nothing to compare: an unrecognised or absent audio codec, or -- the case
+    /// this exists to avoid -- passthrough was never even requested this session (`predicted_audio_
+    /// passthrough` is already `None` in that case, so this just propagates it). `Some(true)` when
+    /// what mpv actually delivered agrees with what the native profile's declared sink capabilities
+    /// predicted; `Some(false)` on a real, checkable miss.
+    pub fn audio_passthrough_as_predicted(&self) -> Option<bool> {
+        let predicted = self.predicted_audio_passthrough?;
+        let observed = self.observed_audio_out_format.as_ref()?;
+        // mpv names every spdif output format with this prefix (`spdif-ac3`, `spdif-dts-hd`, ...);
+        // anything else is a PCM sample format, meaning the bitstream was decoded rather than passed.
+        let observed_bitstream = observed.starts_with("spdif-");
+        Some(predicted == observed_bitstream)
+    }
+
     fn to_json_line(&self) -> String {
         format!(
             "{{\"path\":{},\"unix_secs\":{},\"video_codec\":{},\"predicted_hardware_decode\":{},\
              \"observed_hwdec\":{},\"dropped_frames\":{},\"seconds_played\":{},\
-             \"expected_fps\":{}}}",
+             \"expected_fps\":{},\"predicted_audio_passthrough\":{},\
+             \"observed_audio_out_format\":{}}}",
             quote(&self.path.to_string_lossy()),
             self.unix_secs,
             opt_str(self.video_codec.as_deref()),
@@ -114,6 +141,8 @@ impl CalibrationEntry {
             opt_num(self.dropped_frames),
             self.seconds_played,
             opt_f64(self.expected_fps),
+            opt_bool(self.predicted_audio_passthrough),
+            opt_str(self.observed_audio_out_format.as_deref()),
         )
     }
 
@@ -136,6 +165,15 @@ impl CalibrationEntry {
             // old entry genuinely earns rather than a fabricated duration.
             seconds_played: v.get("seconds_played").and_then(json::Value::as_f64).unwrap_or(0.0),
             expected_fps: v.get("expected_fps").and_then(json::Value::as_f64),
+            // Absent in a line written before this field existed -- `None` is the correct reading
+            // regardless, since an old entry's session never requested passthrough either.
+            predicted_audio_passthrough: v
+                .get("predicted_audio_passthrough")
+                .and_then(json::Value::as_bool),
+            observed_audio_out_format: v
+                .get("observed_audio_out_format")
+                .and_then(json::Value::as_str)
+                .map(str::to_string),
         })
     }
 }
@@ -170,6 +208,8 @@ pub fn observe(r: &FileResult) -> Option<CalibrationEntry> {
         dropped_frames: r.dropped_frames,
         seconds_played: r.seconds_played,
         expected_fps: r.fps,
+        predicted_audio_passthrough: predicted_audio_passthrough(r),
+        observed_audio_out_format: r.audio_out_format.clone(),
     })
 }
 
@@ -186,6 +226,19 @@ fn predicted_hardware_decode(r: &FileResult) -> Option<bool> {
     let track_codec = r.tracks.iter().find(|t| t.kind == "video" && t.selected)?.codec.as_deref();
     let codec = fidelity::video_codec(track_codec);
     fidelity::native_profile().video_caps_for(&codec).map(|c| c.hardware)
+}
+
+/// What the native profile's own declared audio sink capabilities say about this file's selected
+/// audio codec -- `None` whenever there is nothing honest to compare, most importantly when this
+/// session never requested passthrough in the first place (see [`CalibrationEntry::
+/// predicted_audio_passthrough`]'s doc comment for why that gate matters).
+fn predicted_audio_passthrough(r: &FileResult) -> Option<bool> {
+    if !r.audio_spdif_requested {
+        return None;
+    }
+    let track = r.tracks.iter().find(|t| t.kind == "audio" && t.selected)?;
+    let codec = fidelity::audio_codec(track.codec.as_deref(), track.codec_profile.as_deref());
+    Some(fidelity::native_profile().audio_sink.can_passthrough(&codec))
 }
 
 fn unix_now() -> u64 {
@@ -226,6 +279,10 @@ pub fn summarize(entries: &[CalibrationEntry]) -> String {
     if let Some(drop_section) = drop_rate_summary(entries) {
         s.push('\n');
         s.push_str(&drop_section);
+    }
+    if let Some(passthrough_section) = audio_passthrough_summary(entries) {
+        s.push('\n');
+        s.push_str(&passthrough_section);
     }
     s
 }
@@ -315,6 +372,41 @@ fn drop_rate_summary(entries: &[CalibrationEntry]) -> Option<String> {
     Some(s)
 }
 
+/// `None` when no session had anything to judge -- every session that never asked mpv for passthrough
+/// (the default) contributes nothing here, the same reasoning that keeps `drop_rate_summary` silent
+/// rather than printing a redundant "nothing to compare" line on top of the hardware-decode section.
+fn audio_passthrough_summary(entries: &[CalibrationEntry]) -> Option<String> {
+    let checkable: Vec<&CalibrationEntry> =
+        entries.iter().filter(|e| e.audio_passthrough_as_predicted().is_some()).collect();
+    if checkable.is_empty() {
+        return None;
+    }
+    let matched =
+        checkable.iter().filter(|e| e.audio_passthrough_as_predicted() == Some(true)).count();
+    let missed = checkable.len() - matched;
+    if missed == 0 {
+        return Some(format!(
+            "{matched}/{} real playback session{} matched the fidelity model's audio-passthrough prediction",
+            checkable.len(),
+            if checkable.len() == 1 { "" } else { "s" }
+        ));
+    }
+    let mut s = format!(
+        "{matched}/{} real playback sessions matched the fidelity model's audio-passthrough prediction -- {missed} did not:",
+        checkable.len()
+    );
+    for e in checkable.iter().filter(|e| e.audio_passthrough_as_predicted() == Some(false)) {
+        let predicted =
+            if e.predicted_audio_passthrough == Some(true) { "bitstream" } else { "PCM" };
+        s.push_str(&format!(
+            "\n  {} -- predicted {predicted}, mpv actually delivered {}",
+            e.path.display(),
+            e.observed_audio_out_format.as_deref().unwrap_or("unknown format"),
+        ));
+    }
+    Some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +451,8 @@ mod tests {
             fidelity: None,
             delayed_frames: None,
             dropped_frames: Some(3),
+            audio_spdif_requested: false,
+            audio_out_format: None,
         }
     }
 
@@ -551,6 +645,85 @@ mod tests {
         let with_a_flag = summarize(&[flagged]);
         assert!(with_a_flag.contains("dropped-frame threshold"), "{with_a_flag}");
         assert!(with_a_flag.contains("stuttery.mkv"), "{with_a_flag}");
+    }
+
+    /// `codec`/`profile` are FFmpeg's names, the same vocabulary `fidelity::audio_codec` matches --
+    /// mirroring how `played_result`'s video track is set up.
+    fn played_result_with_audio(
+        codec: &str,
+        profile: Option<&str>,
+        requested: bool,
+        observed_format: Option<&str>,
+    ) -> FileResult {
+        let mut r = played_result(Some("hevc"), Some("videotoolbox"));
+        r.tracks.push(TrackInfo {
+            kind: "audio".into(),
+            selected: true,
+            codec: Some(codec.to_string()),
+            codec_profile: profile.map(String::from),
+            ..Default::default()
+        });
+        r.audio_spdif_requested = requested;
+        r.audio_out_format = observed_format.map(String::from);
+        r
+    }
+
+    #[test]
+    fn passthrough_never_requested_this_session_makes_no_claim_even_for_an_eligible_codec() {
+        // The whole point of the gate: TrueHD is eligible for passthrough on the reference AVR, but
+        // this session never asked mpv to attempt it, so there is nothing honest to compare.
+        let r = played_result_with_audio("truehd", None, false, Some("floatp"));
+        let entry = observe(&r).unwrap();
+        assert_eq!(entry.predicted_audio_passthrough, None);
+        assert_eq!(entry.audio_passthrough_as_predicted(), None);
+    }
+
+    #[test]
+    fn a_bitstream_eligible_codec_predicts_passthrough_and_a_bitstream_output_matches() {
+        let r = played_result_with_audio("truehd", None, true, Some("spdif-truehd"));
+        let entry = observe(&r).unwrap();
+        assert_eq!(entry.predicted_audio_passthrough, Some(true));
+        assert_eq!(entry.audio_passthrough_as_predicted(), Some(true));
+    }
+
+    #[test]
+    fn a_predicted_bitstream_that_actually_decoded_to_pcm_is_a_real_miss() {
+        let r = played_result_with_audio("dts", Some("DTS-HD MA"), true, Some("floatp"));
+        let entry = observe(&r).unwrap();
+        assert_eq!(entry.predicted_audio_passthrough, Some(true));
+        assert_eq!(entry.audio_passthrough_as_predicted(), Some(false));
+    }
+
+    #[test]
+    fn a_codec_with_no_passthrough_path_predicts_pcm_and_pcm_output_matches() {
+        // AAC is not in the reference AVR's passthrough list at all.
+        let r = played_result_with_audio("aac", None, true, Some("floatp"));
+        let entry = observe(&r).unwrap();
+        assert_eq!(entry.predicted_audio_passthrough, Some(false));
+        assert_eq!(entry.audio_passthrough_as_predicted(), Some(true), "PCM was exactly predicted");
+    }
+
+    #[test]
+    fn summarize_reports_an_audio_passthrough_section_only_when_there_is_something_to_judge() {
+        let no_data = summarize(&[]);
+        assert!(!no_data.contains("audio-passthrough"), "{no_data}");
+
+        let never_requested =
+            summarize(&[
+                observe(&played_result_with_audio("truehd", None, false, Some("floatp"))).unwrap()
+            ]);
+        assert!(
+            !never_requested.contains("audio-passthrough"),
+            "passthrough never requested means nothing to judge: {never_requested}"
+        );
+
+        let mut missed =
+            observe(&played_result_with_audio("dts", Some("DTS-HD MA"), true, Some("floatp")))
+                .unwrap();
+        missed.path = PathBuf::from("/lib/downgraded.mkv");
+        let with_a_miss = summarize(&[missed]);
+        assert!(with_a_miss.contains("audio-passthrough"), "{with_a_miss}");
+        assert!(with_a_miss.contains("downgraded.mkv"), "{with_a_miss}");
     }
 
     #[test]

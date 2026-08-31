@@ -56,6 +56,9 @@ Options
   --paused            start paused
   --vo <name>         video output (default gpu-next)
   --hwdec <mode>      hardware decoding (default auto-safe)
+  --audio-passthrough ask mpv to bitstream HD audio (TrueHD, DTS-HD, E-AC-3, AC-3) instead of
+                      decoding it, so `lumen doctor`'s calibration log has a real passthrough
+                      outcome to compare against the fidelity model's prediction
   --dry-run           print the mpv command and playlist, launch nothing
   --json <path>       write the machine-readable report here
   --                  everything after this is passed to mpv verbatim
@@ -247,6 +250,7 @@ fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
     play.vo = value(args, "--vo");
     play.fullscreen = !flag(args, "--windowed");
     play.shuffle = flag(args, "--shuffle");
+    play.audio_passthrough = flag(args, "--audio-passthrough");
     play.extra_args = passthrough(args);
     play.dry_run = flag(args, "--dry-run");
     if let Some(h) = value(args, "--hwdec") {
@@ -711,6 +715,16 @@ mod tests {
         assert_eq!(value(&a, "--seconds").as_deref(), Some("20"));
         assert!(flag(&a, "--shuffle"));
         assert!(!flag(&a, "--paused"));
+    }
+
+    #[test]
+    fn audio_passthrough_is_a_bare_flag_off_by_default() {
+        let with = argv(&["/media", "--audio-passthrough"]);
+        assert!(flag(&with, "--audio-passthrough"));
+        assert_eq!(positional(&with), vec![PathBuf::from("/media")], "not mistaken for a path");
+
+        let without = argv(&["/media"]);
+        assert!(!flag(&without, "--audio-passthrough"));
     }
 
     #[test]

@@ -499,6 +499,8 @@ mod tests {
             fidelity: None,
             delayed_frames: None,
             dropped_frames: None,
+            audio_spdif_requested: false,
+            audio_out_format: None,
         };
         r.tracks = tracks;
         r
