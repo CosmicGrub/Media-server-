@@ -104,35 +104,18 @@ impl Mpv {
     fn spawn_reader(writer: Box<dyn Write + Send>, reader: Box<dyn std::io::Read + Send>) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            // TODO(diagnostic, remove once the Windows Play-timeout investigation concludes): proves
-            // whether this thread is actually blocked reading the pipe/socket at all, vs. reading fine
-            // but the main thread's recv side is what stalls.
-            eprintln!("ipc: reader thread starting");
             let mut lines = BufReader::new(reader).lines();
-            loop {
-                eprintln!("ipc: reader thread calling lines.next() (blocking read)");
-                let next = lines.next();
-                eprintln!(
-                    "ipc: reader thread lines.next() returned: {:?}",
-                    next.as_ref().map(|r| r.is_ok())
-                );
-                let Some(Ok(line)) = next else {
-                    eprintln!("ipc: reader thread exiting (EOF or read error)");
-                    return;
-                };
+            while let Some(Ok(line)) = lines.next() {
                 if line.trim().is_empty() {
                     continue;
                 }
                 // A line that will not parse is dropped rather than fatal. mpv has been known to emit
                 // a stray non-JSON line on some builds, and killing the session over one would lose
                 // a whole playback run's worth of results.
-                if let Ok(v) = json::parse(&line) {
-                    eprintln!("ipc: reader thread parsed a line, sending to channel: {line}");
-                    if tx.send(v).is_err() {
-                        return; // the player hung up
-                    }
-                } else {
-                    eprintln!("ipc: reader thread got a non-JSON line, dropping: {line}");
+                if let Ok(v) = json::parse(&line)
+                    && tx.send(v).is_err()
+                {
+                    return; // the player hung up
                 }
             }
         });
@@ -176,47 +159,17 @@ impl Mpv {
         self.next_id += 1;
         let id = self.next_id;
         let quoted: Vec<String> = args.iter().map(|a| json::quote(a)).collect();
-        let desc = args.join(" ");
-        // TODO(diagnostic, remove once the Windows Play-timeout investigation concludes): pins down
-        // whether a blocked write() (the pipe's write side backing up) or a blocked/unbounded receive
-        // loop is where drive_mpv's first iteration is actually losing time -- the heartbeat diagnostic
-        // proved the loop's own logging never gets a chance to run again once this function is entered,
-        // but not which half of it is stuck.
-        let call_start = Instant::now();
-        eprintln!("ipc: command_timeout({desc}) id={id} sending");
         self.send(&format!("{{\"command\":[{}],\"request_id\":{id}}}", quoted.join(",")))?;
-        eprintln!(
-            "ipc: command_timeout({desc}) id={id} write+flush returned after {:?}",
-            call_start.elapsed()
-        );
 
         let deadline = Instant::now() + timeout;
         loop {
-            let recv_start = Instant::now();
             let Some(v) = self.recv_until(deadline) else {
-                eprintln!(
-                    "ipc: command_timeout({desc}) id={id} recv_until gave up after {:?} (total {:?}); treating as unknown",
-                    recv_start.elapsed(),
-                    call_start.elapsed()
-                );
                 return Ok(None); // timed out; the caller treats a missing answer as unknown
             };
-            eprintln!(
-                "ipc: command_timeout({desc}) id={id} recv_until got a value after {:?}: {v:?}",
-                recv_start.elapsed()
-            );
             if v.get("request_id").and_then(Value::as_f64) == Some(id as f64) {
                 if v.get("error").and_then(Value::as_str) != Some("success") {
-                    eprintln!(
-                        "ipc: command_timeout({desc}) id={id} matched our request_id with a non-success error after {:?} total",
-                        call_start.elapsed()
-                    );
                     return Ok(None);
                 }
-                eprintln!(
-                    "ipc: command_timeout({desc}) id={id} matched our request_id with success after {:?} total",
-                    call_start.elapsed()
-                );
                 return Ok(v.get("data").cloned());
             }
             // Not our reply. If it is an event it must survive — dropping it here is how an
