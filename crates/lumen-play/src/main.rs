@@ -573,50 +573,27 @@ fn doctor() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Fetch mpv into the folder holding this binary, so the pair is portable afterwards.
+/// The PowerShell script [`setup`] runs on Windows to fetch mpv. A module-level `const`, not a local
+/// inside `setup` itself, so `tests::a_real_pwsh_run_extracts_and_installs_a_real_archive` below can
+/// run this *exact* text (not a re-typed copy that could silently drift out of sync) through a real
+/// `pwsh` process without needing to be `cfg!(windows)` to link.
 ///
-/// Deliberately does not install anything system-wide, touch the registry, or require an elevated
-/// prompt. It puts one file next to this one; deleting the folder undoes it completely.
-fn setup() -> ExitCode {
-    if let Some(existing) = mpvbin::find() {
-        println!("mpv is already available at {}", existing.display());
-        println!("Nothing to do. Run `lumen doctor` to see what it supports.");
-        return ExitCode::SUCCESS;
-    }
-
-    let Ok(exe) = std::env::current_exe() else {
-        eprintln!("cannot determine where this binary lives; install mpv by hand:\n");
-        eprintln!("{}", mpvbin::install_hint());
-        return ExitCode::from(2);
-    };
-    let dir = exe.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
-
-    if !cfg!(windows) {
-        // On Linux the package manager is the right answer and needs no help from here.
-        println!("{}", mpvbin::install_hint());
-        return ExitCode::from(2);
-    }
-
-    println!("mpv is not present. Fetching a Windows build into:\n  {}\n", dir.display());
-    println!("This downloads from the official mpv Windows builds and extracts mpv.exe here.");
-    println!("Nothing is installed system-wide and no registry keys are written.\n");
-
-    // PowerShell does the work: it is present on every supported Windows, handles TLS and redirects,
-    // and `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
-    // Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
-    //
-    // SourceForge first because that is the source mpv.io itself links to for Windows, and its URL
-    // shape is stable. GitHub is the fallback: its API is rate-limited unauthenticated, which is
-    // fine for one call but not something to depend on first.
-    //
-    // Both sources are tried for the *download itself*, not just the version lookup — a GitHub
-    // Actions runner hitting SourceForge's `/download` redirector has been observed getting back a
-    // small mirror-selection or rate-limit page instead of the archive, on a run where the listing
-    // page it walked moments earlier loaded fine. A `try` around the lookup alone never sees that
-    // failure, so the GitHub fallback never fires: the fix is a real fallback chain over the whole
-    // fetch, and validating the result by its actual 7-Zip file signature rather than by size, since
-    // an interstitial page is not guaranteed to land under any particular byte threshold.
-    let script = r#"
+/// PowerShell does the work: it is present on every supported Windows, handles TLS and redirects,
+/// and `tar` (libarchive, shipped since Windows 10 1803) reads the 7-Zip archive the builds use.
+/// Shelling out beats reimplementing HTTPS and 7-Zip in a binary that has no dependencies.
+///
+/// SourceForge first because that is the source mpv.io itself links to for Windows, and its URL
+/// shape is stable. GitHub is the fallback: its API is rate-limited unauthenticated, which is
+/// fine for one call but not something to depend on first.
+///
+/// Both sources are tried for the *download itself*, not just the version lookup — a GitHub
+/// Actions runner hitting SourceForge's `/download` redirector has been observed getting back a
+/// small mirror-selection or rate-limit page instead of the archive, on a run where the listing
+/// page it walked moments earlier loaded fine. A `try` around the lookup alone never sees that
+/// failure, so the GitHub fallback never fires: the fix is a real fallback chain over the whole
+/// fetch, and validating the result by its actual 7-Zip file signature rather than by size, since
+/// an interstitial page is not guaranteed to land under any particular byte threshold.
+const SETUP_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $dest = $args[0]
 $tmp  = Join-Path $env:TEMP ("lumen-mpv-" + [guid]::NewGuid())
@@ -701,6 +678,36 @@ try {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }
 "#;
+
+/// Fetch mpv into the folder holding this binary, so the pair is portable afterwards.
+///
+/// Deliberately does not install anything system-wide, touch the registry, or require an elevated
+/// prompt. It puts one file next to this one; deleting the folder undoes it completely.
+fn setup() -> ExitCode {
+    if let Some(existing) = mpvbin::find() {
+        println!("mpv is already available at {}", existing.display());
+        println!("Nothing to do. Run `lumen doctor` to see what it supports.");
+        return ExitCode::SUCCESS;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("cannot determine where this binary lives; install mpv by hand:\n");
+        eprintln!("{}", mpvbin::install_hint());
+        return ExitCode::from(2);
+    };
+    let dir = exe.parent().unwrap_or(std::path::Path::new(".")).to_path_buf();
+
+    if !cfg!(windows) {
+        // On Linux the package manager is the right answer and needs no help from here.
+        println!("{}", mpvbin::install_hint());
+        return ExitCode::from(2);
+    }
+
+    println!("mpv is not present. Fetching a Windows build into:\n  {}\n", dir.display());
+    println!("This downloads from the official mpv Windows builds and extracts mpv.exe here.");
+    println!("Nothing is installed system-wide and no registry keys are written.\n");
+
+    let script = SETUP_SCRIPT;
 
     // Written to a temp file and run with `-File` rather than passed inline via `-Command`.
     // `-Command`'s documented `-args <arg-array>` passthrough is specified for an actual ScriptBlock
@@ -803,5 +810,115 @@ mod tests {
     fn no_paths_is_an_actionable_error() {
         let err = run("scan", &argv(&["--shuffle"])).unwrap_err();
         assert!(err.contains("at least one file or folder"), "{err}");
+    }
+
+    /// `SETUP_SCRIPT` (see its own doc comment) had a real bug -- `$dest` silently reading back as
+    /// `$null` -- that nothing caught until the script was actually run to completion for the first
+    /// time; a `#[cfg(windows)]` gate on `setup()` itself means no CI job has ever run it either,
+    /// since `rust.yml`'s own "fetch mpv" step exercises a *separate* path, not this one. This test
+    /// closes that gap for good: it runs the real, unmodified `SETUP_SCRIPT` text through a real
+    /// `pwsh` process -- the one part genuinely untestable without a live download (the network
+    /// lookup/fetch, already covered by this script's own try/catch and 7-Zip-signature verification,
+    /// which a live run separately confirmed still behave correctly against real, blocked, and
+    /// interstitial-page responses) is swapped for a `Copy-Item` of a real, validly-signed 7-Zip
+    /// archive built fresh by this test -- every line after that swap, including the extraction,
+    /// `mpv.exe`/`d3dcompiler_*.dll` search, and copy into `$dest`, is the exact production code.
+    ///
+    /// Runs on any platform pwsh and a `7z`/`7za` binary are both found on -- GitHub-hosted
+    /// `ubuntu-latest` runners ship `pwsh` by default, closing this gap in CI, not just locally.
+    /// Skipped, not failed, when either is missing (the same "this is infrastructure, not a defect"
+    /// convention every other real-subprocess test in this workspace already uses).
+    #[test]
+    fn a_real_pwsh_run_extracts_and_installs_a_real_archive() {
+        if !std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-Command", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipping: pwsh is not on PATH in this environment");
+            return;
+        }
+        let seven_zip = ["7z", "7za"].into_iter().find(|bin| {
+            std::process::Command::new(bin)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        });
+        let Some(seven_zip) = seven_zip else {
+            eprintln!("skipping: neither 7z nor 7za is on PATH in this environment");
+            return;
+        };
+
+        let dir =
+            std::env::temp_dir().join(format!("lumen-setup-real-pwsh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let build_dir = dir.join("build").join("mpv-0.41.0-x86_64").join("nested");
+        let dest_dir = dir.join("dest");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        // A real mpv.exe deep inside a nested folder (mirroring the real archive's own layout,
+        // which is exactly why the extraction logic below does a *recursive* `Get-ChildItem`), plus
+        // the optional d3dcompiler DLL, so both copy branches in SETUP_SCRIPT run for real.
+        std::fs::write(build_dir.join("mpv.exe"), b"real mpv.exe content").unwrap();
+        std::fs::write(build_dir.join("d3dcompiler_47.dll"), b"real d3dcompiler content").unwrap();
+
+        let archive = dir.join("mpv-real-shaped.7z");
+        let status = std::process::Command::new(seven_zip)
+            .args(["a", "-t7z"])
+            .arg(&archive)
+            .arg(dir.join("build").join("mpv-0.41.0-x86_64"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect(seven_zip);
+        assert!(status.success(), "building the test archive with {seven_zip} failed");
+
+        // The only patch to the real script: replace the network lookup+download with a copy of the
+        // archive just built. Everything from `$archive = Join-Path $tmp 'mpv.7z'` onward -- the real
+        // extraction, search, and install logic -- is untouched, verbatim `SETUP_SCRIPT` text.
+        let marker_start = "  $candidates = Get-Candidates";
+        let marker_end = "  if (-not $downloaded) { throw 'every mpv download source returned something that was not a real archive' }";
+        let start = SETUP_SCRIPT.find(marker_start).expect("SETUP_SCRIPT's shape changed");
+        let end =
+            SETUP_SCRIPT.find(marker_end).expect("SETUP_SCRIPT's shape changed") + marker_end.len();
+        let patched = format!(
+            "{}  $archive = Join-Path $tmp 'mpv.7z'\n  Copy-Item '{}' $archive\n{}",
+            &SETUP_SCRIPT[..start],
+            archive.display(),
+            &SETUP_SCRIPT[end..],
+        );
+
+        let script_path = dir.join("test-setup.ps1");
+        std::fs::write(&script_path, patched).unwrap();
+
+        // `$env:TEMP` is a real, always-present Windows environment variable SETUP_SCRIPT depends on
+        // (`$tmp = Join-Path $env:TEMP ...`); on a Linux CI runner it does not otherwise exist, so it
+        // is set explicitly here -- a no-op on real Windows, where it is already correct.
+        let output = std::process::Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&script_path)
+            .arg(&dest_dir)
+            .env("TEMP", std::env::temp_dir())
+            .output()
+            .expect("pwsh must be runnable");
+        assert!(
+            output.status.success(),
+            "the real setup script failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let installed_mpv = dest_dir.join("mpv.exe");
+        let installed_dll = dest_dir.join("d3dcompiler_47.dll");
+        assert!(installed_mpv.is_file(), "mpv.exe was not installed into the destination");
+        assert_eq!(std::fs::read(&installed_mpv).unwrap(), b"real mpv.exe content");
+        assert!(installed_dll.is_file(), "d3dcompiler_47.dll was not installed alongside it");
+        assert_eq!(std::fs::read(&installed_dll).unwrap(), b"real d3dcompiler content");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
