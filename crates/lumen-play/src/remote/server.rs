@@ -17,6 +17,7 @@
 //! `SharedState` has moved on and push a `State` line if so. The timeout is what stands in for the
 //! old writer thread's independent polling tick.
 
+mod dash;
 mod hls;
 mod http;
 mod vr;
@@ -214,10 +215,22 @@ struct ServerContext {
     /// `hls::maybe_evict` so opportunistic cache eviction never removes a directory mid-read. See
     /// `hls::ReaderGuard`.
     active_readers: Mutex<HashMap<String, u32>>,
-    /// Resolved once at startup via `crate::ffmpegbin::find`. `None` means HLS delivery answers every
-    /// request with a clear "ffmpeg not found" error rather than failing to start `lumen serve`
-    /// itself — direct `/stream/` playback needs no ffmpeg at all.
+    /// Resolved once at startup via `crate::ffmpegbin::find`. `None` means HLS/DASH delivery both
+    /// answer every request with a clear "ffmpeg not found" error rather than failing to start `lumen
+    /// serve` itself — direct `/stream/` playback needs no ffmpeg at all. Shared between the two
+    /// delivery paths: both need the same real `ffmpeg` binary, so there is no reason to resolve it
+    /// twice.
     ffmpeg_bin: Option<PathBuf>,
+    /// Where `dash::ensure_ready` builds and caches generated DASH output — see
+    /// `dash::default_cache_root`. Deliberately separate from `hls_cache_root`, not a shared directory
+    /// with a distinguishing key prefix — see `dash::default_cache_root`'s own doc comment.
+    dash_cache_root: PathBuf,
+    /// Per-cache-key generation locks for DASH, mirroring `hls_locks` exactly — see that field's own
+    /// doc comment for why entries are never removed.
+    dash_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// How many responses are currently streaming out of each DASH cache key's directory, mirroring
+    /// `active_readers` exactly — see `dash::ReaderGuard`.
+    dash_active_readers: Mutex<HashMap<String, u32>>,
 }
 
 /// Run the server. Blocks until the process is killed — this is meant to run in the foreground of a
@@ -293,6 +306,19 @@ pub fn run(
     } else {
         hls::sweep_stale_at_startup(&hls_cache_root);
     }
+    // Same reasoning as `hls_cache_root` above, applied to DASH's own, separate cache directory --
+    // created eagerly so `dash::maybe_evict`'s own `fs::read_dir` never has to distinguish "not
+    // created yet" from "created and empty" either.
+    let dash_cache_root = dash::default_cache_root();
+    if let Err(e) = std::fs::create_dir_all(&dash_cache_root) {
+        log(&format!(
+            "warning: could not create DASH cache directory {}: {e}",
+            dash_cache_root.display()
+        ));
+    } else {
+        dash::sweep_stale_at_startup(&dash_cache_root);
+    }
+
     let ffmpeg_bin = crate::ffmpegbin::find();
     if ffmpeg_bin.is_none() {
         log(&format!("note: {}", crate::ffmpegbin::install_hint()));
@@ -329,6 +355,9 @@ pub fn run(
         hls_locks: Mutex::new(HashMap::new()),
         active_readers: Mutex::new(HashMap::new()),
         ffmpeg_bin,
+        dash_cache_root,
+        dash_locks: Mutex::new(HashMap::new()),
+        dash_active_readers: Mutex::new(HashMap::new()),
     });
 
     let listener = TcpListener::bind((bind, port))

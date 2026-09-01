@@ -149,6 +149,11 @@ fn handle_request(tls: &mut TlsStream, req: &HttpRequest, ctx: &ServerContext) {
         return;
     }
 
+    if let Some(rest) = req.path.strip_prefix("/dash/") {
+        super::dash::handle(tls, &req.method, rest, ctx);
+        return;
+    }
+
     let Some(requested) = req.path.strip_prefix("/stream/") else {
         write_error(tls, 404, "Not Found");
         return;

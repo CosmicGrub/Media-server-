@@ -1069,6 +1069,353 @@ fn hls_playlist_and_segments_are_generated_lazily_cached_and_authenticated() {
     let _ = server.wait();
 }
 
+/// Tier 5 integration coverage: DASH delivery wired into `lumen serve`'s HTTP surface (see
+/// `remote::server::dash`), mirroring the HLS integration test above closely -- same fake-ffmpeg
+/// approach, same coverage shape, adapted to DASH's own artifact names and its bare
+/// `-init_seg_name`/`-media_seg_name` addressing (confirmed live against a real ffmpeg build in
+/// `lumen-segment`'s own `dash.rs` tests -- see that crate for the genuine subprocess/ffprobe proof;
+/// this test only needs a fake ffmpeg for CI speed, per this session's own established split between
+/// "prove the real tool's behavior once, at the crate level" and "prove the wiring, fast, everywhere
+/// else"). Real mpv is still required for the same reason the HLS test needs it: `server::run`
+/// unconditionally spawns an idle mpv on startup regardless of whether any DASH route is ever hit.
+#[cfg(unix)]
+#[test]
+fn dash_manifest_and_segments_are_generated_lazily_cached_and_authenticated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("dash");
+    let outside = TempDir::new("dash-outside");
+
+    // Three dummy sources. Their bytes are never read by ffmpeg -- the fake script below ignores its
+    // real input entirely and always writes the same fixed output -- only their existence, size, and
+    // mtime matter, since those alone feed `dash::cache_key`.
+    let source_a = dir.0.join("A.mkv");
+    let source_b = dir.0.join("B.mkv");
+    let source_c = dir.0.join("C.mkv");
+    std::fs::write(&source_a, b"source a").unwrap();
+    std::fs::write(&source_b, b"source b").unwrap();
+    std::fs::write(&source_c, b"source c").unwrap();
+    let outsider = outside.0.join("Secret.mkv");
+    std::fs::write(&outsider, b"not in the library").unwrap();
+
+    // Writes a manifest shaped exactly like a real ffmpeg DASH-MPD run against a video+audio source:
+    // two representations ("0" video, "1" audio), each with its own bare-relative-named
+    // `SegmentTemplate`, representation "0" producing one chunk and representation "1" producing two
+    // -- reproducing, not just asserting, the independent-per-representation segment counts confirmed
+    // live against a real ffmpeg build (see `lumen-segment/src/dash.rs`'s own module doc).
+    let log_path = dir.0.join("ffmpeg-invocations.log");
+    let fake_ffmpeg = dir.0.join("fake-ffmpeg.sh");
+    std::fs::write(
+        &fake_ffmpeg,
+        format!(
+            "#!/bin/sh\n\
+             echo invoked >> \"{log}\"\n\
+             for a in \"$@\"; do last=\"$a\"; done\n\
+             dir=$(dirname \"$last\")\n\
+             printf 'chunk0' > \"$dir/chunk-0-00001.m4s\"\n\
+             printf 'achunk0' > \"$dir/chunk-1-00001.m4s\"\n\
+             printf 'achunk1' > \"$dir/chunk-1-00002.m4s\"\n\
+             printf 'init0' > \"$dir/init-0.m4s\"\n\
+             printf 'init1' > \"$dir/init-1.m4s\"\n\
+             printf '<?xml version=\"1.0\" encoding=\"utf-8\"?><MPD><Period>' > \"$last\"\n\
+             printf '<AdaptationSet><Representation id=\"0\"><SegmentTemplate \
+             initialization=\"init-$RepresentationID$.m4s\" \
+             media=\"chunk-$RepresentationID$-$Number%%05d$.m4s\"/></Representation></AdaptationSet>' \
+             >> \"$last\"\n\
+             printf '<AdaptationSet><Representation id=\"1\"><SegmentTemplate \
+             initialization=\"init-$RepresentationID$.m4s\" \
+             media=\"chunk-$RepresentationID$-$Number%%05d$.m4s\"/></Representation></AdaptationSet>' \
+             >> \"$last\"\n\
+             printf '</Period></MPD>' >> \"$last\"\n\
+             exit 0\n",
+            log = log_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let invocation_count = |log: &std::path::Path| -> usize {
+        std::fs::read_to_string(log).map(|s| s.lines().count()).unwrap_or(0)
+    };
+
+    let config_dir = dir.0.join("config");
+    // A disjoint port range from both the pairing/playback test (17000..20999) and the HLS test
+    // (21000..24999) above, so all three can run concurrently in the same `cargo test` process
+    // without contending for a listener.
+    let port = 25000 + (std::process::id() % 4000) as u16;
+    let bin = env!("CARGO_BIN_EXE_lumen");
+    let mut server = KillOnDrop(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                dir.0.to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--",
+                "--vo=null",
+                "--ao=null",
+                "--force-window=no",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("APPDATA", &config_dir)
+            .env("HOME", &config_dir)
+            .env("LUMEN_FFMPEG", &fake_ffmpeg)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("lumen must be runnable"),
+    );
+
+    if let Some(stderr) = server.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[lumen serve stderr] {line}");
+            }
+        });
+    }
+
+    let stdout = server.stdout.take().unwrap();
+    let mut lines = BufReader::new(stdout).lines();
+    let mut code = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        println!("[lumen serve stdout] {line}");
+        if let Some(rest) = line.strip_prefix("pairing code: ") {
+            code = Some(rest.split_whitespace().next().unwrap().to_string());
+            break;
+        }
+    }
+    let code = code.expect("the server must print a pairing code on startup");
+
+    let mut fingerprint = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        println!("[lumen serve stdout] {line}");
+        if let Some(rest) = line.strip_prefix("tls fingerprint: ") {
+            fingerprint = Some(rest.split("  ").next().unwrap().to_string());
+            break;
+        }
+    }
+    let fingerprint = fingerprint.expect("the server must print a TLS fingerprint on startup");
+
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            println!("[lumen serve stdout] {line}");
+        }
+    });
+
+    rustls::crypto::ring::default_provider().install_default().ok();
+
+    let mut tls = connect_tls(port, &fingerprint, Duration::from_secs(10));
+    tls.write_all(request("1", &format!("\"type\":\"pair\",\"code\":\"{code}\"")).as_bytes())
+        .unwrap();
+    let paired = read_reply(&mut tls);
+    assert_eq!(
+        paired.ty().as_deref(),
+        Some("paired"),
+        "expected a paired reply, got {:?}",
+        paired.0
+    );
+    let token = paired.str("token").expect("a paired reply must carry a token");
+    drop(tls);
+
+    let enc = |p: &std::path::Path| p.to_str().unwrap().replace(' ', "%20");
+
+    // A missing/invalid token is refused before any generation is even attempted.
+    {
+        let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+        c.write_all(
+            format!(
+                "GET /dash/notarealtoken00000000000000000/{}/manifest.mpd HTTP/1.1\r\nHost: x\r\n\r\n",
+                enc(&source_a)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let (status, _, _) = read_http_response(&mut c);
+        assert_eq!(status, 401, "an invalid token must be refused before touching ffmpeg at all");
+    }
+
+    // A source outside the served library root is refused, exactly like `/stream/` and `/hls/`.
+    {
+        let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+        c.write_all(
+            format!(
+                "GET /dash/{token}/{}/manifest.mpd HTTP/1.1\r\nHost: x\r\n\r\n",
+                enc(&outsider)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let (status, _, _) = read_http_response(&mut c);
+        assert_eq!(status, 404, "a source outside the library root must not be segmentable");
+    }
+
+    // A chunk name requested before any manifest request for that source has ever run is a stale or
+    // forged URL, not a legitimate race -- 404, never a wait-and-retry.
+    {
+        let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+        c.write_all(
+            format!(
+                "GET /dash/{token}/{}/chunk-0-00001.m4s HTTP/1.1\r\nHost: x\r\n\r\n",
+                enc(&source_b)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let (status, _, _) = read_http_response(&mut c);
+        assert_eq!(status, 404, "a chunk can never be fetched before its manifest generates it");
+    }
+
+    // The first manifest request for a genuinely new source triggers real generation (through the
+    // fake ffmpeg) and returns bare, relative init/chunk URIs -- never the absolute build-directory
+    // paths ffmpeg itself was invoked with.
+    let before = invocation_count(&log_path);
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /dash/{token}/{}/manifest.mpd HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, headers, body) = read_http_response(&mut c);
+    assert_eq!(status, 200, "generation must succeed against the fake ffmpeg");
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("dash+xml")),
+        "expected a DASH manifest content-type, got {headers:?}"
+    );
+    let manifest = String::from_utf8(body).expect("a manifest must be valid UTF-8");
+    assert!(manifest.contains("<MPD"), "not a real manifest: {manifest:?}");
+    // A manifest's own `SegmentTemplate` carries the *pattern*, never a resolved literal segment
+    // name -- `$RepresentationID$` is filled in by the player per representation, not by ffmpeg when
+    // it writes the manifest (confirmed live: see `lumen-segment/src/dash.rs`'s own module doc).
+    assert!(
+        manifest.contains(r#"initialization="init-$RepresentationID$.m4s""#)
+            && manifest.contains(r#"media="chunk-$RepresentationID$-$Number%05d$.m4s""#),
+        "expected bare segment template patterns for both representations: {manifest:?}"
+    );
+    assert!(
+        !manifest.contains(dir.0.to_str().unwrap()),
+        "the served manifest must never leak the server's own build-directory path: {manifest:?}"
+    );
+    assert_eq!(
+        invocation_count(&log_path),
+        before + 1,
+        "exactly one ffmpeg run for a fresh source"
+    );
+
+    // An init segment named by that manifest now resolves, with the fake script's own fixed bytes.
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /dash/{token}/{}/init-0.m4s HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, headers, body) = read_http_response(&mut c);
+    assert_eq!(status, 200);
+    assert!(
+        headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "video/mp4")
+    );
+    assert_eq!(body, b"init0", "expected the fake ffmpeg's own init segment bytes");
+
+    // Representation "1"'s *second* chunk resolves too -- proving this route family does not assume
+    // every representation shares one segment count the way HLS's single timeline would.
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!(
+            "GET /dash/{token}/{}/chunk-1-00002.m4s HTTP/1.1\r\nHost: x\r\n\r\n",
+            enc(&source_a)
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let (status, _, body) = read_http_response(&mut c);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"achunk1", "expected the fake ffmpeg's own second-chunk bytes");
+
+    // A second request for the *same, unchanged* source must not regenerate anything -- served
+    // straight from the on-disk cache.
+    let before = invocation_count(&log_path);
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /dash/{token}/{}/manifest.mpd HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, _, _) = read_http_response(&mut c);
+    assert_eq!(status, 200);
+    assert_eq!(
+        invocation_count(&log_path),
+        before,
+        "an unchanged, already-cached source must not re-run ffmpeg"
+    );
+
+    // Concurrent first-time requests for one new source coalesce onto exactly one ffmpeg run.
+    let before = invocation_count(&log_path);
+    let fp = fingerprint.clone();
+    let tok = token.clone();
+    let src = enc(&source_c);
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let fp = fp.clone();
+            let tok = tok.clone();
+            let src = src.clone();
+            std::thread::spawn(move || {
+                let mut c = connect_tls(port, &fp, Duration::from_secs(10));
+                c.write_all(
+                    format!("GET /dash/{tok}/{src}/manifest.mpd HTTP/1.1\r\nHost: x\r\n\r\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+                read_http_response(&mut c).0
+            })
+        })
+        .collect();
+    for h in handles {
+        assert_eq!(h.join().unwrap(), 200, "every coalesced requester must still see success");
+    }
+    assert_eq!(
+        invocation_count(&log_path),
+        before + 1,
+        "six concurrent requests for the same new source must invoke ffmpeg exactly once"
+    );
+
+    // Touching the source's mtime changes its cache key -- the next manifest request must generate
+    // fresh output, not keep serving what was cached under the old key.
+    let before = invocation_count(&log_path);
+    let touched = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::File::open(&source_a).unwrap().set_modified(touched).unwrap();
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /dash/{token}/{}/manifest.mpd HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, _, body) = read_http_response(&mut c);
+    assert_eq!(status, 200);
+    assert!(String::from_utf8(body).unwrap().contains("<MPD"));
+    assert_eq!(
+        invocation_count(&log_path),
+        before + 1,
+        "a changed mtime must trigger a fresh generation under its new cache key"
+    );
+
+    // Kept explicit even though `KillOnDrop` will do this again on scope exit regardless -- see the
+    // matching comment at the end of the other integration tests in this file.
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
 fn connect_with_retry(port: u16, timeout: Duration) -> TcpStream {
     let deadline = std::time::Instant::now() + timeout;
     loop {
