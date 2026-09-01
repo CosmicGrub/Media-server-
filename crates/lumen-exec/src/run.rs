@@ -235,4 +235,115 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Every test above exercises a FAKE ffmpeg. `build_command` here has no auxiliary-filename
+    /// option comparable to HLS's `-hls_fmp4_init_filename` (a real ffmpeg-version-specific
+    /// path-resolution quirk `lumen-segment`'s own real-ffmpeg test exists to catch) -- every argument
+    /// here is either a codec/bitstream-filter choice or the one `job.output` path, which a real
+    /// ffmpeg build honors as given (already proven live: the same absolute-path behavior the HLS
+    /// playlist path and segment pattern both rely on correctly). This test exists anyway, to convert
+    /// that reasoning into a real, standing proof rather than trusting it — a real remux against a
+    /// real ffmpeg build, verified both by `execute()`'s own content-sniffing and, independently, by
+    /// `ffprobe`. Skipped, not failed, when `ffmpeg`/`ffprobe` are not on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_ffmpeg_build_remuxes_a_real_source_and_the_output_verifies_both_ways() {
+        if !std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipping: ffmpeg is not on PATH in this environment");
+            return;
+        }
+        if !std::process::Command::new("ffprobe")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipping: ffprobe is not on PATH in this environment");
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("lumen-exec-real-ffmpeg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let source = dir.join("source.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=10:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                source.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg must be runnable to encode the source");
+        assert!(status.success(), "encoding the real source file failed");
+
+        let output = dir.join("out.mkv");
+        let job = RemuxJob {
+            source,
+            output: output.clone(),
+            container: Container::Matroska,
+            audio: AudioAdaptation::Copy,
+            include_subtitles: true,
+        };
+        let outcome = execute(&job, Path::new("ffmpeg")).expect(
+            "a real ffmpeg build must accept exactly what build_command produces, and the \
+                     remuxed output must verify against execute()'s own content-sniffing",
+        );
+        assert!(outcome.output_bytes > 0);
+
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name",
+                "-of",
+                "csv=p=0",
+                output.to_str().unwrap(),
+            ])
+            .output()
+            .expect("ffprobe must be runnable");
+        assert!(
+            probe.status.success(),
+            "ffprobe rejected the real remux output: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let out = String::from_utf8_lossy(&probe.stdout);
+        // Column order in ffprobe's csv output is not being relied on -- just that some line names
+        // both the right codec_type and the right codec_name together, proving the remux really
+        // stream-copied the source's own codecs rather than silently transcoding or dropping a track.
+        assert!(
+            out.lines().any(|l| l.contains("h264") && l.contains("video")),
+            "expected a stream-copied h264 video stream:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| l.contains("aac") && l.contains("audio")),
+            "expected a stream-copied aac audio stream:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
