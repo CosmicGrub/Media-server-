@@ -652,6 +652,201 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let _ = server.wait();
 }
 
+/// `docs/15` §A's manual-trigger MVP, proven against a real `lumen serve` process: `library_version`
+/// starts at 0 (unchanged from before this existed), a file dropped into the library after startup is
+/// invisible until a real `rescan` request re-walks the tree, and the version that comes back in the
+/// `Rescan` reply is the same one the very next unprompted `state` push carries -- not a second,
+/// independently-tracked number that could drift from what clients actually see.
+#[test]
+fn rescan_makes_library_version_real_and_reflects_a_newly_added_file() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("rescan");
+    let first = encode_probe_file(&dir.0);
+    let config_dir = dir.0.join("config");
+    let port = 21500 + (std::process::id() % 4000) as u16;
+    let bin = env!("CARGO_BIN_EXE_lumen");
+    let mut server = KillOnDrop(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                dir.0.to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--",
+                "--vo=null",
+                "--ao=null",
+                "--force-window=no",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("APPDATA", &config_dir)
+            .env("HOME", &config_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("lumen must be runnable"),
+    );
+
+    if let Some(stderr) = server.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[lumen serve stderr] {line}");
+            }
+        });
+    }
+
+    let stdout = server.stdout.take().unwrap();
+    let mut lines = BufReader::new(stdout).lines();
+    let mut code = None;
+    let mut fingerprint = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        println!("[lumen serve stdout] {line}");
+        if let Some(rest) = line.strip_prefix("pairing code: ") {
+            code = Some(rest.split_whitespace().next().unwrap().to_string());
+        }
+        if let Some(rest) = line.strip_prefix("tls fingerprint: ") {
+            fingerprint = Some(rest.split("  ").next().unwrap().to_string());
+        }
+        if code.is_some() && fingerprint.is_some() {
+            break;
+        }
+    }
+    let code = code.expect("the server must print a pairing code on startup");
+    let fingerprint = fingerprint.expect("the server must print a TLS fingerprint on startup");
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            println!("[lumen serve stdout] {line}");
+        }
+    });
+
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let mut tls = connect_tls(port, &fingerprint, Duration::from_secs(10));
+    tls.write_all(request("1", &format!("\"type\":\"pair\",\"code\":\"{code}\"")).as_bytes())
+        .unwrap();
+    let paired = read_reply(&mut tls);
+    assert_eq!(paired.ty().as_deref(), Some("paired"));
+
+    // The very first unprompted state push must carry the same `library_version: 0` every state push
+    // did before this feature existed -- a server that has never been asked to rescan must not report
+    // a version that implies it already re-walked something on its own.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_initial_version = None;
+    while std::time::Instant::now() < deadline {
+        let msg = read_message(&mut tls);
+        if msg.ty().as_deref() == Some("state") {
+            saw_initial_version = num_in(&msg.0, "library_version");
+            break;
+        }
+    }
+    assert_eq!(
+        saw_initial_version,
+        Some(0.0),
+        "library_version must start at 0, unchanged from before a rescan was ever requested"
+    );
+
+    // Drop a second real file into the library while the server is already running -- exactly the
+    // scenario `server.rs`'s own "one snapshot taken at startup, never refreshed" limitation named.
+    let second = encode_probe_file2(&dir.0);
+    assert_ne!(second, first, "the two probe files must actually be distinct paths");
+
+    tls.write_all(request("2", "\"type\":\"rescan\"").as_bytes()).unwrap();
+    let rescan_reply = read_reply(&mut tls);
+    assert_eq!(
+        rescan_reply.bool("ok"),
+        Some(true),
+        "rescan must be accepted: {:?}",
+        rescan_reply.0
+    );
+    let result = rescan_reply.map("result").expect("a rescan reply must carry a result object");
+    assert_eq!(
+        num_in(&result, "file_count"),
+        Some(2.0),
+        "the fresh walk must see both the original and the newly added file"
+    );
+    assert_eq!(
+        num_in(&result, "library_version"),
+        Some(1.0),
+        "the first rescan must bump the version from 0 to 1"
+    );
+
+    // The very next state push must carry the same version the rescan reply just reported -- a client
+    // watching state pushes alone (never issuing its own rescan) must see the same number a client
+    // that requested the rescan directly was told, not a second, independently-tracked value.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_bumped_version = None;
+    while std::time::Instant::now() < deadline {
+        let msg = read_message(&mut tls);
+        if msg.ty().as_deref() == Some("state") {
+            let v = num_in(&msg.0, "library_version");
+            if v == Some(1.0) {
+                saw_bumped_version = v;
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        saw_bumped_version,
+        Some(1.0),
+        "the next state push must carry the version the rescan reply just reported"
+    );
+
+    // A second rescan with nothing new on disk still bumps the version -- this is a re-walk trigger,
+    // not a diff against the previous run (that finer-grained tracking is the larger, deliberately
+    // deferred `lumen-index`-backed engine `docs/15` §A describes, not this).
+    tls.write_all(request("3", "\"type\":\"rescan\"").as_bytes()).unwrap();
+    let second_rescan = read_reply(&mut tls);
+    let result = second_rescan.map("result").expect("a rescan reply must carry a result object");
+    assert_eq!(num_in(&result, "file_count"), Some(2.0), "still the same two real files");
+    assert_eq!(
+        num_in(&result, "library_version"),
+        Some(2.0),
+        "every completed rescan bumps the version, changed or not"
+    );
+
+    // An unauthenticated socket must not be able to trigger a filesystem walk any more than it can
+    // control playback -- the same posture the existing test already proves for `pause`.
+    let mut stranger = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    stranger.write_all(request("4", "\"type\":\"rescan\"").as_bytes()).unwrap();
+    let refused = read_reply(&mut stranger);
+    assert_eq!(
+        refused.bool("ok"),
+        Some(false),
+        "an unauthenticated socket must not trigger a rescan"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// A second, distinctly-named real encoded clip, for the rescan test's "a file appeared after startup"
+/// scenario -- kept separate from `encode_probe_file` rather than parameterizing it, since every other
+/// call site wants exactly `Probe.mkv` and gains nothing from a filename argument threaded through it.
+fn encode_probe_file2(dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("SecondProbe.mkv");
+    let status = std::process::Command::new("mpv")
+        .args([
+            "av://lavfi:testsrc2=size=160x90:rate=8:duration=2",
+            "--audio-file=av://lavfi:sine=frequency=220:duration=2",
+            &format!("--o={}", path.display()),
+            "--ovc=libx264",
+            "--ovcopts=preset=ultrafast",
+            "--oac=aac",
+            "--msg-level=all=error",
+        ])
+        .status()
+        .expect("mpv must be runnable to encode the second probe file");
+    assert!(status.success(), "encoding the second probe file failed");
+    assert!(path.exists());
+    path
+}
+
 /// Connect over TCP, then complete a TLS handshake pinned to `fingerprint` — the same trust-on-first-
 /// use a real client performs, not a bypass of it. `ServerName` is required by the API but never
 /// actually checked: [`PinnedFingerprint`] verifies the certificate by its hash alone.

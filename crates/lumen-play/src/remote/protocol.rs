@@ -75,6 +75,16 @@ pub enum ClientMessage {
     Health {
         id: String,
     },
+    /// Re-walk the library root right now and make `PlaybackState::library_version` real. `docs/15`
+    /// §A names this exact shape — "periodic re-diff on `serve` startup plus the manual command" — as
+    /// the legitimate MVP, distinct from (and a smaller slice than) the persisted, incremental
+    /// `lumen-index`-backed engine the rest of that section describes and this does not attempt: no
+    /// on-disk index, no diffing against a previous run, just a fresh scan replacing the in-memory one
+    /// `server.rs` already holds. A background filesystem watcher stays the honest phase-2 item that
+    /// section already names, not something this pretends to be.
+    Rescan {
+        id: String,
+    },
 }
 
 impl ClientMessage {
@@ -91,7 +101,8 @@ impl ClientMessage {
             | Self::SetVolume { id, .. }
             | Self::Next { id, .. }
             | Self::Previous { id, .. }
-            | Self::Health { id, .. } => id,
+            | Self::Health { id, .. }
+            | Self::Rescan { id, .. } => id,
         }
     }
 
@@ -131,6 +142,7 @@ impl ClientMessage {
             "next" => Some(Self::Next { id }),
             "previous" => Some(Self::Previous { id }),
             "health" => Some(Self::Health { id }),
+            "rescan" => Some(Self::Rescan { id }),
             _ => None,
         }
     }
@@ -162,6 +174,14 @@ pub enum ReplyBody {
     Ok,
     Library(Vec<LibraryEntry>),
     Health(HealthReport),
+    /// A completed [`ClientMessage::Rescan`]: how many playable files the fresh walk found, and the
+    /// `library_version` it now stands at — handed back directly rather than making the client wait
+    /// for the next `State` push (which will also carry it, on the driver thread's own ~400ms cadence)
+    /// to learn whether its trigger actually did anything.
+    Rescan {
+        file_count: u64,
+        library_version: u64,
+    },
 }
 
 /// `docs/15-next-generation-engines.md` §D. Every field a paired client cannot otherwise learn about
@@ -260,6 +280,13 @@ impl ServerMessage {
                         entries.join(",")
                     )
                 }
+                ReplyBody::Rescan { file_count, library_version } => format!(
+                    "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":{{\"file_count\":{},\
+                     \"library_version\":{}}}}}",
+                    quote(id),
+                    file_count,
+                    library_version,
+                ),
                 ReplyBody::Health(h) => format!(
                     "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":{{\"mpv_roundtrip_ms\":{},\
                      \"tls_cert_expires_in_secs\":{},\"library_last_indexed_unix_secs\":{},\
@@ -436,6 +463,29 @@ mod tests {
     fn a_health_request_parses_and_carries_its_id() {
         let line = obj(&[("type", Value::Str("health".into())), ("id", Value::Str("9".into()))]);
         assert_eq!(ClientMessage::parse(&line).unwrap(), ClientMessage::Health { id: "9".into() });
+    }
+
+    #[test]
+    fn a_rescan_request_parses_and_carries_its_id() {
+        let line = obj(&[("type", Value::Str("rescan".into())), ("id", Value::Str("11".into()))]);
+        assert_eq!(ClientMessage::parse(&line).unwrap(), ClientMessage::Rescan { id: "11".into() });
+        assert!(
+            !ClientMessage::Rescan { id: "11".into() }.is_pre_auth(),
+            "an unauthenticated socket must not be able to trigger a filesystem walk"
+        );
+    }
+
+    #[test]
+    fn a_rescan_reply_carries_the_fresh_count_and_version() {
+        let msg = ServerMessage::Reply {
+            id: "4".into(),
+            result: ReplyBody::Rescan { file_count: 137, library_version: 3 },
+        };
+        let line = msg.to_line();
+        let v = crate::json::parse(line.trim_end()).expect("must be well-formed JSON");
+        let result = v.get("result").expect("a rescan reply must carry a result object");
+        assert_eq!(result.get("file_count").and_then(Value::as_f64), Some(137.0));
+        assert_eq!(result.get("library_version").and_then(Value::as_f64), Some(3.0));
     }
 
     #[test]

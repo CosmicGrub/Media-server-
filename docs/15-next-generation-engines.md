@@ -31,11 +31,21 @@ holds; only the storage engine changed.
 `lumen scan` and `lumen serve` both call the same walker in
 [`lumen-play/src/scan.rs`](../crates/lumen-play/src/scan.rs), and it is **stateless**: every
 invocation re-walks the tree and re-probes every file from zero. `server.rs` holds the result as
-`library: Arc<Mutex<Scan>>` — one snapshot taken at startup, held in memory, never refreshed. The
-wire protocol already has a `library_version: u64` field on `PlaybackState`
+`library: Arc<Mutex<Scan>>` — one snapshot taken at startup, held in memory, never refreshed unless a
+client asks. The wire protocol already has a `library_version: u64` field on `PlaybackState`
 ([`protocol.rs`](../crates/lumen-play/src/remote/protocol.rs)) — its own doc comment says a client
-uses it "to cheaply decide whether its cached listing is stale" — but `server.rs` hardcodes it to
-`0`. The hook is designed in; nothing drives it.
+uses it "to cheaply decide whether its cached listing is stale."
+
+**Update: the manual-trigger half of this is done, the persisted/incremental half below is not.**
+`ClientMessage::Rescan` now re-walks `library_root` on request, replaces the in-memory `Scan`, and
+bumps a real `ServerContext::library_version` that every subsequent `PlaybackState` push carries — the
+exact "periodic re-diff on `serve` startup plus the manual command is a legitimate MVP" shape this
+section's own CLI note below already pre-approved. What is **not** built: no `lumen-index` wiring into
+`serve` (still only reachable via the separate `lumen reindex`/`lumen verify` subcommands), no
+persisted on-disk index, no diff against a previous run (every rescan re-probes everything and bumps
+the version whether anything actually changed or not), and no automatic re-diff on `serve` startup —
+a rescan only happens when a client explicitly asks. The rest of this section (the real design below)
+is the larger engine that would close those, and remains what it always was: designed, not built.
 
 Separately: `lumen-meta` (provider fragments, artwork selection, field merge with provenance) and
 `lumen-subs` (subtitle acquisition ladder, sync correction) are both fully built, independently
@@ -342,8 +352,9 @@ other message type in `RemoteScreen.kt` — a small "Server" card, not a new scr
 Each engine above extends code that already exists and is already tested, rather than opening a new
 front. None require an account, a cloud service, or new infrastructure — consistent with the
 project's stated LAN-first, offline-primary posture. Each closes a gap that was found by reading the
-actual source, not by extrapolating from the aspirational roadmap: a hardcoded `library_version: 0`,
-two fully-built crates nothing depends on, a fidelity model with no feedback loop, and a headless
-server with no way to ask it how it's doing. That is the bar for "engineering-grade" this document
+actual source, not by extrapolating from the aspirational roadmap: a `library_version` nothing drove
+(now driven by a manual rescan trigger — see §A's own update note for exactly how much of the section
+that does and does not close), two fully-built crates nothing depends on, a fidelity model with no
+feedback loop, and a headless server with no way to ask it how it's doing. That is the bar for "engineering-grade" this document
 tries to hold itself to — a precise, named gap in real code, a design that reuses this codebase's own
 established patterns, and an explicit test strategy, for every item.

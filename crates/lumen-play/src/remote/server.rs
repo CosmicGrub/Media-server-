@@ -231,6 +231,12 @@ struct ServerContext {
     /// How many responses are currently streaming out of each DASH cache key's directory, mirroring
     /// `active_readers` exactly — see `dash::ReaderGuard`.
     dash_active_readers: Mutex<HashMap<String, u32>>,
+    /// Backs `PlaybackState::library_version` — see that field's own doc comment and `docs/15` §A.
+    /// Starts at 0, the same value every state push already carried before this existed; bumped once
+    /// per completed [`ClientMessage::Rescan`], never on the free-running `MPV_POLL_INTERVAL` poll
+    /// that reads it. `drive_mpv` only ever loads this — `dispatch`'s `Rescan` arm is the one writer,
+    /// so there is exactly one place a client-visible version bump can come from.
+    library_version: Arc<AtomicU64>,
 }
 
 /// Run the server. Blocks until the process is killed — this is meant to run in the foreground of a
@@ -286,9 +292,13 @@ pub fn run(
 
     let (tx, rx) = mpsc::channel::<Command>();
     let shared = Arc::new(SharedState::new());
+    let library_version = Arc::new(AtomicU64::new(0));
     let driver_shared = Arc::clone(&shared);
+    let driver_library_version = Arc::clone(&library_version);
     let driver_log = Arc::clone(&log);
-    std::thread::spawn(move || drive_mpv(mpv, rx, &driver_shared, &*driver_log));
+    std::thread::spawn(move || {
+        drive_mpv(mpv, rx, &driver_shared, &driver_library_version, &*driver_log)
+    });
 
     let token_path = TokenStore::default_path();
     let tokens = Arc::new(Mutex::new(TokenStore::load(&token_path)));
@@ -358,6 +368,7 @@ pub fn run(
         dash_cache_root,
         dash_locks: Mutex::new(HashMap::new()),
         dash_active_readers: Mutex::new(HashMap::new()),
+        library_version,
     });
 
     let listener = TcpListener::bind((bind, port))
@@ -408,6 +419,7 @@ fn drive_mpv(
     mut mpv: Mpv,
     commands: Receiver<Command>,
     shared: &SharedState,
+    library_version: &AtomicU64,
     log: &(dyn Fn(&str) + Send + Sync),
 ) {
     log("driver: command loop starting");
@@ -440,7 +452,7 @@ fn drive_mpv(
         }
         if last_poll.elapsed() >= MPV_POLL_INTERVAL {
             let start = std::time::Instant::now();
-            let state = read_state(&mut mpv);
+            let state = read_state(&mut mpv, library_version.load(Ordering::Acquire));
             let elapsed = start.elapsed();
             // Only when it is unexpectedly slow -- every 400ms would be pure noise, since a healthy
             // poll finishes in well under a millisecond.
@@ -498,10 +510,10 @@ fn execute(mpv: &mut Mpv, body: CommandBody) -> Result<ReplyBody, String> {
     }
 }
 
-fn read_state(mpv: &mut Mpv) -> PlaybackState {
+fn read_state(mpv: &mut Mpv, library_version: u64) -> PlaybackState {
     let path = mpv.get_string_timeout("path", STATE_POLL_PROPERTY_TIMEOUT);
     let Some(path) = path else {
-        return PlaybackState { now_playing: None, library_version: 0 };
+        return PlaybackState { now_playing: None, library_version };
     };
     let title = mpv
         .get_string_timeout("media-title", STATE_POLL_PROPERTY_TIMEOUT)
@@ -520,7 +532,7 @@ fn read_state(mpv: &mut Mpv) -> PlaybackState {
         .clamp(0.0, 100.0) as u8;
     PlaybackState {
         now_playing: Some(NowPlaying { path, title, duration_ms, position_ms, paused, volume }),
-        library_version: 0,
+        library_version,
     }
 }
 
@@ -731,6 +743,20 @@ fn dispatch(msg: ClientMessage, ctx: &ServerContext, authed: &mut bool) -> Serve
                 paired_client_count: ctx.active_clients.load(Ordering::Acquire),
             };
             run_command(ctx, id, body)
+        }
+        // `docs/15` §A's manual-trigger MVP: re-walk the library root right now, replace the
+        // in-memory `Scan` `Library`/`Play` already read from, and bump the counter every subsequent
+        // `PlaybackState` push carries. Run on this connection's own thread, not sent through
+        // `ctx.commands` to the mpv driver thread — a filesystem walk has nothing to do with mpv, and
+        // routing it through that channel would block every other client's commands behind it for as
+        // long as the walk takes.
+        ClientMessage::Rescan { .. } => {
+            let fresh =
+                scan::scan(std::slice::from_ref(&ctx.library_root), &ScanOptions::default());
+            let file_count = fresh.playable().count() as u64;
+            *ctx.library.lock().unwrap() = fresh;
+            let library_version = ctx.library_version.fetch_add(1, Ordering::AcqRel) + 1;
+            ServerMessage::Reply { id, result: ReplyBody::Rescan { file_count, library_version } }
         }
     }
 }
