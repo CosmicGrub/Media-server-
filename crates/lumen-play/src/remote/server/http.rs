@@ -144,6 +144,11 @@ fn handle_request(tls: &mut TlsStream, req: &HttpRequest, ctx: &ServerContext) {
         return;
     }
 
+    if let Some(rest) = req.path.strip_prefix("/hls/") {
+        super::hls::handle(tls, &req.method, rest, ctx);
+        return;
+    }
+
     let Some(requested) = req.path.strip_prefix("/stream/") else {
         write_error(tls, 404, "Not Found");
         return;
@@ -189,7 +194,7 @@ fn handle_request(tls: &mut TlsStream, req: &HttpRequest, ctx: &ServerContext) {
     serve_file(tls, &req.method, Path::new(&real_path), content_type, req.header("range"));
 }
 
-fn serve_file(
+pub(super) fn serve_file(
     tls: &mut TlsStream,
     method: &str,
     real_path: &Path,
@@ -300,7 +305,7 @@ fn write_ok(tls: &mut TlsStream, content_type: &str, body: &[u8]) {
     }
 }
 
-fn write_error(tls: &mut TlsStream, code: u16, reason: &str) {
+pub(super) fn write_error(tls: &mut TlsStream, code: u16, reason: &str) {
     let head = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{reason}",

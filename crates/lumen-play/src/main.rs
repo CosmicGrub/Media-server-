@@ -15,6 +15,7 @@
 
 mod calibration;
 mod dlna;
+mod ffmpegbin;
 mod fidelity;
 mod ipc;
 mod json;

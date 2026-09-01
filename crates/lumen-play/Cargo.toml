@@ -20,6 +20,7 @@ lumen-match.workspace = true
 lumen-identity.workspace = true
 lumen-index.workspace = true
 lumen-discovery.workspace = true
+lumen-segment.workspace = true
 # Only for `lumen serve`'s pairing codes and tokens. `unsafe_code` is denied workspace-wide, which
 # rules out reading a platform random source by hand, and std has no CSPRNG of its own to reach for.
 getrandom = "0.3"

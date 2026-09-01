@@ -283,6 +283,7 @@ dependencies = [
  "lumen-model",
  "lumen-playback",
  "lumen-probe",
+ "lumen-segment",
  "rcgen",
  "rustls",
  "sha2",

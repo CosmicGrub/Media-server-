@@ -707,6 +707,324 @@ fn read_http_response(tls: &mut ClientTls) -> (u16, Vec<(String, String)>, Vec<u
     (status, headers, body)
 }
 
+/// Tier 5 integration coverage: HLS delivery wired into `lumen serve`'s HTTP surface (see
+/// `remote::server::hls`). A real `ffmpeg` binary is not required -- a tiny fake shell script stands
+/// in for it, the same "spawn a real subprocess, verify against real files it actually wrote" trick
+/// `lumen-segment`'s own `command.rs` tests already use, pointed at via `LUMEN_FFMPEG` (see
+/// `ffmpegbin::find`). Real mpv is still required: `server::run` unconditionally spawns an idle mpv on
+/// startup regardless of whether any HLS route is ever hit, so this test is skipped under the same
+/// convention as every other mpv-dependent test in this crate when mpv is not on `PATH`.
+#[cfg(unix)]
+#[test]
+fn hls_playlist_and_segments_are_generated_lazily_cached_and_authenticated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("hls");
+    let outside = TempDir::new("hls-outside");
+
+    // Three dummy sources. Their bytes are never read by ffmpeg -- the fake script below ignores its
+    // real input entirely and always writes the same fixed output -- only their existence, size, and
+    // mtime matter, since those alone feed `hls::cache_key`.
+    let source_a = dir.0.join("A.mkv");
+    let source_b = dir.0.join("B.mkv");
+    let source_c = dir.0.join("C.mkv");
+    std::fs::write(&source_a, b"source a").unwrap();
+    std::fs::write(&source_b, b"source b").unwrap();
+    std::fs::write(&source_c, b"source c").unwrap();
+    let outsider = outside.0.join("Secret.mkv");
+    std::fs::write(&outsider, b"not in the library").unwrap();
+
+    let log_path = dir.0.join("ffmpeg-invocations.log");
+    let fake_ffmpeg = dir.0.join("fake-ffmpeg.sh");
+    std::fs::write(
+        &fake_ffmpeg,
+        format!(
+            "#!/bin/sh\n\
+             echo invoked >> \"{log}\"\n\
+             prev=\"\"\n\
+             init=\"\"\n\
+             for a in \"$@\"; do\n\
+             \x20\x20if [ \"$prev\" = \"-hls_fmp4_init_filename\" ]; then init=\"$a\"; fi\n\
+             \x20\x20prev=\"$a\"\n\
+             \x20\x20last=\"$a\"\n\
+             done\n\
+             dir=$(dirname \"$last\")\n\
+             printf 'seg0' > \"$dir/seg_00000.m4s\"\n\
+             printf 'seg1' > \"$dir/seg_00001.m4s\"\n\
+             printf 'seg2' > \"$dir/seg_00002.m4s\"\n\
+             printf 'init' > \"$init\"\n\
+             printf '#EXTM3U\\n' > \"$last\"\n\
+             printf '#EXT-X-VERSION:7\\n' >> \"$last\"\n\
+             printf '#EXT-X-TARGETDURATION:6\\n' >> \"$last\"\n\
+             printf '#EXTINF:6.000,\\n' >> \"$last\"\n\
+             printf 'seg_00000.m4s\\n' >> \"$last\"\n\
+             printf '#EXTINF:6.000,\\n' >> \"$last\"\n\
+             printf 'seg_00001.m4s\\n' >> \"$last\"\n\
+             printf '#EXTINF:3.000,\\n' >> \"$last\"\n\
+             printf 'seg_00002.m4s\\n' >> \"$last\"\n\
+             printf '#EXT-X-ENDLIST\\n' >> \"$last\"\n\
+             exit 0\n",
+            log = log_path.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let invocation_count = |log: &std::path::Path| -> usize {
+        std::fs::read_to_string(log).map(|s| s.lines().count()).unwrap_or(0)
+    };
+
+    let config_dir = dir.0.join("config");
+    // A disjoint port range from the main pairing/playback test above (17000..20999), so both tests
+    // can run concurrently in the same `cargo test` process without contending for a listener.
+    let port = 21000 + (std::process::id() % 4000) as u16;
+    let bin = env!("CARGO_BIN_EXE_lumen");
+    let mut server = std::process::Command::new(bin)
+        .args([
+            "serve",
+            dir.0.to_str().unwrap(),
+            "--port",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--",
+            "--vo=null",
+            "--ao=null",
+            "--force-window=no",
+        ])
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("APPDATA", &config_dir)
+        .env("HOME", &config_dir)
+        .env("LUMEN_FFMPEG", &fake_ffmpeg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("lumen must be runnable");
+
+    if let Some(stderr) = server.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[lumen serve stderr] {line}");
+            }
+        });
+    }
+
+    let stdout = server.stdout.take().unwrap();
+    let mut lines = BufReader::new(stdout).lines();
+    let mut code = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        println!("[lumen serve stdout] {line}");
+        if let Some(rest) = line.strip_prefix("pairing code: ") {
+            code = Some(rest.split_whitespace().next().unwrap().to_string());
+            break;
+        }
+    }
+    let code = code.expect("the server must print a pairing code on startup");
+
+    let mut fingerprint = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        println!("[lumen serve stdout] {line}");
+        if let Some(rest) = line.strip_prefix("tls fingerprint: ") {
+            fingerprint = Some(rest.split("  ").next().unwrap().to_string());
+            break;
+        }
+    }
+    let fingerprint = fingerprint.expect("the server must print a TLS fingerprint on startup");
+
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            println!("[lumen serve stdout] {line}");
+        }
+    });
+
+    rustls::crypto::ring::default_provider().install_default().ok();
+
+    let mut tls = connect_tls(port, &fingerprint, Duration::from_secs(10));
+    tls.write_all(request("1", &format!("\"type\":\"pair\",\"code\":\"{code}\"")).as_bytes())
+        .unwrap();
+    let paired = read_reply(&mut tls);
+    assert_eq!(
+        paired.ty().as_deref(),
+        Some("paired"),
+        "expected a paired reply, got {:?}",
+        paired.0
+    );
+    let token = paired.str("token").expect("a paired reply must carry a token");
+    drop(tls);
+
+    let enc = |p: &std::path::Path| p.to_str().unwrap().replace(' ', "%20");
+
+    // A missing/invalid token is refused before any generation is even attempted.
+    {
+        let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+        c.write_all(
+            format!(
+                "GET /hls/notarealtoken00000000000000000/{}/playlist.m3u8 HTTP/1.1\r\nHost: x\r\n\r\n",
+                enc(&source_a)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let (status, _, _) = read_http_response(&mut c);
+        assert_eq!(status, 401, "an invalid token must be refused before touching ffmpeg at all");
+    }
+
+    // A source outside the served library root is refused, exactly like `/stream/`.
+    {
+        let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+        c.write_all(
+            format!(
+                "GET /hls/{token}/{}/playlist.m3u8 HTTP/1.1\r\nHost: x\r\n\r\n",
+                enc(&outsider)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let (status, _, _) = read_http_response(&mut c);
+        assert_eq!(status, 404, "a source outside the library root must not be segmentable");
+    }
+
+    // A segment name requested before any playlist request for that source has ever run is a stale
+    // or forged URL, not a legitimate race -- 404, never a wait-and-retry.
+    {
+        let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+        c.write_all(
+            format!(
+                "GET /hls/{token}/{}/seg_00000.m4s HTTP/1.1\r\nHost: x\r\n\r\n",
+                enc(&source_b)
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let (status, _, _) = read_http_response(&mut c);
+        assert_eq!(status, 404, "a segment can never be fetched before its playlist generates it");
+    }
+
+    // The first playlist request for a genuinely new source triggers real generation (through the
+    // fake ffmpeg) and returns bare, relative segment/init URIs -- never the absolute build-directory
+    // paths ffmpeg itself was invoked with.
+    let before = invocation_count(&log_path);
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /hls/{token}/{}/playlist.m3u8 HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, headers, body) = read_http_response(&mut c);
+    assert_eq!(status, 200, "generation must succeed against the fake ffmpeg");
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("mpegurl")),
+        "expected an HLS playlist content-type, got {headers:?}"
+    );
+    let playlist = String::from_utf8(body).expect("a playlist must be valid UTF-8");
+    assert!(playlist.contains("#EXTM3U"), "not a real playlist: {playlist:?}");
+    assert!(playlist.contains("seg_00000.m4s"), "expected a bare segment URI: {playlist:?}");
+    assert!(
+        !playlist.contains(dir.0.to_str().unwrap()),
+        "the served playlist must never leak the server's own build-directory path: {playlist:?}"
+    );
+    assert_eq!(
+        invocation_count(&log_path),
+        before + 1,
+        "exactly one ffmpeg run for a fresh source"
+    );
+
+    // A segment named by that playlist now resolves, with the fake script's own fixed bytes.
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /hls/{token}/{}/seg_00000.m4s HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, headers, body) = read_http_response(&mut c);
+    assert_eq!(status, 200);
+    assert!(
+        headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "video/mp4")
+    );
+    assert_eq!(body, b"seg0", "expected the fake ffmpeg's own segment bytes");
+
+    // A second request for the *same, unchanged* source must not regenerate anything -- served
+    // straight from the on-disk cache.
+    let before = invocation_count(&log_path);
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /hls/{token}/{}/playlist.m3u8 HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, _, _) = read_http_response(&mut c);
+    assert_eq!(status, 200);
+    assert_eq!(
+        invocation_count(&log_path),
+        before,
+        "an unchanged, already-cached source must not re-run ffmpeg"
+    );
+
+    // Concurrent first-time requests for one new source coalesce onto exactly one ffmpeg run.
+    let before = invocation_count(&log_path);
+    let fp = fingerprint.clone();
+    let tok = token.clone();
+    let src = enc(&source_c);
+    let handles: Vec<_> = (0..6)
+        .map(|_| {
+            let fp = fp.clone();
+            let tok = tok.clone();
+            let src = src.clone();
+            std::thread::spawn(move || {
+                let mut c = connect_tls(port, &fp, Duration::from_secs(10));
+                c.write_all(
+                    format!("GET /hls/{tok}/{src}/playlist.m3u8 HTTP/1.1\r\nHost: x\r\n\r\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+                read_http_response(&mut c).0
+            })
+        })
+        .collect();
+    for h in handles {
+        assert_eq!(h.join().unwrap(), 200, "every coalesced requester must still see success");
+    }
+    assert_eq!(
+        invocation_count(&log_path),
+        before + 1,
+        "six concurrent requests for the same new source must invoke ffmpeg exactly once"
+    );
+
+    // Touching the source's mtime changes its cache key -- the next playlist request must generate
+    // fresh output, not keep serving what was cached under the old key.
+    let before = invocation_count(&log_path);
+    let touched = std::time::SystemTime::now() + Duration::from_secs(5);
+    std::fs::File::open(&source_a).unwrap().set_modified(touched).unwrap();
+    let mut c = connect_tls(port, &fingerprint, Duration::from_secs(5));
+    c.write_all(
+        format!("GET /hls/{token}/{}/playlist.m3u8 HTTP/1.1\r\nHost: x\r\n\r\n", enc(&source_a))
+            .as_bytes(),
+    )
+    .unwrap();
+    let (status, _, body) = read_http_response(&mut c);
+    assert_eq!(status, 200);
+    assert!(String::from_utf8(body).unwrap().contains("#EXTM3U"));
+    assert_eq!(
+        invocation_count(&log_path),
+        before + 1,
+        "a changed mtime must trigger a fresh generation under its new cache key"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
 fn connect_with_retry(port: u16, timeout: Duration) -> TcpStream {
     let deadline = std::time::Instant::now() + timeout;
     loop {

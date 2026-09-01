@@ -17,9 +17,11 @@
 //! `SharedState` has moved on and push a `State` line if so. The timeout is what stands in for the
 //! old writer thread's independent polling tick.
 
+mod hls;
 mod http;
 mod vr;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -196,6 +198,20 @@ struct ServerContext {
     /// How many sockets are currently connected *and authenticated* — see `ActiveClientGuard`, the
     /// only thing that ever mutates this.
     active_clients: Arc<AtomicU32>,
+    /// Where `hls::ensure_ready` builds and caches generated HLS output — see `hls::default_cache_root`.
+    hls_cache_root: PathBuf,
+    /// Per-cache-key generation locks, so concurrent requests for the same source coalesce onto one
+    /// `ffmpeg` run rather than racing to build it twice. Created lazily, one entry per key ever
+    /// requested this session — see `hls::ensure_ready`.
+    hls_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// How many responses are currently streaming out of each cache key's directory — consulted by
+    /// `hls::maybe_evict` so opportunistic cache eviction never removes a directory mid-read. See
+    /// `hls::ReaderGuard`.
+    active_readers: Mutex<HashMap<String, u32>>,
+    /// Resolved once at startup via `crate::ffmpegbin::find`. `None` means HLS delivery answers every
+    /// request with a clear "ffmpeg not found" error rather than failing to start `lumen serve`
+    /// itself — direct `/stream/` playback needs no ffmpeg at all.
+    ffmpeg_bin: Option<PathBuf>,
 }
 
 /// Run the server. Blocks until the process is killed — this is meant to run in the foreground of a
@@ -258,6 +274,24 @@ pub fn run(
     let token_path = TokenStore::default_path();
     let tokens = Arc::new(Mutex::new(TokenStore::load(&token_path)));
 
+    // `hls-cache` is created eagerly, whether or not ffmpeg is even found below, so `maybe_evict`'s
+    // own `fs::read_dir` never has to distinguish "not created yet" from "created and empty". Any
+    // failure here is only ever a permissions problem this same directory would hit again on the
+    // first real request, so it is surfaced then, not by failing the whole server to start.
+    let hls_cache_root = hls::default_cache_root();
+    if let Err(e) = std::fs::create_dir_all(&hls_cache_root) {
+        log(&format!(
+            "warning: could not create HLS cache directory {}: {e}",
+            hls_cache_root.display()
+        ));
+    } else {
+        hls::sweep_stale_at_startup(&hls_cache_root);
+    }
+    let ffmpeg_bin = crate::ffmpegbin::find();
+    if ffmpeg_bin.is_none() {
+        log(&format!("note: {}", crate::ffmpegbin::install_hint()));
+    }
+
     let code = pairing::generate_code(random_u32());
     log(&format!(
         "pairing code: {code}  (valid {} minutes; enter it once in a client, which then stores a \
@@ -285,6 +319,10 @@ pub fn run(
         library_root,
         cert_expires_at: server_cert.expires_at(),
         active_clients: Arc::new(AtomicU32::new(0)),
+        hls_cache_root,
+        hls_locks: Mutex::new(HashMap::new()),
+        active_readers: Mutex::new(HashMap::new()),
+        ffmpeg_bin,
     });
 
     let listener = TcpListener::bind((bind, port))
