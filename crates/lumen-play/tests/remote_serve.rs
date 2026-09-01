@@ -286,6 +286,33 @@ impl Drop for TempDir {
     }
 }
 
+/// Kills the wrapped `lumen serve` child process (and, via `Child::kill`, its own child mpv) on drop
+/// -- including when a panicking assertion unwinds through the scope holding it, which a bare `Child`
+/// never does (`std` never kills a child process just because its handle was dropped). Without this,
+/// a single failed assertion anywhere between spawning the server and this test's own explicit
+/// `kill()`/`wait()` at the end leaks a `lumen serve` process still bound to this test's port --
+/// exactly the kind of leak that turns one flaky assertion into an unrelated "address already in use"
+/// failure in a later run. `Deref`/`DerefMut` to `Child` so every existing call site
+/// (`.stdout.take()`, `.stderr.take()`, `.kill()`, `.wait()`) keeps working unchanged.
+struct KillOnDrop(std::process::Child);
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn mpv_on_path() -> bool {
     std::process::Command::new("mpv")
         .arg("--version")
@@ -337,34 +364,36 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     // suites without fighting anyone else for a fixed port number.
     let port = 17000 + (std::process::id() % 4000) as u16;
     let bin = env!("CARGO_BIN_EXE_lumen");
-    let mut server = std::process::Command::new(bin)
-        .args([
-            "serve",
-            dir.0.to_str().unwrap(),
-            "--port",
-            &port.to_string(),
-            "--bind",
-            "127.0.0.1",
-            "--",
-            "--vo=null", // No display in CI or this container; audio/video pipeline still runs.
-            "--ao=null", // No audio device either, for the same reason.
-            // `spawn_idle_mpv` hardcodes `--force-window=yes` so a real desktop `lumen serve` shows a
-            // window the moment it starts, before any file is loaded. `--vo=null` alone does not
-            // cancel that: mpv still tries to create the window, and on a Windows CI runner (which has
-            // no interactive window station — it runs as a service session) that creation call can
-            // block indefinitely, well before mpv ever reaches its IPC command loop. That is why every
-            // property/command sent over the pipe just sat there un-drained: mpv was never getting far
-            // enough into startup to read it, not any bug in the client-side IPC or driver code. Extra
-            // args come last and win (see `spawn_idle_mpv`'s doc comment), so this cancels it.
-            "--force-window=no",
-        ])
-        .env("XDG_CONFIG_HOME", &config_dir)
-        .env("APPDATA", &config_dir)
-        .env("HOME", &config_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("lumen must be runnable");
+    let mut server = KillOnDrop(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                dir.0.to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--",
+                "--vo=null", // No display in CI or this container; audio/video pipeline still runs.
+                "--ao=null", // No audio device either, for the same reason.
+                // `spawn_idle_mpv` hardcodes `--force-window=yes` so a real desktop `lumen serve` shows a
+                // window the moment it starts, before any file is loaded. `--vo=null` alone does not
+                // cancel that: mpv still tries to create the window, and on a Windows CI runner (which has
+                // no interactive window station — it runs as a service session) that creation call can
+                // block indefinitely, well before mpv ever reaches its IPC command loop. That is why every
+                // property/command sent over the pipe just sat there un-drained: mpv was never getting far
+                // enough into startup to read it, not any bug in the client-side IPC or driver code. Extra
+                // args come last and win (see `spawn_idle_mpv`'s doc comment), so this cancels it.
+                "--force-window=no",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("APPDATA", &config_dir)
+            .env("HOME", &config_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("lumen must be runnable"),
+    );
 
     // mpv's own errors -- an unopenable file, a missing decoder, a rejected IPC command -- land on
     // the server's stderr and were previously discarded outright, so a failure here had no more to
@@ -616,6 +645,9 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     assert!(page.contains("requestSession"), "the page must actually request an XR session");
     assert!(page.contains("/stream/"), "the page must build a /stream/ URL, not invent a new one");
 
+    // Kept explicit even though `KillOnDrop` will do this again on scope exit regardless -- a
+    // double kill()/wait() is harmless (both discard their `Result`), and an explicit stop here
+    // reaps the process the moment the test's real work is done rather than waiting for drop order.
     let _ = server.kill();
     let _ = server.wait();
 }
@@ -784,27 +816,29 @@ fn hls_playlist_and_segments_are_generated_lazily_cached_and_authenticated() {
     // can run concurrently in the same `cargo test` process without contending for a listener.
     let port = 21000 + (std::process::id() % 4000) as u16;
     let bin = env!("CARGO_BIN_EXE_lumen");
-    let mut server = std::process::Command::new(bin)
-        .args([
-            "serve",
-            dir.0.to_str().unwrap(),
-            "--port",
-            &port.to_string(),
-            "--bind",
-            "127.0.0.1",
-            "--",
-            "--vo=null",
-            "--ao=null",
-            "--force-window=no",
-        ])
-        .env("XDG_CONFIG_HOME", &config_dir)
-        .env("APPDATA", &config_dir)
-        .env("HOME", &config_dir)
-        .env("LUMEN_FFMPEG", &fake_ffmpeg)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("lumen must be runnable");
+    let mut server = KillOnDrop(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                dir.0.to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--",
+                "--vo=null",
+                "--ao=null",
+                "--force-window=no",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("APPDATA", &config_dir)
+            .env("HOME", &config_dir)
+            .env("LUMEN_FFMPEG", &fake_ffmpeg)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("lumen must be runnable"),
+    );
 
     if let Some(stderr) = server.stderr.take() {
         std::thread::spawn(move || {
@@ -1021,6 +1055,8 @@ fn hls_playlist_and_segments_are_generated_lazily_cached_and_authenticated() {
         "a changed mtime must trigger a fresh generation under its new cache key"
     );
 
+    // Kept explicit even though `KillOnDrop` will do this again on scope exit regardless -- see the
+    // matching comment at the end of the other integration test in this file.
     let _ = server.kill();
     let _ = server.wait();
 }

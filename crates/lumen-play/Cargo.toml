@@ -38,6 +38,15 @@ time = { version = "0.3", default-features = false }
 # is already in the dependency graph via `rustls`/`getrandom`, so this adds no new transitive crate.
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 
+[dev-dependencies]
+# Backdating a file's or directory's own mtime in `hls.rs`'s eviction/sweep tests. `std::fs::File`
+# opened read-only (or, for a directory, opened without `FILE_FLAG_BACKUP_SEMANTICS` at all) cannot
+# have its own timestamps written on Windows -- `File::set_modified` needs `FILE_WRITE_ATTRIBUTES`
+# access a plain `File::open` never requests, and `File::open` on a directory fails outright on
+# Windows without that same flag. `filetime` is the standard, minimal answer to exactly this (used by
+# cargo itself for reproducible-timestamp tests); test-only, so it never reaches the shipped binary.
+filetime = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 # `ipc.rs`'s Windows named-pipe transport: two `File`s duplicated from one `CreateFileW` handle (via
 # `try_clone`) deadlocked the moment a real command was sent, because Windows serializes synchronous

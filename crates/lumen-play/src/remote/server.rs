@@ -202,7 +202,13 @@ struct ServerContext {
     hls_cache_root: PathBuf,
     /// Per-cache-key generation locks, so concurrent requests for the same source coalesce onto one
     /// `ffmpeg` run rather than racing to build it twice. Created lazily, one entry per key ever
-    /// requested this session — see `hls::ensure_ready`.
+    /// requested this session — see `hls::ensure_ready`. Entries are never removed: a `lumen serve`
+    /// session left running for weeks accumulates one small `Arc<Mutex<()>>` per distinct
+    /// `(path, size, mtime)` key ever requested. Accepted rather than closed with an
+    /// evict-on-last-reference scheme — a personal library's realistic key churn (bounded by how often
+    /// files actually get replaced) keeps this in the tens-of-KB range even over a very long session,
+    /// and the alternative is real added complexity in the same double-checked-locking path
+    /// `ensure_ready` already has to get exactly right.
     hls_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// How many responses are currently streaming out of each cache key's directory — consulted by
     /// `hls::maybe_evict` so opportunistic cache eviction never removes a directory mid-read. See

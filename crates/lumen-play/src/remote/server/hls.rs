@@ -145,6 +145,17 @@ pub(super) fn handle(tls: &mut TlsStream, method: &str, rest: &str, ctx: &Server
     let key = cache_key(&real_source, meta.len(), mtime);
     let cache_dir = ctx.hls_cache_root.join(&key);
 
+    // Registered before anything below assumes `cache_dir` will keep existing -- not after. `handle`
+    // used to confirm the directory was ready (via `ensure_ready` or a bare `is_dir` check) and only
+    // register as a reader afterward, leaving a real window between "confirmed present" and "counted
+    // as being read" during which a concurrent `maybe_evict` sweep -- triggered by any other, unrelated
+    // request building a different key -- could delete this exact directory out from under an
+    // already-validated request, turning it into a spurious 404. `maybe_evict`'s own `has_readers`
+    // guard only protects a key once it has an entry in `ctx.active_readers`, so registering first is
+    // what actually closes the gap; a reader recorded for a key with no directory yet (the common,
+    // first-generation case) costs nothing; `maybe_evict` simply has nothing to find for it.
+    let _guard = ReaderGuard::new(&ctx.active_readers, &key);
+
     match artifact {
         Artifact::Playlist => {
             if let Err(e) = ensure_ready(ctx, &real_source, &key, &cache_dir) {
@@ -165,7 +176,6 @@ pub(super) fn handle(tls: &mut TlsStream, method: &str, rest: &str, ctx: &Server
     }
 
     touch_last_used(&cache_dir);
-    let _guard = ReaderGuard::new(&ctx.active_readers, &key);
     let content_type = match artifact {
         Artifact::Playlist => "application/vnd.apple.mpegurl",
         Artifact::Init | Artifact::Segment => "video/mp4",
@@ -196,6 +206,11 @@ enum HlsGenError {
     PlaylistMissing,
     NoSegmentsProduced,
     TimedOut,
+    /// The helper thread that runs `execute()` ended without ever sending a result -- almost
+    /// certainly a panic inside `execute()` itself -- distinct from [`Self::TimedOut`] so a worker
+    /// that dies in milliseconds is never reported to a client or a log line as having "timed out
+    /// after 30 minutes".
+    WorkerLost,
     VerifyMismatch(&'static str),
     Io(std::io::Error),
 }
@@ -223,6 +238,12 @@ fn write_gen_error(tls: &mut TlsStream, err: &HlsGenError) {
             500,
             format!("timed out after {HLS_GENERATION_TIMEOUT:?} waiting for ffmpeg"),
             "timed out waiting for ffmpeg",
+        ),
+        HlsGenError::WorkerLost => (
+            500,
+            "the generation thread ended unexpectedly before reporting a result (likely a panic)"
+                .into(),
+            "segmenting failed unexpectedly",
         ),
         HlsGenError::VerifyMismatch(why) => (
             500,
@@ -295,10 +316,27 @@ fn ensure_ready(
         // out from under a possibly-still-writing process; it is a named, accepted leak for this rare
         // pathological case, bounded by the mid-session `.building-*` grace-period sweep and the
         // unconditional startup sweep on the next restart.
-        Err(_) => return Err(HlsGenError::TimedOut),
+        Err(mpsc::RecvTimeoutError::Timeout) => return Err(HlsGenError::TimedOut),
+        // Distinct from a genuine timeout, and handled differently: the `Sender` was dropped without
+        // ever sending, which only happens if the helper thread ended -- almost certainly panicked --
+        // inside `execute()` itself. Unlike the timeout case, the thread is confirmed dead here, so
+        // nothing can still be writing into `tmp_dir`; cleaning it up immediately (rather than
+        // reporting a false "timed out after 30 minutes" that in reality took milliseconds, and
+        // leaving the directory for the hour-long grace-period sweep) is both honest and safe.
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Err(HlsGenError::WorkerLost);
+        }
     };
 
-    rebuild_playlist(&tmp_dir, &outcome)?;
+    if let Err(e) = rebuild_playlist(&tmp_dir, &outcome) {
+        // `rebuild_playlist` already cleans up `tmp_dir` on every verification-failure path of its
+        // own (a `VerifyMismatch`); this covers the one path it does not own -- an `Io` error from
+        // `fs::read_to_string`/`fs::metadata` before its own cleanup runs -- so no error out of this
+        // function ever leaves a `.building-*` directory that isn't already handled by a sweep.
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
 
     match fs::rename(&tmp_dir, cache_dir) {
         Ok(()) => {
@@ -312,7 +350,14 @@ fn ensure_ready(
             let _ = fs::remove_dir_all(&tmp_dir);
             Ok(())
         }
-        Err(e) => Err(HlsGenError::Io(e)),
+        // A genuine rename failure (e.g. a permission change on `hls_cache_root` mid-flight) after
+        // `rebuild_playlist` has already fully verified real, complete output sitting in `tmp_dir` --
+        // unlike the timeout case, nothing is still writing into it, so it is cleaned up here rather
+        // than left for the grace-period sweep.
+        Err(e) => {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            Err(HlsGenError::Io(e))
+        }
     }
 }
 
@@ -361,7 +406,14 @@ fn rebuild_playlist(tmp_dir: &Path, outcome: &HlsExecOutcome) -> Result<(), HlsG
 
     let playlist =
         MediaPlaylist { segments, init: Some(InitSegment { uri: "init.mp4".to_string() }) };
-    fs::write(tmp_dir.join("playlist.m3u8"), playlist.to_m3u8()).map_err(HlsGenError::Io)?;
+    if let Err(e) = fs::write(tmp_dir.join("playlist.m3u8"), playlist.to_m3u8()) {
+        // Every verification-failure branch above already cleans up `tmp_dir` before returning; this
+        // one -- a real I/O failure on the final rewrite, most plausibly the disk filling up right
+        // after an entire media file's worth of segments were just copied into `tmp_dir` -- must too,
+        // or a multi-GB directory sits there uncleaned until the hour-long grace-period sweep.
+        let _ = fs::remove_dir_all(tmp_dir);
+        return Err(HlsGenError::Io(e));
+    }
     Ok(())
 }
 
@@ -625,9 +677,16 @@ mod tests {
         fs::write(old_dir.join("data.bin"), vec![0u8; 1024]).unwrap();
         touch_last_used(&old_dir);
         // Backdate .last_used well past HLS_CACHE_MAX_AGE so the age-cap branch alone would remove it.
+        // `filetime`, not `std::fs::File::open(..).set_modified(..)`: a plain read-only `File::open`
+        // has no `FILE_WRITE_ATTRIBUTES` access on Windows, so `set_modified` there fails with
+        // "Access is denied" even on an ordinary file -- `filetime` requests the narrower access this
+        // actually needs, cross-platform.
         let ancient = SystemTime::now() - HLS_CACHE_MAX_AGE - Duration::from_secs(3600);
-        let file = std::fs::File::open(old_dir.join(".last_used")).unwrap();
-        file.set_modified(ancient).unwrap();
+        filetime::set_file_mtime(
+            old_dir.join(".last_used"),
+            filetime::FileTime::from_system_time(ancient),
+        )
+        .unwrap();
 
         let ctx_active_readers: Mutex<HashMap<String, u32>> =
             Mutex::new(HashMap::from([(old_key.clone(), 1)]));
@@ -667,8 +726,11 @@ mod tests {
         let stale = dir.join(".building-stale-1");
         fs::create_dir_all(&stale).unwrap();
         let old = SystemTime::now() - HLS_BUILDING_GRACE - Duration::from_secs(60);
-        let stale_file = std::fs::File::open(&stale).unwrap();
-        stale_file.set_modified(old).unwrap();
+        // `filetime`, not `std::fs::File::open(&stale).set_modified(..)`: opening a *directory* as a
+        // plain `std::fs::File` fails outright on Windows without `FILE_FLAG_BACKUP_SEMANTICS`, which
+        // `File::open` never sets -- `filetime::set_file_mtime` handles a directory correctly on every
+        // platform this workspace targets.
+        filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(old)).unwrap();
         let complete = dir.join("somekeyhash");
         fs::create_dir_all(&complete).unwrap();
 
