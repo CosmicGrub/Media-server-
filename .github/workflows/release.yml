@@ -394,19 +394,29 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Publishes wherever the build job's four artifacts are, as one link that always points at the
-  # newest build — the same pattern `android.yml` already uses (`android-latest`) for the phone
-  # side. `needs: build` on a matrix job only succeeds once every leg does, so a rolling release
-  # never gets updated with one platform silently missing because its own build broke.
+  # Publishes wherever the build job's four artifacts are. Two distinct outcomes share this one job
+  # because they share everything else (the same artifacts, the same asset-presence check, the same
+  # "both platforms or none" guarantee) and diverging them into two near-identical jobs would be the
+  # kind of duplication that drifts the moment one copy gets a fix the other doesn't:
+  #   - A branch push updates the rolling `desktop-latest` release in place — one link that always
+  #     points at the newest build, the same pattern `android.yml` already uses (`android-latest`)
+  #     for the phone side.
+  #   - A `v*` tag push instead publishes a new, permanent, numbered release at that tag -- created
+  #     once and never moved or overwritten again, because the whole point of a version tag is that
+  #     it means the same thing every time someone downloads it.
+  # `needs: build` on a matrix job only succeeds once every leg does, so neither path ever publishes
+  # with one platform silently missing because its own build broke.
   #
-  # Gated to this branch specifically, not also main or the shared development branch: this file's
-  # own Windows-specific verification steps above (the CRT-static check, the codec-coverage check)
-  # do not exist on those branches yet, and publishing from a branch that cannot itself produce what
-  # the release notes claim would be worse than not publishing at all.
+  # Gated to this branch (for the rolling release) or a version tag (for a pinned one), not also main
+  # or the shared development branch: this file's own Windows-specific verification steps above (the
+  # CRT-static check, the codec-coverage check) do not exist on those branches yet, and publishing
+  # from a branch that cannot itself produce what the release notes claim would be worse than not
+  # publishing at all. A `v*` tag is exempt from that reasoning -- it is only ever cut from a commit
+  # that already passed those checks as a branch push first.
   publish:
-    name: publish to desktop-latest
+    name: publish release
     needs: build
-    if: github.ref == 'refs/heads/device/windows-pc'
+    if: github.ref == 'refs/heads/device/windows-pc' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     permissions:
       contents: write
@@ -422,7 +432,7 @@ jobs:
         with:
           path: artifacts
 
-      - name: Publish or update the rolling release
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -437,25 +447,57 @@ jobs:
           done
           ls -lh "${ASSETS[@]}"
 
-          # Drop anything already attached to the release that this run did not just build. Without
-          # this, an asset from a platform later removed from the matrix (macOS, here, on 2026-08-31)
-          # sits on the "latest" release forever: `--clobber` below only ever overwrites or adds, never
-          # removes, so `desktop-latest` would keep offering a macOS bundle years after the workflow
-          # stopped building one -- silently wrong in exactly the way a rolling release is supposed to
-          # never be. `gh release view --json` and `gh release delete-asset` no-op cleanly when the
-          # release doesn't exist yet or carries no extra assets.
-          if gh release view desktop-latest >/dev/null 2>&1; then
-            while IFS= read -r stale; do
-              [ -z "$stale" ] && continue
-              echo "removing stale asset from a previous platform matrix: $stale"
-              gh release delete-asset desktop-latest "$stale" --yes
-            done < <(
-              gh release view desktop-latest --json assets --jq '.assets[].name' \
-                | grep -vxF -f <(printf '%s\n' "${ASSETS[@]}")
-            )
-          fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # A pinned, numbered release -- published once, at the version the tag itself already
+            # names, and never touched again. No stale-asset sweep and no `--clobber` here: those
+            # exist for the rolling release below, which is expected to change under the same name
+            # release after release; a version tag republishing its own assets out from under
+            # someone who already downloaded it is the failure this guards against, not a feature.
+            TAG="${GITHUB_REF_NAME}"
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "release $TAG already exists -- refusing to overwrite a pinned version's assets" >&2
+              exit 1
+            fi
 
-          NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
+            NOTES="Lumen Desktop ${TAG}, built from \`${SHORT}\`.
+
+          Two platform bundles from the same commit: Windows and Linux — both self-contained,
+          nothing to install. \`lumen.exe\`'s C runtime is statically linked (no Visual C++
+          Redistributable needed); every platform's mpv ships beside its \`lumen\`, full codec set
+          included (TrueHD and DTS-HD MA covered). On Linux that means the codec/format/subtitle
+          layer is vendored while GL/Vulkan, the display server, the audio server and the security
+          stack still come from this machine, the same as any other app — see each bundle's
+          \`START-HERE.txt\`. All of it checked on this exact build by actually decoding a file, not
+          assumed to still hold from an earlier release."
+
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Lumen Desktop ${TAG}" \
+              --notes "$NOTES"
+            gh release upload "$TAG" "${ASSETS[@]}"
+            echo "### Desktop release ${TAG} published" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}>" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Drop anything already attached to the release that this run did not just build. Without
+            # this, an asset from a platform later removed from the matrix (macOS, here, on
+            # 2026-08-31) sits on the "latest" release forever: `--clobber` below only ever overwrites
+            # or adds, never removes, so `desktop-latest` would keep offering a macOS bundle years
+            # after the workflow stopped building one -- silently wrong in exactly the way a rolling
+            # release is supposed to never be. `gh release view --json` and `gh release delete-asset`
+            # no-op cleanly when the release doesn't exist yet or carries no extra assets.
+            if gh release view desktop-latest >/dev/null 2>&1; then
+              while IFS= read -r stale; do
+                [ -z "$stale" ] && continue
+                echo "removing stale asset from a previous platform matrix: $stale"
+                gh release delete-asset desktop-latest "$stale" --yes
+              done < <(
+                gh release view desktop-latest --json assets --jq '.assets[].name' \
+                  | grep -vxF -f <(printf '%s\n' "${ASSETS[@]}")
+              )
+            fi
+
+            NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
 
           Two platform bundles from the same commit: Windows and Linux — both self-contained,
           nothing to install. \`lumen.exe\`'s C runtime is statically linked (no Visual C++
@@ -468,28 +510,26 @@ jobs:
 
           This is a development build, not a versioned release."
 
-          if gh release view desktop-latest >/dev/null 2>&1; then
-            # `gh release edit --target` cannot move the tag of a published release — the API ignores
-            # target_commitish once a release is out of draft — so the tag is moved directly. Without
-            # this the release would keep pointing at whichever commit first created it while serving
-            # assets from a much later one.
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/desktop-latest" \
-              -f sha="$GITHUB_SHA" -F force=true > /dev/null
-            gh release edit desktop-latest \
-              --title "Lumen Desktop — build ${SHORT}" --notes "$NOTES" --prerelease
-          else
-            gh release create desktop-latest \
-              --target "$GITHUB_SHA" \
-              --title "Lumen Desktop — build ${SHORT}" \
-              --notes "$NOTES" \
-              --prerelease
+            if gh release view desktop-latest >/dev/null 2>&1; then
+              # `gh release edit --target` cannot move the tag of a published release — the API
+              # ignores target_commitish once a release is out of draft — so the tag is moved
+              # directly. Without this the release would keep pointing at whichever commit first
+              # created it while serving assets from a much later one.
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/desktop-latest" \
+                -f sha="$GITHUB_SHA" -F force=true > /dev/null
+              gh release edit desktop-latest \
+                --title "Lumen Desktop — build ${SHORT}" --notes "$NOTES" --prerelease
+            else
+              gh release create desktop-latest \
+                --target "$GITHUB_SHA" \
+                --title "Lumen Desktop — build ${SHORT}" \
+                --notes "$NOTES" \
+                --prerelease
+            fi
+            # `--clobber` rather than deleting the release: deleting it would break every link already
+            # shared, which is the one thing a rolling "latest" URL exists to avoid.
+            gh release upload desktop-latest "${ASSETS[@]}" --clobber
+            echo "### Desktop builds published" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/desktop-latest>" >> "$GITHUB_STEP_SUMMARY"
           fi
-          # `--clobber` rather than deleting the release: deleting it would break every link already
-          # shared, which is the one thing a rolling "latest" URL exists to avoid.
-          gh release upload desktop-latest "${ASSETS[@]}" --clobber
-
-      - name: Say where it landed
-        run: |
-          echo "### Desktop builds published" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/desktop-latest>" >> "$GITHUB_STEP_SUMMARY"
