@@ -69,6 +69,20 @@ const STATE_POLL_PROPERTY_TIMEOUT: Duration = Duration::from_millis(500);
 /// it takes to glance back at the screen, not something that reads as "did it even notice."
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(1500);
 
+/// How long the watcher discards *every* event, of any kind, right after a rescan it just ran —
+/// filtering `EventKind::Access` alone (see `spawn_library_watcher`'s own comment) closes the
+/// self-triggering loop confirmed live on Linux's inotify backend, but real Windows CI caught the same
+/// class of bug surviving that filter: `ReadDirectoryChangesW` reports `rescan_library`'s own read of
+/// the library it just walked as a *different* event shape than inotify's `IN_OPEN`/`IN_CLOSE` did,
+/// one this filter did not anticipate and a second platform-specific kind-by-kind allowlist would be
+/// fragile to keep chasing. Discarding unconditionally for a bounded window after every rescan closes
+/// the whole class at once, regardless of which kind a given platform's backend happens to use for a
+/// rescan's own footprint. This does not lose a real external change permanently: one landing inside
+/// this window is simply picked up by whatever the *next* trigger's full re-walk finds, whenever that
+/// next trigger fires — the same "soft, eventually-consistent, manual `rescan` is the fallback"
+/// contract this whole feature already has, not a hard real-time guarantee.
+const POST_RESCAN_QUIET_PERIOD: Duration = WATCHER_DEBOUNCE;
+
 type TlsStream = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
 /// A request from a client thread to the mpv driver thread, with its own private reply channel —
@@ -899,6 +913,28 @@ fn spawn_library_watcher(ctx: Arc<ServerContext>, log: Arc<dyn Fn(&str) + Send +
                 "library watcher: filesystem change detected -> rescanned, {file_count} playable \
                  files, library_version now {library_version}"
             ));
+
+            // Unconditionally discard every event for `POST_RESCAN_QUIET_PERIOD` before going back to
+            // waiting for the next real change — see that constant's own doc for why this exists on
+            // top of the `is_access()` filter above, confirmed necessary by a real Windows CI failure.
+            let quiet_until = std::time::Instant::now() + POST_RESCAN_QUIET_PERIOD;
+            loop {
+                let remaining = quiet_until.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(_) => {} // Any event, any kind, any platform -- discarded without comment.
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        log(
+                            "library watcher: event channel closed; automatic rescans are disabled \
+                             for the rest of this session",
+                        );
+                        return;
+                    }
+                }
+            }
         }
     });
 }
