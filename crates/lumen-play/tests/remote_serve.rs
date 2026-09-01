@@ -951,24 +951,42 @@ fn wait_for_library_version_change(
     None
 }
 
-/// Every distinct `library_version` a `state` push carries over `window`, in the order first seen --
-/// used to tell "a burst of filesystem events was coalesced into exactly one rescan" (one entry) apart
-/// from "several rescans raced each other" (more than one). Consecutive-value dedup is enough because
-/// `library_version` only ever increases -- see `rescan_library`'s own `fetch_add`.
-fn distinct_library_versions_over(tls: &mut ClientTls, window: Duration) -> Vec<u64> {
+/// Every `library_version` a `state` push carries over `window` that is strictly greater than
+/// `baseline` (the value the caller has already confirmed is current), in increasing order -- used to
+/// tell "a burst of filesystem events was coalesced into exactly one rescan" (nothing beyond baseline)
+/// apart from "another rescan happened on its own" (a real value above it).
+///
+/// Compared against `baseline`, not just deduped against whatever this call happens to see first:
+/// `SharedState::publish` republishes a `state` line whenever *any* `PlaybackState` field changes, not
+/// only `library_version` -- `now_playing` toggling (a real, if brief, quirk this suite has already
+/// observed from mpv's own idle-state reporting on Windows CI) can resend the *same*, already-current
+/// `library_version` on a connection that has not seen a real rescan at all. Deduping only against the
+/// previous value seen *within this one call* (as an earlier version of this helper did) misreads that
+/// redundant, unchanged resend as a fresh transition the moment it is first observed here, even though
+/// it carries no new information the caller doesn't already have. A value that isn't actually higher
+/// than what's already confirmed can never indicate a genuine additional rescan -- `library_version`
+/// only ever increases via `rescan_library`'s own `fetch_add` -- so it is real signal to filter out,
+/// not something a correctness check should trip on.
+fn distinct_library_versions_over(
+    tls: &mut ClientTls,
+    baseline: u64,
+    window: Duration,
+) -> Vec<u64> {
     let deadline = std::time::Instant::now() + window;
-    let mut seen: Vec<u64> = Vec::new();
+    let mut max_seen = baseline;
+    let mut beyond_baseline: Vec<u64> = Vec::new();
     while std::time::Instant::now() < deadline {
         let Some(msg) = try_read_message(tls) else { continue };
         if msg.ty().as_deref() == Some("state") {
             if let Some(v) = num_in(&msg.0, "library_version").map(|n| n as u64) {
-                if seen.last() != Some(&v) {
-                    seen.push(v);
+                if v > max_seen {
+                    beyond_baseline.push(v);
+                    max_seen = v;
                 }
             }
         }
     }
-    seen
+    beyond_baseline
 }
 
 /// Sends a `library` request and returns the raw reply line -- needed where a test wants to see
@@ -1046,8 +1064,11 @@ fn an_unprompted_filesystem_change_triggers_an_automatic_rescan() {
 
     // No self-triggered loop: a rescan itself writes nothing into the watched directory (it only
     // replaces an in-memory `Scan` and bumps an `AtomicU64`), so once the change above has settled,
-    // the version must sit still rather than keep climbing on its own.
-    let after_settling = distinct_library_versions_over(&mut tls, Duration::from_secs(5));
+    // the version must not rise any further -- `bumped.unwrap()` (1) is the baseline, not empty: a
+    // redundant `state` push repeating that same confirmed value (see `distinct_library_versions_over`'s
+    // own doc) is not itself a failure.
+    let after_settling =
+        distinct_library_versions_over(&mut tls, bumped.unwrap(), Duration::from_secs(5));
     assert!(
         after_settling.is_empty(),
         "library_version must not keep climbing once nothing further has changed on disk: saw {after_settling:?}"
@@ -1105,8 +1126,10 @@ fn a_burst_of_new_files_is_coalesced_into_one_automatic_rescan() {
     }
 
     // The real proof the debounce coalesced the burst rather than merely happening to settle on the
-    // same value: no *other* version was ever observed in between -- not 2, not 3, not one per file.
-    let after_settling = distinct_library_versions_over(&mut tls, Duration::from_secs(5));
+    // same value: no version *beyond* the one confirmed above was ever observed -- not 2, not 3, not
+    // one per file.
+    let after_settling =
+        distinct_library_versions_over(&mut tls, bumped.unwrap(), Duration::from_secs(5));
     assert!(
         after_settling.is_empty(),
         "a coalesced burst must produce exactly one version transition, with nothing further \
