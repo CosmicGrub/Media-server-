@@ -11,17 +11,25 @@
 //! its own port, in plain HTTP, and is never started unless `--dlna` is passed -- an operator who
 //! never asks for it gets exactly the security posture they already had.
 //!
-//! **Stage 1, honestly scoped.** Every playable file in the current scan is listed as a single flat
-//! set of children under the root container ("0") -- no folder hierarchy yet, which
-//! `lumen_discovery::content_directory`'s own module doc already flagged as the next real limitation
-//! once this ships. Object IDs are the file's index into the current [`Scan`], stable only for the
-//! lifetime of one `lumen serve` process (the same "one snapshot taken at startup, never refreshed"
-//! limitation `docs/15` Engine A already documents for the paired control channel's own library
-//! listing -- this shares that gap rather than inventing a second one).
+//! **Stage 2: a real folder hierarchy.** Every playable file is listed under the directory it actually
+//! lives in on disk, not flattened into one giant list under the root container. A [`LibraryTree`],
+//! built once at startup from the same [`Scan`] and the library root, walks/creates a container node
+//! for every ancestor directory a playable file is actually found under -- an empty directory never
+//! gets a node, matching `Scan::playable`'s own "only report what's actually playable" posture, not a
+//! second filter bolted on afterward.
+//!
+//! Object IDs are `"0"` for the UPnP-mandated root, `"d<n>"` for a directory, and `"f<n>"` for a file
+//! (`<n>` is that file's index into `Scan::playable()`'s own enumeration) -- three disjoint prefixes,
+//! so no two distinct objects can ever share an id (see [`LibraryTree`]'s own doc for the bare-integer
+//! collision this replaced). IDs are stable only for the lifetime of one `lumen serve` process (the
+//! same "one snapshot taken at startup, never refreshed" limitation `docs/15` Engine A already
+//! documents for the paired control channel's own library listing -- this shares that gap rather than
+//! inventing a second one).
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -82,10 +90,20 @@ pub fn run(
     friendly_name: String,
     log: impl Fn(&str) + Send + Sync + 'static,
 ) -> Result<(), String> {
+    // Canonicalized so every playable file's own path (built by `scan` walking from exactly this root)
+    // and this root agree byte-for-byte when `LibraryTree::build` computes each file's directory
+    // ancestry below -- a mismatch here (a relative root, a trailing separator, a symlink) would mean
+    // `strip_prefix` fails and every file falls back to attaching straight to the root, silently
+    // flattening the very hierarchy this stage exists to build. Falls back to the path as given if
+    // canonicalization itself fails (e.g. the root vanished between `lumen serve`'s own existence
+    // check and here) rather than refusing to serve at all.
+    let library_root = library_root.canonicalize().unwrap_or(library_root);
+
     let scan = crate::scan::scan(
         std::slice::from_ref(&library_root),
         &crate::scan::ScanOptions::default(),
     );
+    let tree = LibraryTree::build(&scan, &library_root);
     let library = Arc::new(Mutex::new(scan));
 
     let advertise_host = if bind == "0.0.0.0" {
@@ -144,7 +162,7 @@ pub fn run(
         .map_err(|e| format!("cannot listen on {bind}:{port} for DLNA: {e}"))?;
     log(&format!("DLNA: advertising \"{friendly_name}\" at {base_url}/dlna/desc.xml"));
 
-    let ctx = Arc::new(DlnaContext { library, library_root, base_url, friendly_name, uuid });
+    let ctx = Arc::new(DlnaContext { library, tree, base_url, friendly_name, uuid });
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else { continue };
         let ctx = Arc::clone(&ctx);
@@ -155,17 +173,144 @@ pub fn run(
 
 struct DlnaContext {
     library: Arc<Mutex<Scan>>,
-    /// Not read yet -- reserved for the folder-hierarchy `Browse` support this module's own doc
-    /// comment already flags as Stage 1's next limitation, where child containers will need to be
-    /// resolved back to real subdirectories under this root. Kept on the context now rather than
-    /// added as a second breaking-change parameter later.
-    #[allow(dead_code)]
-    library_root: PathBuf,
+    /// The library's real folder hierarchy -- built once in [`run`] from the same startup `Scan` as
+    /// `library` above. Never mutated after construction, sharing the "one snapshot taken at startup,
+    /// never refreshed" limitation `library` itself already carries, so a `Mutex` here would only add
+    /// contention this design has no use for.
+    tree: LibraryTree,
     base_url: String,
     friendly_name: String,
     /// Generated once in [`run`] and carried here so every `desc.xml` response agrees with the UUID
     /// already baked into the SSDP announcements and the response's own LOCATION URL.
     uuid: String,
+}
+
+/// One directory in the served library's own folder hierarchy -- a DLNA `StorageFolder` container.
+///
+/// `LibraryTree::dirs[0]` is always the root, with the UPnP-mandated fixed id `"0"`; every other
+/// node's id is `"d<n>"`, where `<n>` is an incrementing counter assigned in creation order by
+/// [`LibraryTree::build`].
+#[derive(Debug)]
+struct DirNode {
+    id: String,
+    parent_id: String,
+    /// The directory's own basename. Empty for the root -- unused, since `BrowseMetadata("0")`
+    /// already hardcodes the root's title as `"lumen"` in `handle_content_directory_control`.
+    name: String,
+    /// Indices into the owning [`LibraryTree`]'s own `dirs`.
+    child_dirs: Vec<usize>,
+    /// Indices into `scan.playable()`'s own enumeration -- the same ordering
+    /// `handle_content_directory_control` already built its (Stage 1, flat) file list from, so a
+    /// file's object id keeps meaning what it already meant.
+    child_files: Vec<usize>,
+}
+
+/// The served library's real folder hierarchy, built once at startup (see [`run`]) from the same
+/// [`Scan`] and library root every playable file was found under.
+///
+/// **Why this exists, not just a flat list**: a smart TV's Browse UI should show `Movies`, a show's
+/// own folder, `Season 01`, and so on -- not one giant flat list of every file in the collection.
+/// Building this once, rather than walking the filesystem again per request, matches this module's
+/// existing "one snapshot at startup" posture for the library itself.
+///
+/// **Fixes a real, latent id-collision bug along the way.** Stage 1 gave playable files bare-integer
+/// object ids ("0", "1", ...) -- the same string space the root container's own fixed id ("0") lives
+/// in. A client asking `Browse("0", BrowseMetadata)` to inspect "the object with id 0" could never
+/// actually reach file index 0's metadata; the root-vs-file check in
+/// `handle_content_directory_control` ran first and always won, no matter what the client actually
+/// meant. Every directory now gets a `"d<n>"` id and every file an `"f<n>"` id -- three disjoint
+/// prefixes (`"0"`, `"d..."`, `"f..."`), so no two distinct objects can ever share a string again.
+#[derive(Debug)]
+struct LibraryTree {
+    dirs: Vec<DirNode>,
+    /// `DirNode::id` -> index into `dirs`, for every node including the root -- `O(1)` id lookups for
+    /// both `Browse` flags, instead of a linear scan per request.
+    by_id: HashMap<String, usize>,
+    /// The parent directory's own id, for each playable file -- indexed exactly the way
+    /// `scan.playable()`'s own enumeration (and therefore each file's own `"f<n>"` id) already is.
+    /// Looked up only by a `Browse(Metadata)` naming a bare file id directly; every `DirectChildren`
+    /// listing already has its directory's id in hand from the [`DirNode`] being listed, so it never
+    /// needs this.
+    file_parent: Vec<String>,
+}
+
+impl LibraryTree {
+    /// Build the hierarchy. A directory node is created only while walking an actual playable file's
+    /// own ancestor chain, memoized by that directory's path relative to `library_root` so the same
+    /// real directory -- reached as an ancestor of two different playable files -- is only ever
+    /// created once. A directory nothing playable lives under (recursively) is therefore never
+    /// visited at all, and so never gets a node -- the "empty directories are never listed" guarantee
+    /// falls straight out of this construction rather than needing a second, separate check.
+    fn build(scan: &Scan, library_root: &Path) -> Self {
+        let mut dirs = vec![DirNode {
+            id: "0".to_string(),
+            parent_id: "-1".to_string(),
+            name: String::new(),
+            child_dirs: Vec::new(),
+            child_files: Vec::new(),
+        }];
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+        by_id.insert("0".to_string(), 0);
+        let mut by_rel_dir: HashMap<PathBuf, usize> = HashMap::new();
+        let mut next_dir_id: usize = 0;
+        let mut file_parent = Vec::new();
+
+        for f in scan.playable() {
+            // The ancestor directory names between `library_root` and this file, outermost first. A
+            // file directly under `library_root` -- or, defensively, one `strip_prefix` cannot relate
+            // to `library_root` at all (should not happen, since `scan` was pointed at exactly this
+            // root, but a fallback beats a panic) -- has none, and attaches straight to the root.
+            let components: Vec<String> = f
+                .path
+                .strip_prefix(library_root)
+                .ok()
+                .and_then(Path::parent)
+                .map(|dir| {
+                    dir.components()
+                        .filter_map(|c| match c {
+                            std::path::Component::Normal(s) => {
+                                Some(s.to_string_lossy().into_owned())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut parent_idx = 0usize;
+            let mut rel = PathBuf::new();
+            for name in &components {
+                rel.push(name);
+                parent_idx = match by_rel_dir.get(&rel) {
+                    Some(&idx) => idx,
+                    None => {
+                        let id = format!("d{next_dir_id}");
+                        next_dir_id += 1;
+                        dirs.push(DirNode {
+                            id: id.clone(),
+                            parent_id: dirs[parent_idx].id.clone(),
+                            name: name.clone(),
+                            child_dirs: Vec::new(),
+                            child_files: Vec::new(),
+                        });
+                        let new_idx = dirs.len() - 1;
+                        dirs[parent_idx].child_dirs.push(new_idx);
+                        by_id.insert(id, new_idx);
+                        by_rel_dir.insert(rel.clone(), new_idx);
+                        new_idx
+                    }
+                };
+            }
+            dirs[parent_idx].child_files.push(file_parent.len());
+            file_parent.push(dirs[parent_idx].id.clone());
+        }
+
+        Self { dirs, by_id, file_parent }
+    }
+
+    fn dir_by_id(&self, id: &str) -> Option<&DirNode> {
+        self.by_id.get(id).map(|&i| &self.dirs[i])
+    }
 }
 
 fn handle_connection(mut tcp: TcpStream, ctx: &DlnaContext) {
@@ -249,36 +394,54 @@ fn handle_content_directory_control(
 
     let scan = ctx.library.lock().unwrap();
     let files: Vec<_> = scan.playable().collect();
+    let tree = &ctx.tree;
 
-    let (objects, total) = match (browse.object_id.as_str(), browse.flag) {
-        ("0", BrowseFlag::DirectChildren) => {
-            let start = browse.starting_index as usize;
-            let count = if browse.requested_count == 0 {
-                files.len()
-            } else {
-                browse.requested_count as usize
+    let (objects, total) = match browse.flag {
+        BrowseFlag::DirectChildren => {
+            let Some(dir) = tree.dir_by_id(&browse.object_id) else {
+                write_soap_fault(tcp, 701, "No such object");
+                return;
             };
-            let objects: Vec<DidlObject> = files
-                .iter()
-                .enumerate()
-                .skip(start)
-                .take(count)
-                .map(|(i, f)| DidlObject {
-                    id: i.to_string(),
-                    parent_id: "0".into(),
+            // Folders first, then files -- a reasonable, common convention; the spec mandates neither
+            // order, so this only needs to be consistent with itself, and it is: it is the only order
+            // this responder ever produces.
+            let mut combined: Vec<DidlObject> =
+                Vec::with_capacity(dir.child_dirs.len() + dir.child_files.len());
+            combined.extend(dir.child_dirs.iter().map(|&idx| {
+                let d = &tree.dirs[idx];
+                DidlObject {
+                    id: d.id.clone(),
+                    parent_id: d.parent_id.clone(),
+                    title: d.name.clone(),
+                    class: ObjectClass::StorageFolder,
+                    resource: None,
+                }
+            }));
+            combined.extend(dir.child_files.iter().filter_map(|&i| {
+                files.get(i).map(|f| DidlObject {
+                    id: format!("f{i}"),
+                    parent_id: dir.id.clone(),
                     title: f.label(),
                     class: object_class_for(f.container),
                     resource: Some(DidlResource {
-                        url: format!("{}/dlna/stream/{i}", ctx.base_url),
+                        url: format!("{}/dlna/stream/f{i}", ctx.base_url),
                         mime_type: content_type_for(f.container, f.extension.as_deref())
                             .to_string(),
                         size_bytes: Some(f.size),
                     }),
                 })
-                .collect();
-            (objects, files.len())
+            }));
+
+            // Pagination is over the COMBINED dirs-then-files sequence, not files alone -- a client
+            // paging through a large folder must see a stable, single sequence, not two independently
+            // restarting ones.
+            let total = combined.len();
+            let start = browse.starting_index as usize;
+            let count =
+                if browse.requested_count == 0 { total } else { browse.requested_count as usize };
+            (combined.into_iter().skip(start).take(count).collect(), total)
         }
-        ("0", BrowseFlag::Metadata) => (
+        BrowseFlag::Metadata if browse.object_id == "0" => (
             vec![DidlObject {
                 id: "0".into(),
                 parent_id: "-1".into(),
@@ -288,30 +451,48 @@ fn handle_content_directory_control(
             }],
             1,
         ),
-        (id, BrowseFlag::Metadata) => match id.parse::<usize>().ok().and_then(|i| files.get(i)) {
-            Some(f) => (
-                vec![DidlObject {
-                    id: id.to_string(),
-                    parent_id: "0".into(),
-                    title: f.label(),
-                    class: object_class_for(f.container),
-                    resource: Some(DidlResource {
-                        url: format!("{}/dlna/stream/{id}", ctx.base_url),
-                        mime_type: content_type_for(f.container, f.extension.as_deref())
-                            .to_string(),
-                        size_bytes: Some(f.size),
-                    }),
-                }],
-                1,
-            ),
-            None => {
+        BrowseFlag::Metadata => {
+            if let Some(d) = tree.dir_by_id(&browse.object_id) {
+                (
+                    vec![DidlObject {
+                        id: d.id.clone(),
+                        parent_id: d.parent_id.clone(),
+                        title: d.name.clone(),
+                        class: ObjectClass::StorageFolder,
+                        resource: None,
+                    }],
+                    1,
+                )
+            } else if let Some(i) =
+                browse.object_id.strip_prefix('f').and_then(|s| s.parse::<usize>().ok())
+            {
+                match (files.get(i), tree.file_parent.get(i)) {
+                    (Some(f), Some(parent_id)) => (
+                        vec![DidlObject {
+                            id: format!("f{i}"),
+                            parent_id: parent_id.clone(),
+                            title: f.label(),
+                            class: object_class_for(f.container),
+                            resource: Some(DidlResource {
+                                url: format!("{}/dlna/stream/f{i}", ctx.base_url),
+                                mime_type: content_type_for(f.container, f.extension.as_deref())
+                                    .to_string(),
+                                size_bytes: Some(f.size),
+                            }),
+                        }],
+                        1,
+                    ),
+                    _ => {
+                        write_soap_fault(tcp, 701, "No such object");
+                        return;
+                    }
+                }
+            } else {
+                // Neither a known directory nor a known file -- an unknown "d<n>"/"f<n>" index, or a
+                // bare-numeric legacy id from Stage 1's now-retired flat scheme.
                 write_soap_fault(tcp, 701, "No such object");
                 return;
             }
-        },
-        _ => {
-            write_soap_fault(tcp, 701, "No such object");
-            return;
         }
     };
 
@@ -341,7 +522,14 @@ fn handle_connection_manager_control(tcp: &mut TcpStream, req: &HttpRequest, _bo
 
 fn serve_stream(tcp: &mut TcpStream, req: &HttpRequest, id: &str, ctx: &DlnaContext) {
     let scan = ctx.library.lock().unwrap();
-    let Some(f) = id.parse::<usize>().ok().and_then(|i| scan.playable().nth(i)) else {
+    // `/dlna/stream/<id>` URLs are built with the same "f<n>" ids `build_didl_lite`-driven items carry
+    // (see `handle_content_directory_control`) -- strip that prefix before the numeric lookup so this
+    // parses exactly the ids this responder itself hands out.
+    let Some(f) = id
+        .strip_prefix('f')
+        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|i| scan.playable().nth(i))
+    else {
         write_error(tcp, 404, "Not Found");
         return;
     };
@@ -610,6 +798,317 @@ fn random_uuid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory that deletes itself. No tempfile crate, and a test that leaks directories into the
+    /// user's tree is its own bug -- matches `scan.rs`'s own private helper of the same shape, which
+    /// this module cannot reuse across a `pub(crate)`-free module boundary.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let anchor = 0u8;
+            let dir = std::env::temp_dir().join(format!(
+                "lumen-dlna-{tag}-{}-{:x}",
+                std::process::id(),
+                std::ptr::from_ref(&anchor) as usize
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn file(&self, rel: &str, bytes: &[u8]) -> PathBuf {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Scans a fresh temp directory built from `files` (relative path, content -- content is
+    /// irrelevant here since these tests are about the hierarchy `LibraryTree::build` derives from
+    /// paths alone, not container sniffing) and builds its `LibraryTree`, mirroring the two-step
+    /// `run` itself performs. The root is canonicalized before either step, matching `run`'s own
+    /// contract that `LibraryTree::build` is only ever handed a canonical root.
+    fn scan_tree(tag: &str, files: &[(&str, &[u8])]) -> (TempDir, PathBuf, Scan, LibraryTree) {
+        let d = TempDir::new(tag);
+        for (rel, bytes) in files {
+            d.file(rel, bytes);
+        }
+        let root = d.0.canonicalize().unwrap();
+        let scan =
+            crate::scan::scan(std::slice::from_ref(&root), &crate::scan::ScanOptions::default());
+        let tree = LibraryTree::build(&scan, &root);
+        (d, root, scan, tree)
+    }
+
+    fn test_context(tree: LibraryTree, scan: Scan) -> DlnaContext {
+        DlnaContext {
+            library: Arc::new(Mutex::new(scan)),
+            tree,
+            base_url: "http://127.0.0.1:7891".to_string(),
+            friendly_name: "test".to_string(),
+            uuid: "00000000-0000-4000-8000-000000000000".to_string(),
+        }
+    }
+
+    /// The inverse of `lumen_discovery::content_directory`'s own (private) `escape_xml` -- duplicated
+    /// here, rather than depending on another crate's internals, purely so these tests can assert
+    /// against readable DIDL-Lite text instead of its doubly-escaped form inside `<Result>`.
+    fn unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    }
+
+    fn browse_soap(object_id: &str, flag: &str, starting_index: u32, count: u32) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+             <s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+             <ObjectID>{object_id}</ObjectID><BrowseFlag>{flag}</BrowseFlag>\
+             <Filter>*</Filter><StartingIndex>{starting_index}</StartingIndex>\
+             <RequestedCount>{count}</RequestedCount><SortCriteria></SortCriteria>\
+             </u:Browse></s:Body></s:Envelope>"
+        )
+    }
+
+    /// Drives `handle_content_directory_control` itself -- the real dispatch code, not a
+    /// reimplementation of its logic -- over a real loopback TCP connection, the same transport a real
+    /// control point's request actually arrives on. The inbound `HttpRequest` is built by hand rather
+    /// than round-tripped through `HttpRequest::parse`, since header parsing already has its own
+    /// dedicated tests elsewhere in this file; what these tests exercise is the Browse dispatch itself.
+    fn browse(
+        ctx: &DlnaContext,
+        object_id: &str,
+        flag: &str,
+        starting_index: u32,
+        count: u32,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).unwrap();
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "soapaction".to_string(),
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"".to_string(),
+        );
+        let req = HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
+        let body = browse_soap(object_id, flag, starting_index, count);
+        handle_content_directory_control(&mut server_stream, &req, body.as_bytes(), ctx);
+        // The response is only complete once the server side has finished writing and this handle is
+        // dropped -- `write_ok`/`write_soap_fault` never call `shutdown` themselves, so the reader
+        // thread's `read_to_end` would otherwise block forever waiting for a EOF nothing produces.
+        drop(server_stream);
+
+        reader.join().unwrap()
+    }
+
+    /// Pulls the DIDL-Lite text back out of a `Browse` response's `<Result>...</Result>`, unescaped so
+    /// assertions can read it directly (`build_browse_response`'s own doc explains why it is escaped
+    /// once more on the way in).
+    fn result_didl(response: &str) -> String {
+        let start = response.find("<Result>").expect("a Browse response must carry <Result>")
+            + "<Result>".len();
+        let end = response.find("</Result>").expect("a Browse response must carry </Result>");
+        unescape(&response[start..end])
+    }
+
+    #[test]
+    fn library_tree_builds_nested_directories_and_never_lists_an_empty_one() {
+        let d = TempDir::new("nested");
+        d.file("Movies/Show/Season 01/S01E01.mkv", b"a");
+        d.file("Movies/Show/Season 01/S01E02.mkv", b"b");
+        d.file("Movies/OtherShow/Season 01/S01E01.mkv", b"c");
+        d.file("Root.mkv", b"d");
+        std::fs::create_dir_all(d.0.join("Movies/Empty")).unwrap();
+
+        let root = d.0.canonicalize().unwrap();
+        let scan =
+            crate::scan::scan(std::slice::from_ref(&root), &crate::scan::ScanOptions::default());
+        let tree = LibraryTree::build(&scan, &root);
+
+        let root_node = tree.dir_by_id("0").unwrap();
+        assert_eq!(root_node.child_files.len(), 1, "Root.mkv attaches directly to the root");
+        assert_eq!(root_node.child_dirs.len(), 1, "only Movies sits directly under the root");
+
+        let movies = &tree.dirs[root_node.child_dirs[0]];
+        assert_eq!(movies.name, "Movies");
+        assert_eq!(movies.parent_id, "0");
+        assert!(movies.child_files.is_empty(), "Movies itself holds no files directly");
+        let names: Vec<&str> =
+            movies.child_dirs.iter().map(|&i| tree.dirs[i].name.as_str()).collect();
+        assert!(names.contains(&"Show"), "{names:?}");
+        assert!(names.contains(&"OtherShow"), "{names:?}");
+        assert!(
+            !names.contains(&"Empty"),
+            "a directory with nothing playable anywhere under it must never get a node: {names:?}"
+        );
+        assert_eq!(movies.child_dirs.len(), 2, "Show and OtherShow, never Empty: {names:?}");
+
+        let show_idx = *movies.child_dirs.iter().find(|&&i| tree.dirs[i].name == "Show").unwrap();
+        let show = &tree.dirs[show_idx];
+        assert_eq!(
+            show.child_dirs.len(),
+            1,
+            "the two S01E0x files under it must share one Season 01 node, not create two"
+        );
+        let season = &tree.dirs[show.child_dirs[0]];
+        assert_eq!(season.name, "Season 01");
+        assert_eq!(season.parent_id, show.id);
+        assert_eq!(season.child_files.len(), 2);
+
+        // Season 01 exists twice on disk (once under Show, once under OtherShow) and must be two
+        // distinct nodes, not merged -- they are different real directories that only share a name.
+        assert_eq!(
+            tree.dirs.len(),
+            6,
+            "root + Movies + Show + OtherShow + two distinct Season 01s"
+        );
+    }
+
+    #[test]
+    fn root_direct_children_lists_directories_before_files_with_correct_ids() {
+        let (_d, _root, scan, tree) = scan_tree(
+            "root-children",
+            &[
+                ("Movies/Interstellar.mkv", b"a"),
+                ("Shows/Show/Season 01/S01E01.mkv", b"b"),
+                ("Shows/Show/Season 01/S01E02.mkv", b"c"),
+                ("RootFile.mkv", b"d"),
+            ],
+        );
+        let ctx = test_context(tree, scan);
+
+        let response = browse(&ctx, "0", "BrowseDirectChildren", 0, 0);
+        assert!(response.contains("<NumberReturned>3</NumberReturned>"), "{response}");
+        assert!(response.contains("<TotalMatches>3</TotalMatches>"), "{response}");
+
+        let didl = result_didl(&response);
+        assert!(didl.contains("<container id=\"d0\" parentID=\"0\""), "{didl}");
+        assert!(didl.contains("<container id=\"d1\" parentID=\"0\""), "{didl}");
+        assert!(didl.contains("<item id=\"f1\" parentID=\"0\""), "{didl}");
+
+        let last_dir_pos = didl.rfind("<container").unwrap();
+        let first_item_pos = didl.find("<item").unwrap();
+        assert!(
+            last_dir_pos < first_item_pos,
+            "every folder must be listed before every file: {didl}"
+        );
+    }
+
+    #[test]
+    fn a_directorys_direct_children_returns_only_its_own_children() {
+        let (_d, _root, scan, tree) = scan_tree(
+            "dir-children",
+            &[
+                ("Movies/Interstellar.mkv", b"a"),
+                ("Shows/Show/Season 01/S01E01.mkv", b"b"),
+                ("RootFile.mkv", b"d"),
+            ],
+        );
+        // "Shows" is the second directory created (Movies is created first, from the
+        // alphabetically-earlier `Movies/Interstellar.mkv`), so it is "d1".
+        let ctx = test_context(tree, scan);
+
+        let response = browse(&ctx, "d1", "BrowseDirectChildren", 0, 0);
+        assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
+        let didl = result_didl(&response);
+        assert!(didl.contains("<container id=\"d2\" parentID=\"d1\""), "{didl}");
+        // Nothing belonging to the root or to Movies must leak into Shows's own listing.
+        assert!(!didl.contains("id=\"d0\""), "{didl}");
+        assert!(!didl.contains("id=\"f0\""), "{didl}");
+        assert!(!didl.contains("id=\"f1\""), "{didl}");
+    }
+
+    #[test]
+    fn metadata_resolves_the_root_a_directory_and_a_file_and_rejects_every_unknown_shape() {
+        let (_d, _root, scan, tree) =
+            scan_tree("metadata", &[("Movies/Interstellar.mkv", b"a"), ("RootFile.mkv", b"d")]);
+        let ctx = test_context(tree, scan);
+
+        let root_didl = result_didl(&browse(&ctx, "0", "BrowseMetadata", 0, 0));
+        assert!(root_didl.contains("<container id=\"0\" parentID=\"-1\""), "{root_didl}");
+        assert!(root_didl.contains("<dc:title>lumen</dc:title>"), "{root_didl}");
+
+        let dir_didl = result_didl(&browse(&ctx, "d0", "BrowseMetadata", 0, 0));
+        assert!(dir_didl.contains("<container id=\"d0\" parentID=\"0\""), "{dir_didl}");
+        assert!(dir_didl.contains("<dc:title>Movies</dc:title>"), "{dir_didl}");
+
+        let file_didl = result_didl(&browse(&ctx, "f0", "BrowseMetadata", 0, 0));
+        assert!(file_didl.contains("<item id=\"f0\" parentID=\"d0\""), "{file_didl}");
+
+        for unknown in ["d99", "f99", "3", "not-an-id"] {
+            let response = browse(&ctx, unknown, "BrowseMetadata", 0, 0);
+            assert!(
+                response.contains("<errorCode>701</errorCode>"),
+                "{unknown} must be a 701 fault: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bare_integer_id_collision_stage_1_had_is_fixed() {
+        // Under Stage 1's scheme, this single file (the only playable file, sorted first) would have
+        // been object id "0" -- the exact same string as the root container's own fixed id. A client
+        // asking `Browse("0", Metadata)` could only ever reach the root, never this file. Confirm both
+        // ids now resolve to their own, distinct object.
+        let (_d, _root, scan, tree) = scan_tree("collision", &[("OnlyFile.mkv", b"x")]);
+        let ctx = test_context(tree, scan);
+
+        let root_didl = result_didl(&browse(&ctx, "0", "BrowseMetadata", 0, 0));
+        assert!(root_didl.contains("<dc:title>lumen</dc:title>"), "{root_didl}");
+        assert!(root_didl.contains("object.container.storageFolder"), "{root_didl}");
+
+        let file_didl = result_didl(&browse(&ctx, "f0", "BrowseMetadata", 0, 0));
+        assert!(file_didl.contains("<item id=\"f0\" parentID=\"0\""), "{file_didl}");
+        assert!(
+            !file_didl.contains("object.container.storageFolder"),
+            "the file's own metadata must never read as the root container: {file_didl}"
+        );
+    }
+
+    #[test]
+    fn pagination_applies_over_the_combined_directories_then_files_sequence() {
+        let (_d, _root, scan, tree) = scan_tree(
+            "paginate",
+            &[
+                ("Movies/Interstellar.mkv", b"a"),
+                ("Shows/Show/Season 01/S01E01.mkv", b"b"),
+                ("RootFile.mkv", b"d"),
+            ],
+        );
+        // Root's combined DirectChildren sequence is [Movies(d0), Shows(d1), RootFile(f1)] -- 3 total.
+        let ctx = test_context(tree, scan);
+
+        let response = browse(&ctx, "0", "BrowseDirectChildren", 1, 1);
+        assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
+        assert!(
+            response.contains("<TotalMatches>3</TotalMatches>"),
+            "TotalMatches must reflect the combined count, not just files: {response}"
+        );
+        let didl = result_didl(&response);
+        assert!(
+            didl.contains("id=\"d1\""),
+            "starting_index=1 must land on the second entry: {didl}"
+        );
+        assert!(!didl.contains("id=\"d0\""), "{didl}");
+        assert!(!didl.contains("id=\"f1\""), "{didl}");
+    }
 
     #[test]
     fn a_request_line_and_headers_parse_including_a_percent_encoded_path() {
