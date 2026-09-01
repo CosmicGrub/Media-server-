@@ -56,11 +56,16 @@ pub fn build_device_description(identity: &DeviceIdentity, base_url: &str) -> St
     )
 }
 
-/// `ContentDirectory:1`'s SCPD: the one action this responder actually implements (`Browse`), plus
-/// the two read-only state variables every real client expects to find declared even when it never
-/// queries them directly (`SystemUpdateID`, `SortCriteria`). Declaring an action this server does not
-/// implement would be the dishonest direction to get wrong -- a client that trusts the SCPD and calls
-/// it gets a SOAP fault it had no way to expect.
+/// `ContentDirectory:1`'s SCPD: the two actions this responder actually implements (`Browse` and
+/// `Search` -- the latter only over the bounded `SearchCriteria` subset `content_directory`'s own
+/// module doc describes: `"*"` and single-clause `dc:title contains "..."`, not the full UPnP search
+/// grammar), plus the two read-only state variables every real client expects to find declared even
+/// when it never queries them directly (`SystemUpdateID`, `SortCriteria`). Declaring an action this
+/// server does not implement would be the dishonest direction to get wrong -- a client that trusts the
+/// SCPD and calls it gets a SOAP fault it had no way to expect. `Search`'s `ContainerID` argument
+/// reuses `A_ARG_TYPE_ObjectID` rather than declaring its own state variable, matching the real UPnP
+/// `ContentDirectory:1` spec's own SCPD (a container id and an object id are the same string type;
+/// UPnP does not require a state variable's name to mirror the argument name that uses it).
 pub fn content_directory_scpd() -> &'static str {
     "<?xml version=\"1.0\"?>\
      <scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\
@@ -81,10 +86,26 @@ pub fn content_directory_scpd() -> &'static str {
      <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>\
      </argumentList>\
      </action>\
+     <action>\
+     <name>Search</name>\
+     <argumentList>\
+     <argument><name>ContainerID</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ObjectID</relatedStateVariable></argument>\
+     <argument><name>SearchCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SearchCriteria</relatedStateVariable></argument>\
+     <argument><name>Filter</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Filter</relatedStateVariable></argument>\
+     <argument><name>StartingIndex</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Index</relatedStateVariable></argument>\
+     <argument><name>RequestedCount</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
+     <argument><name>SortCriteria</name><direction>in</direction><relatedStateVariable>A_ARG_TYPE_SortCriteria</relatedStateVariable></argument>\
+     <argument><name>Result</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Result</relatedStateVariable></argument>\
+     <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
+     <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
+     <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>\
+     </argumentList>\
+     </action>\
      </actionList>\
      <serviceStateTable>\
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>\
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_BrowseFlag</name><dataType>string</dataType></stateVariable>\
+     <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_SearchCriteria</name><dataType>string</dataType></stateVariable>\
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Filter</name><dataType>string</dataType></stateVariable>\
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Index</name><dataType>ui4</dataType></stateVariable>\
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Count</name><dataType>ui4</dataType></stateVariable>\
@@ -199,11 +220,19 @@ mod tests {
     }
 
     #[test]
-    fn the_content_directory_scpd_declares_exactly_the_browse_action_this_server_implements() {
+    fn the_content_directory_scpd_declares_exactly_the_browse_and_search_actions_this_server_implements()
+     {
         let scpd = content_directory_scpd();
         assert!(scpd.contains("<name>Browse</name>"));
         assert!(scpd.contains("<name>ObjectID</name>"));
         assert!(scpd.contains("<name>Result</name>"));
+        assert!(scpd.contains("<name>Search</name>"));
+        assert!(scpd.contains("<name>ContainerID</name>"));
+        assert!(scpd.contains("<name>SearchCriteria</name>"));
+        assert!(
+            scpd.contains("A_ARG_TYPE_SearchCriteria"),
+            "SearchCriteria must be declared as its own state variable: {scpd}"
+        );
     }
 
     #[test]

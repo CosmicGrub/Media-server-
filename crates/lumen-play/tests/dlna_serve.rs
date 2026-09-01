@@ -1,11 +1,12 @@
 //! End-to-end verification of `lumen serve --dlna` against a real, nested directory tree.
 //!
-//! Every other test of `dlna.rs`'s own `LibraryTree`/`Browse` dispatch logic (in `src/dlna.rs`'s own
-//! `#[cfg(test)] mod tests`) drives that code directly, in-process, over a loopback socket this test
-//! file does not share. This is the one that proves the pieces actually work assembled: a real `lumen
-//! serve --dlna` process, spawned against a real nested fixture on disk, issuing real SOAP `Browse`
-//! requests over a real HTTP connection to the real listener `dlna::run` binds -- the same wire
-//! protocol a real smart TV's Browse UI would speak, not a reimplementation of it.
+//! Every other test of `dlna.rs`'s own `LibraryTree`/`Browse`/`Search` dispatch logic (in
+//! `src/dlna.rs`'s own `#[cfg(test)] mod tests`) drives that code directly, in-process, over a
+//! loopback socket this test file does not share. This is the one that proves the pieces actually
+//! work assembled: a real `lumen serve --dlna` process, spawned against a real nested fixture on disk,
+//! issuing real SOAP `Browse` and `Search` requests over a real HTTP connection to the real listener
+//! `dlna::run` binds -- the same wire protocol a real smart TV's Browse/Search UI would speak, not a
+//! reimplementation of it.
 //!
 //! Real mpv is still required to spawn the process at all: `main.rs`'s `serve` command starts the DLNA
 //! listener on its own thread and then unconditionally calls `remote::server::run`, which spawns an
@@ -194,6 +195,62 @@ fn browse_expect_fault(port: u16, object_id: &str, flag: &str) -> String {
         "POST /dlna/cd/control HTTP/1.1\r\n\
          Host: 127.0.0.1:{port}\r\n\
          SOAPACTION: \"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"\r\n\
+         Content-Type: text/xml; charset=\"utf-8\"\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tcp.write_all(request.as_bytes()).unwrap();
+    let (_status, _headers, resp_body) = read_http_response(&mut tcp);
+    String::from_utf8(resp_body).expect("a SOAP fault must be valid UTF-8")
+}
+
+fn search_soap(container_id: &str, criteria: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+         <s:Body><u:Search xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+         <ContainerID>{container_id}</ContainerID><SearchCriteria>{criteria}</SearchCriteria>\
+         <Filter>*</Filter><StartingIndex>0</StartingIndex>\
+         <RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>\
+         </u:Search></s:Body></s:Envelope>"
+    )
+}
+
+/// As [`browse`], but for a real `Search` SOAP request: sends it over a fresh, real TCP connection and
+/// returns the DIDL-Lite text out of `<Result>...</Result>`, unescaped. Panics loudly (with the full
+/// response) if the reply is not a well-formed `SearchResponse`.
+fn search(port: u16, container_id: &str, criteria: &str) -> String {
+    let mut tcp = connect_with_retry(port, Duration::from_secs(5));
+    let body = search_soap(container_id, criteria);
+    let request = format!(
+        "POST /dlna/cd/control HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         SOAPACTION: \"urn:schemas-upnp-org:service:ContentDirectory:1#Search\"\r\n\
+         Content-Type: text/xml; charset=\"utf-8\"\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tcp.write_all(request.as_bytes()).unwrap();
+    let (status, _headers, resp_body) = read_http_response(&mut tcp);
+    let text = String::from_utf8(resp_body).expect("a Search response must be valid UTF-8");
+    assert_eq!(status, 200, "a successful Search is always wrapped in a 200: {text}");
+    assert!(!text.contains("<errorCode>"), "expected a SearchResponse, got a SOAP fault: {text}");
+
+    let start =
+        text.find("<Result>").expect("a Search response must carry <Result>") + "<Result>".len();
+    let end = text.find("</Result>").expect("a Search response must carry </Result>");
+    unescape(&text[start..end])
+}
+
+/// Same as [`search`], but for a request this test expects to be *refused* -- returns the raw response
+/// text (headers and all) rather than panicking on a non-200/fault, so the caller can assert on the
+/// fault itself.
+fn search_expect_fault(port: u16, container_id: &str, criteria: &str) -> String {
+    let mut tcp = connect_with_retry(port, Duration::from_secs(5));
+    let body = search_soap(container_id, criteria);
+    let request = format!(
+        "POST /dlna/cd/control HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         SOAPACTION: \"urn:schemas-upnp-org:service:ContentDirectory:1#Search\"\r\n\
          Content-Type: text/xml; charset=\"utf-8\"\r\n\
          Content-Length: {}\r\n\r\n{body}",
         body.len()
@@ -430,6 +487,47 @@ fn a_real_server_serves_a_real_nested_folder_hierarchy_over_real_soap_and_stream
     let (status, _headers, body) = read_http_response(&mut root_stream_tcp);
     assert_eq!(status, 200);
     assert_eq!(body, std::fs::read(&root_file).unwrap());
+
+    // 7. Search(MatchAll) from the root finds every real file, including the deeply nested episodes
+    // two directories down, and never the empty directory -- and, since Search answers "find these
+    // items", never emits a <container> element for Movies/Shows/Season 01 either.
+    let all_files_didl = search(dlna_port, "0", "*");
+    for expected in ["Interstellar", "S01E01", "S01E02", root_file_label()] {
+        assert!(
+            all_files_didl.contains(expected),
+            "{expected} missing from a real Search(*) from the root: {all_files_didl}"
+        );
+    }
+    assert!(
+        !all_files_didl.contains("Empty"),
+        "an empty directory must never appear in a real Search response: {all_files_didl}"
+    );
+    assert!(
+        !all_files_didl.contains("<container"),
+        "Search results must be items only, never containers: {all_files_didl}"
+    );
+
+    // 8. Search(dc:title contains "chernobyl") finds only the two real episodes, matched
+    // case-insensitively, never Interstellar and never the unrelated root file.
+    let chernobyl_search_didl = search(dlna_port, "0", "dc:title contains \"chernobyl\"");
+    assert!(chernobyl_search_didl.contains("S01E01"), "{chernobyl_search_didl}");
+    assert!(chernobyl_search_didl.contains("S01E02"), "{chernobyl_search_didl}");
+    assert!(!chernobyl_search_didl.contains("Interstellar"), "{chernobyl_search_didl}");
+    assert!(!chernobyl_search_didl.contains(root_file_label()), "{chernobyl_search_didl}");
+
+    // 9. Searching from "Shows" instead of the root still finds both episodes two levels further down
+    // (Shows -> Chernobyl -> Season 01) -- proving the recursion genuinely walks from the *named*
+    // container, not always from the root -- and, scoped there, never returns Interstellar or the
+    // root file, which a container-blind ("accidentally global") search would.
+    let shows_search_didl = search(dlna_port, &shows_id, "*");
+    assert!(shows_search_didl.contains("S01E01"), "{shows_search_didl}");
+    assert!(shows_search_didl.contains("S01E02"), "{shows_search_didl}");
+    assert!(!shows_search_didl.contains("Interstellar"), "{shows_search_didl}");
+    assert!(!shows_search_didl.contains(root_file_label()), "{shows_search_didl}");
+
+    // 10. An unknown container_id is a real 701 SOAP fault over the wire, exactly like Browse.
+    let search_fault = search_expect_fault(dlna_port, "d999", "*");
+    assert!(search_fault.contains("<errorCode>701</errorCode>"), "{search_fault}");
 
     let _ = server.kill();
     let _ = server.wait();

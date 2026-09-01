@@ -28,8 +28,9 @@ mod descriptor;
 mod message;
 
 pub use content_directory::{
-    BrowseFlag, BrowseRequest, DidlObject, DidlResource, ObjectClass, build_browse_response,
-    build_didl_lite, build_soap_fault, parse_browse_request,
+    BrowseFlag, BrowseRequest, DidlObject, DidlResource, ObjectClass, SearchCriteria,
+    SearchRequest, build_browse_response, build_cd_search_response, build_didl_lite,
+    build_soap_fault, parse_browse_request, parse_search_request,
 };
 pub use descriptor::{
     DeviceIdentity, build_device_description, build_get_current_connection_ids_response,

@@ -1,6 +1,14 @@
 //! DLNA `MediaServer` support for `lumen serve` -- the `--dlna` opt-in surface: SSDP announcement
-//! plus a plain, unauthenticated HTTP server answering `ContentDirectory`'s `Browse` action and
-//! streaming the files it lists.
+//! plus a plain, unauthenticated HTTP server answering `ContentDirectory`'s `Browse` and `Search`
+//! actions and streaming the files they list.
+//!
+//! **`Search`, Stage 3: files only, over a bounded criteria subset.** `handle_search` walks
+//! [`LibraryTree`] recursively from the named container and returns every matching *file* -- never a
+//! container, since DIDL-Lite `Search` conventionally answers "find these items", and "list this
+//! container's own children" (directories included) is already `Browse(DirectChildren)`'s job.
+//! Recognised criteria are exactly `lumen_discovery::SearchCriteria`'s two real cases (`"*"` and
+//! single-clause `dc:title contains "..."`) -- see that type's own doc, and `content_directory.rs`'s
+//! module doc, for why the full UPnP search grammar is deliberately not implemented here.
 //!
 //! **Deliberately separate infrastructure from `remote::server`, not an extension of it.** SSDP and
 //! DLNA's `ContentDirectory`/`ConnectionManager` services are unauthenticated by protocol design --
@@ -35,9 +43,10 @@ use std::time::{Duration, Instant};
 
 use lumen_discovery::{
     Announcement, BrowseFlag, DeviceIdentity, DidlObject, DidlResource, ObjectClass, Responder,
-    build_browse_response, build_device_description, build_didl_lite,
-    build_get_current_connection_ids_response, build_get_protocol_info_response, build_soap_fault,
-    connection_manager_scpd, content_directory_scpd, parse_browse_request,
+    SearchCriteria, build_browse_response, build_cd_search_response, build_device_description,
+    build_didl_lite, build_get_current_connection_ids_response, build_get_protocol_info_response,
+    build_soap_fault, connection_manager_scpd, content_directory_scpd, parse_browse_request,
+    parse_search_request,
 };
 use lumen_model::Container;
 
@@ -195,13 +204,13 @@ struct DirNode {
     id: String,
     parent_id: String,
     /// The directory's own basename. Empty for the root -- unused, since `BrowseMetadata("0")`
-    /// already hardcodes the root's title as `"lumen"` in `handle_content_directory_control`.
+    /// already hardcodes the root's title as `"lumen"` in `handle_browse`.
     name: String,
     /// Indices into the owning [`LibraryTree`]'s own `dirs`.
     child_dirs: Vec<usize>,
-    /// Indices into `scan.playable()`'s own enumeration -- the same ordering
-    /// `handle_content_directory_control` already built its (Stage 1, flat) file list from, so a
-    /// file's object id keeps meaning what it already meant.
+    /// Indices into `scan.playable()`'s own enumeration -- the same ordering `handle_browse` already
+    /// built its (Stage 1, flat) file list from, so a file's object id keeps meaning what it already
+    /// meant.
     child_files: Vec<usize>,
 }
 
@@ -216,9 +225,9 @@ struct DirNode {
 /// **Fixes a real, latent id-collision bug along the way.** Stage 1 gave playable files bare-integer
 /// object ids ("0", "1", ...) -- the same string space the root container's own fixed id ("0") lives
 /// in. A client asking `Browse("0", BrowseMetadata)` to inspect "the object with id 0" could never
-/// actually reach file index 0's metadata; the root-vs-file check in
-/// `handle_content_directory_control` ran first and always won, no matter what the client actually
-/// meant. Every directory now gets a `"d<n>"` id and every file an `"f<n>"` id -- three disjoint
+/// actually reach file index 0's metadata; the root-vs-file check in `handle_browse` ran first and
+/// always won, no matter what the client actually meant. Every directory now gets a `"d<n>"` id and
+/// every file an `"f<n>"` id -- three disjoint
 /// prefixes (`"0"`, `"d..."`, `"f..."`), so no two distinct objects can ever share a string again.
 #[derive(Debug)]
 struct LibraryTree {
@@ -228,9 +237,11 @@ struct LibraryTree {
     by_id: HashMap<String, usize>,
     /// The parent directory's own id, for each playable file -- indexed exactly the way
     /// `scan.playable()`'s own enumeration (and therefore each file's own `"f<n>"` id) already is.
-    /// Looked up only by a `Browse(Metadata)` naming a bare file id directly; every `DirectChildren`
-    /// listing already has its directory's id in hand from the [`DirNode`] being listed, so it never
-    /// needs this.
+    /// Looked up by a `Browse(Metadata)` naming a bare file id directly, and by `handle_search` for
+    /// every matched file (a file three levels under the searched container must report its own true
+    /// immediate parent, not the container that was searched from) -- every `DirectChildren` listing
+    /// already has its directory's id in hand from the [`DirNode`] being listed, so it never needs
+    /// this.
     file_parent: Vec<String>,
 }
 
@@ -375,6 +386,8 @@ fn route(tcp: &mut TcpStream, req: &HttpRequest, body: &[u8], ctx: &DlnaContext)
     }
 }
 
+/// Dispatches `POST /dlna/cd/control` on its `SOAPACTION` header -- the same header-based routing
+/// `handle_connection_manager_control` already uses for its own three actions.
 fn handle_content_directory_control(
     tcp: &mut TcpStream,
     req: &HttpRequest,
@@ -383,11 +396,17 @@ fn handle_content_directory_control(
 ) {
     let soap = String::from_utf8_lossy(body);
     let action = req.header("soapaction").unwrap_or("");
-    if !action.contains("#Browse") {
+    if action.contains("#Browse") {
+        handle_browse(tcp, &soap, ctx);
+    } else if action.contains("#Search") {
+        handle_search(tcp, &soap, ctx);
+    } else {
         write_soap_fault(tcp, 401, "Invalid Action");
-        return;
     }
-    let Some(browse) = parse_browse_request(&soap) else {
+}
+
+fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
+    let Some(browse) = parse_browse_request(soap) else {
         write_soap_fault(tcp, 402, "Invalid Args");
         return;
     };
@@ -501,6 +520,96 @@ fn handle_content_directory_control(
     write_ok(tcp, "text/xml; charset=\"utf-8\"", response.as_bytes());
 }
 
+/// `Search`: every playable *file* (never a container -- see this module's own doc) anywhere under
+/// the named container, recursively, matching `criteria`. `701` if `container_id` names no real
+/// directory; `708` ("Unsupported or invalid search criteria") if the criteria string parsed to
+/// [`SearchCriteria::Unsupported`] rather than one of the two shapes this responder actually
+/// evaluates. Pagination is `starting_index`/`requested_count` over the matched flat list, the exact
+/// same skip/take-over-a-flat-sequence shape `handle_browse`'s own `DirectChildren` case already
+/// uses.
+fn handle_search(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
+    let Some(search) = parse_search_request(soap) else {
+        write_soap_fault(tcp, 402, "Invalid Args");
+        return;
+    };
+    let tree = &ctx.tree;
+    if tree.dir_by_id(&search.container_id).is_none() {
+        write_soap_fault(tcp, 701, "No such object");
+        return;
+    }
+
+    let scan = ctx.library.lock().unwrap();
+    let files: Vec<_> = scan.playable().collect();
+
+    let matched: Vec<usize> = match &search.criteria {
+        SearchCriteria::MatchAll => collect_file_indices_recursive(tree, &search.container_id),
+        SearchCriteria::TitleContains(text) => {
+            let needle = text.to_ascii_lowercase();
+            collect_file_indices_recursive(tree, &search.container_id)
+                .into_iter()
+                .filter(|&i| {
+                    files.get(i).is_some_and(|f| f.label().to_ascii_lowercase().contains(&needle))
+                })
+                .collect()
+        }
+        SearchCriteria::Unsupported => {
+            write_soap_fault(tcp, 708, "Unsupported or invalid search criteria");
+            return;
+        }
+    };
+
+    // Pagination over the matched flat list -- the same skip/take-over-a-single-sequence shape
+    // `handle_browse`'s DirectChildren case already applies to its own combined dirs-then-files list.
+    let total = matched.len();
+    let start = search.starting_index as usize;
+    let count = if search.requested_count == 0 { total } else { search.requested_count as usize };
+
+    let objects: Vec<DidlObject> = matched
+        .into_iter()
+        .skip(start)
+        .take(count)
+        .filter_map(|i| {
+            files.get(i).map(|f| DidlObject {
+                id: format!("f{i}"),
+                // The file's own true immediate parent (from `LibraryTree::file_parent`), never
+                // `search.container_id` -- a search recursing several levels down must report each
+                // result's real containing directory, exactly like `Browse(Metadata)` on a file
+                // already does.
+                parent_id: tree.file_parent.get(i).cloned().unwrap_or_default(),
+                title: f.label(),
+                class: object_class_for(f.container),
+                resource: Some(DidlResource {
+                    url: format!("{}/dlna/stream/f{i}", ctx.base_url),
+                    mime_type: content_type_for(f.container, f.extension.as_deref()).to_string(),
+                    size_bytes: Some(f.size),
+                }),
+            })
+        })
+        .collect();
+
+    let didl = build_didl_lite(&objects);
+    let response = build_cd_search_response(&didl, objects.len() as u32, total as u32, 1);
+    write_ok(tcp, "text/xml; charset=\"utf-8\"", response.as_bytes());
+}
+
+/// Every index into `scan.playable()`'s own enumeration for a file anywhere under `container_id`,
+/// recursively -- the walk `handle_search` needs and `handle_browse`'s `DirectChildren` case does not
+/// (that case only ever wants one directory's own direct children).
+fn collect_file_indices_recursive(tree: &LibraryTree, container_id: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    if let Some(dir) = tree.dir_by_id(container_id) {
+        collect_dir_files_recursive(tree, dir, &mut out);
+    }
+    out
+}
+
+fn collect_dir_files_recursive(tree: &LibraryTree, dir: &DirNode, out: &mut Vec<usize>) {
+    out.extend(dir.child_files.iter().copied());
+    for &child_idx in &dir.child_dirs {
+        collect_dir_files_recursive(tree, &tree.dirs[child_idx], out);
+    }
+}
+
 fn handle_connection_manager_control(tcp: &mut TcpStream, req: &HttpRequest, _body: &[u8]) {
     let action = req.header("soapaction").unwrap_or("");
     if action.contains("#GetProtocolInfo") {
@@ -523,8 +632,8 @@ fn handle_connection_manager_control(tcp: &mut TcpStream, req: &HttpRequest, _bo
 fn serve_stream(tcp: &mut TcpStream, req: &HttpRequest, id: &str, ctx: &DlnaContext) {
     let scan = ctx.library.lock().unwrap();
     // `/dlna/stream/<id>` URLs are built with the same "f<n>" ids `build_didl_lite`-driven items carry
-    // (see `handle_content_directory_control`) -- strip that prefix before the numeric lookup so this
-    // parses exactly the ids this responder itself hands out.
+    // (see `handle_browse` and `handle_search`) -- strip that prefix before the numeric lookup so
+    // this parses exactly the ids this responder itself hands out.
     let Some(f) = id
         .strip_prefix('f')
         .and_then(|s| s.parse::<usize>().ok())
@@ -918,6 +1027,49 @@ mod tests {
         reader.join().unwrap()
     }
 
+    fn search_soap(container_id: &str, criteria: &str, starting_index: u32, count: u32) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+             <s:Body><u:Search xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+             <ContainerID>{container_id}</ContainerID><SearchCriteria>{criteria}</SearchCriteria>\
+             <Filter>*</Filter><StartingIndex>{starting_index}</StartingIndex>\
+             <RequestedCount>{count}</RequestedCount><SortCriteria></SortCriteria>\
+             </u:Search></s:Body></s:Envelope>"
+        )
+    }
+
+    /// As [`browse`], but drives `handle_content_directory_control` with a real `#Search` SOAPACTION
+    /// and a `Search` SOAP body over a real loopback TCP connection.
+    fn search(
+        ctx: &DlnaContext,
+        container_id: &str,
+        criteria: &str,
+        starting_index: u32,
+        count: u32,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).unwrap();
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "soapaction".to_string(),
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#Search\"".to_string(),
+        );
+        let req = HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
+        let body = search_soap(container_id, criteria, starting_index, count);
+        handle_content_directory_control(&mut server_stream, &req, body.as_bytes(), ctx);
+        drop(server_stream);
+
+        reader.join().unwrap()
+    }
+
     /// Pulls the DIDL-Lite text back out of a `Browse` response's `<Result>...</Result>`, unescaped so
     /// assertions can read it directly (`build_browse_response`'s own doc explains why it is escaped
     /// once more on the way in).
@@ -926,6 +1078,23 @@ mod tests {
             + "<Result>".len();
         let end = response.find("</Result>").expect("a Browse response must carry </Result>");
         unescape(&response[start..end])
+    }
+
+    /// Find the `parentID` attribute of the `<item ...>` element whose `<dc:title>` contains
+    /// `title_substr`, in a DIDL-Lite document -- used to assert a `Search` result names its own real
+    /// containing directory, not the container the search started from.
+    fn item_parent_id(didl: &str, title_substr: &str) -> String {
+        let title_pos = didl.find(title_substr).unwrap_or_else(|| {
+            panic!("no item titled containing {title_substr:?} found in DIDL-Lite: {didl}")
+        });
+        let item_start =
+            didl[..title_pos].rfind("<item id=\"").expect("a preceding <item> open tag");
+        let marker = "parentID=\"";
+        let p = didl[item_start..].find(marker).expect("an <item> must carry parentID")
+            + item_start
+            + marker.len();
+        let end = didl[p..].find('"').expect("a closing quote for parentID");
+        didl[p..p + end].to_string()
     }
 
     #[test]
@@ -1108,6 +1277,116 @@ mod tests {
         );
         assert!(!didl.contains("id=\"d0\""), "{didl}");
         assert!(!didl.contains("id=\"f1\""), "{didl}");
+    }
+
+    #[test]
+    fn search_match_all_finds_every_file_recursively_not_just_direct_children() {
+        let (_d, _root, scan, tree) = scan_tree(
+            "search-matchall",
+            &[
+                ("Movies/Interstellar.mkv", b"a"),
+                ("Shows/Show/Season 01/S01E01.mkv", b"b"),
+                ("Shows/Show/Season 01/S01E02.mkv", b"c"),
+                ("RootFile.mkv", b"d"),
+            ],
+        );
+        let ctx = test_context(tree, scan);
+
+        let response = search(&ctx, "0", "*", 0, 0);
+        assert!(response.contains("<NumberReturned>4</NumberReturned>"), "{response}");
+        assert!(response.contains("<TotalMatches>4</TotalMatches>"), "{response}");
+        let didl = result_didl(&response);
+        for expected in ["Interstellar", "S01E01", "S01E02"] {
+            assert!(didl.contains(expected), "{expected} missing: {didl}");
+        }
+        assert!(
+            !didl.contains("<container"),
+            "Search results are items only, never containers: {didl}"
+        );
+
+        // A file two directories below the searched container must report its own real immediate
+        // parent (the Season 01 directory), never the root container that was searched from.
+        assert_ne!(
+            item_parent_id(&didl, "S01E01"),
+            "0",
+            "a deeply nested file's parentID must be its real directory, not the root it was \
+             searched from: {didl}"
+        );
+    }
+
+    #[test]
+    fn search_title_contains_matches_case_insensitively_and_only_the_right_files() {
+        let (_d, _root, scan, tree) = scan_tree(
+            "search-title",
+            &[
+                ("Movies/Interstellar.mkv", b"a"),
+                ("Shows/Chernobyl/Season 01/Chernobyl.S01E01.mkv", b"b"),
+                ("Shows/Chernobyl/Season 01/Chernobyl.S01E02.mkv", b"c"),
+            ],
+        );
+        let ctx = test_context(tree, scan);
+
+        let response = search(&ctx, "0", "dc:title contains \"CHERNOBYL\"", 0, 0);
+        assert!(response.contains("<NumberReturned>2</NumberReturned>"), "{response}");
+        let didl = result_didl(&response);
+        assert!(didl.contains("S01E01"), "{didl}");
+        assert!(didl.contains("S01E02"), "{didl}");
+        assert!(!didl.contains("Interstellar"), "the unrelated title must not match: {didl}");
+    }
+
+    #[test]
+    fn search_from_a_non_root_container_only_returns_files_under_that_subtree() {
+        let (_d, _root, scan, tree) = scan_tree(
+            "search-subtree",
+            &[
+                ("Movies/Interstellar.mkv", b"a"),
+                ("Shows/Show/Season 01/S01E01.mkv", b"b"),
+                ("RootFile.mkv", b"d"),
+            ],
+        );
+        // "Shows" is the second directory created (Movies is created first, from the
+        // alphabetically-earlier `Movies/Interstellar.mkv`), so it is "d1" -- matching
+        // `a_directorys_direct_children_returns_only_its_own_children`'s own fixture and reasoning.
+        let ctx = test_context(tree, scan);
+
+        let response = search(&ctx, "d1", "*", 0, 0);
+        assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
+        let didl = result_didl(&response);
+        assert!(didl.contains("S01E01"), "{didl}");
+        assert!(!didl.contains("Interstellar"), "{didl}");
+        assert!(!didl.contains("RootFile"), "{didl}");
+    }
+
+    #[test]
+    fn search_pagination_works_like_browses_over_the_matched_flat_list() {
+        let (_d, _root, scan, tree) =
+            scan_tree("search-paginate", &[("A.mkv", b"a"), ("B.mkv", b"b"), ("C.mkv", b"c")]);
+        let ctx = test_context(tree, scan);
+
+        let response = search(&ctx, "0", "*", 1, 1);
+        assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
+        assert!(
+            response.contains("<TotalMatches>3</TotalMatches>"),
+            "TotalMatches must reflect every match, not just the returned page: {response}"
+        );
+    }
+
+    #[test]
+    fn search_with_an_unknown_container_id_is_a_701_fault() {
+        let (_d, _root, scan, tree) = scan_tree("search-unknown", &[("A.mkv", b"a")]);
+        let ctx = test_context(tree, scan);
+
+        let response = search(&ctx, "d999", "*", 0, 0);
+        assert!(response.contains("<errorCode>701</errorCode>"), "{response}");
+    }
+
+    #[test]
+    fn search_with_unsupported_criteria_is_a_708_fault() {
+        let (_d, _root, scan, tree) = scan_tree("search-unsupported", &[("A.mkv", b"a")]);
+        let ctx = test_context(tree, scan);
+
+        let response = search(&ctx, "0", "dc:creator contains \"X\"", 0, 0);
+        assert!(response.contains("<errorCode>708</errorCode>"), "{response}");
     }
 
     #[test]

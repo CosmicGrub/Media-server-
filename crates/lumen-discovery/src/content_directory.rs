@@ -1,10 +1,24 @@
-//! DLNA `ContentDirectory:1`: the SOAP `Browse` action, and the DIDL-Lite XML it returns.
+//! DLNA `ContentDirectory:1`: the SOAP `Browse` and `Search` actions, and the DIDL-Lite XML they
+//! return.
 //!
-//! **Not a general XML parser or writer.** `parse_browse_request` is a bounded scan for the handful
-//! of specific, known leaf elements a `Browse` SOAP body carries -- the same "extract only what a
-//! specific, known structure needs" scope `lumen-probe`'s EBML/ISOBMFF readers already keep to, not
-//! a document tree. `build_didl_lite` writes exactly the DIDL-Lite shape a `Browse` response needs,
-//! nothing more general.
+//! **Not a general XML parser or writer.** `parse_browse_request`/`parse_search_request` are a
+//! bounded scan for the handful of specific, known leaf elements a `Browse`/`Search` SOAP body
+//! carries -- the same "extract only what a specific, known structure needs" scope `lumen-probe`'s
+//! EBML/ISOBMFF readers already keep to, not a document tree. `build_didl_lite` writes exactly the
+//! DIDL-Lite shape a `Browse`/`Search` response needs, nothing more general.
+//!
+//! **`Search`'s scope is deliberately bounded, not a general UPnP search-grammar parser.** The real
+//! `SearchCriteria` grammar UPnP `ContentDirectory:1` defines supports arbitrary boolean expressions
+//! (`and`/`or`, parenthesised nesting), several relational operators (`contains`, `derivedfrom`, `=`,
+//! `<`, ...) over arbitrary properties (`dc:title`, `dc:creator`, `upnp:class`, ...), and full string
+//! escaping throughout. Implementing that honestly is a small parser-combinator project in its own
+//! right, and almost no real client sends anything beyond two shapes in practice: `"*"` (match
+//! everything, letting the client filter client-side) and a single `dc:title contains "..."` clause
+//! (the "search box" case). [`SearchCriteria`] models exactly those two, plus an explicit
+//! [`SearchCriteria::Unsupported`] third case for everything else -- answered with a `708` SOAP fault
+//! (see `dlna.rs`'s `handle_search`) rather than silently guessed at, misinterpreted as `MatchAll`, or
+//! panicking. Extending this to more of the real grammar is future work, not a claim of full spec
+//! coverage today.
 
 /// Which of DIDL-Lite's two browse modes was requested: the object itself (`BrowseMetadata`, used to
 /// resolve one object's own properties) or its children (`BrowseDirectChildren`, used to list a
@@ -40,6 +54,95 @@ pub fn parse_browse_request(soap_body: &str) -> Option<BrowseRequest> {
     let requested_count =
         xml_element_text(soap_body, "RequestedCount").and_then(|s| s.parse().ok()).unwrap_or(0);
     Some(BrowseRequest { object_id, flag, starting_index, requested_count })
+}
+
+/// The bounded subset of UPnP `SearchCriteria` this responder understands -- see this module's own
+/// doc for why the real grammar is not implemented in full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchCriteria {
+    /// The literal criteria string `"*"`: every item under the searched container, recursively. The
+    /// common case a client sends when it wants a flat listing to filter client-side.
+    MatchAll,
+    /// The single-clause form `dc:title contains "TEXT"` -- matched case-insensitively per the UPnP
+    /// spec's own `contains` semantics. `TEXT` has already had UPnP's `""`-for-a-literal-`"` quoting
+    /// undone.
+    TitleContains(String),
+    /// Anything this parser could not confidently interpret as one of the two cases above: the full
+    /// boolean grammar, a property other than `dc:title`, an operator other than `contains`, or a
+    /// malformed quoted string. Distinct from the whole request failing to parse (`None` from
+    /// [`parse_search_request`]) -- `ContainerID`/`StartingIndex`/`RequestedCount` can still be
+    /// genuinely known even when the criteria string itself is unintelligible, so the caller decides
+    /// what to do with an otherwise-valid request carrying criteria it cannot honour (a `708` SOAP
+    /// fault, in `dlna.rs`'s `handle_search`).
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchRequest {
+    pub container_id: String,
+    pub criteria: SearchCriteria,
+    /// How many results to skip before the first one returned -- pagination, not a filter.
+    pub starting_index: u32,
+    /// `0` means "no limit" per the UPnP spec's own convention, not "return nothing".
+    pub requested_count: u32,
+}
+
+/// Parse a `Search` SOAP request body. `None` only when a required element (`ContainerID` or
+/// `SearchCriteria`) is missing entirely -- an unintelligible-but-present `SearchCriteria` string
+/// still yields `Some(SearchRequest { criteria: SearchCriteria::Unsupported, .. })` rather than
+/// failing the whole request, since the other fields can still be genuinely known (see
+/// [`SearchCriteria::Unsupported`]'s own doc).
+pub fn parse_search_request(soap_body: &str) -> Option<SearchRequest> {
+    let container_id = xml_element_text(soap_body, "ContainerID")?;
+    let criteria = parse_search_criteria(&xml_element_text(soap_body, "SearchCriteria")?);
+    let starting_index =
+        xml_element_text(soap_body, "StartingIndex").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let requested_count =
+        xml_element_text(soap_body, "RequestedCount").and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(SearchRequest { container_id, criteria, starting_index, requested_count })
+}
+
+/// Classify one already-extracted `SearchCriteria` string into the bounded set this responder
+/// understands. Never panics on malformed input -- an unrecognised shape is
+/// [`SearchCriteria::Unsupported`], not a crash.
+fn parse_search_criteria(text: &str) -> SearchCriteria {
+    let trimmed = text.trim();
+    if trimmed == "*" {
+        return SearchCriteria::MatchAll;
+    }
+    if let Some(rest) = trimmed.strip_prefix("dc:title") {
+        if let Some(rest) = rest.trim_start().strip_prefix("contains") {
+            if let Some(needle) = parse_search_quoted_string(rest.trim_start()) {
+                return SearchCriteria::TitleContains(needle);
+            }
+        }
+    }
+    SearchCriteria::Unsupported
+}
+
+/// Parse one UPnP search-string literal: a double-quoted string in which `""` represents a literal
+/// `"` (the escaping form the `ContentDirectory` search grammar defines for quoted values). `None` --
+/// never a panic -- for anything that is not a complete, properly quoted literal: missing opening
+/// quote, an unterminated string, or non-whitespace trailing the closing quote.
+fn parse_search_quoted_string(s: &str) -> Option<String> {
+    let body = s.strip_prefix('"')?;
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '"' {
+            if chars.get(i + 1) == Some(&'"') {
+                out.push('"');
+                i += 2;
+                continue;
+            }
+            let trailing: String = chars[i + 1..].iter().collect();
+            return trailing.trim().is_empty().then_some(out);
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    None // No closing quote was ever found.
 }
 
 /// The DIDL-Lite `upnp:class` for one object -- what tells a renderer whether something is a folder
@@ -99,7 +202,7 @@ pub fn build_didl_lite(objects: &[DidlObject]) -> String {
     for o in objects {
         if o.class.is_container() {
             s.push_str(&format!(
-                "<container id=\"{}\" parentID=\"{}\" restricted=\"1\" searchable=\"0\">\
+                "<container id=\"{}\" parentID=\"{}\" restricted=\"1\" searchable=\"1\">\
                  <dc:title>{}</dc:title><upnp:class>{}</upnp:class></container>",
                 escape_xml(&o.id),
                 escape_xml(&o.parent_id),
@@ -138,16 +241,55 @@ pub fn build_browse_response(
     total_matches: u32,
     update_id: u32,
 ) -> String {
+    build_content_directory_response(
+        "BrowseResponse",
+        didl_lite,
+        number_returned,
+        total_matches,
+        update_id,
+    )
+}
+
+/// As [`build_browse_response`], for a `Search` response -- identical shape (`Result`,
+/// `NumberReturned`, `TotalMatches`, `UpdateID`), just with `SearchResponse` as the outer element name
+/// per the UPnP spec. Named `build_cd_search_response` rather than `build_search_response`: this
+/// crate's `message` module already exports a public `build_search_response` for a wholly different
+/// concept (an SSDP `M-SEARCH` reply), and the crate root re-exports both modules' public items, so a
+/// second same-named function here would not even compile.
+pub fn build_cd_search_response(
+    didl_lite: &str,
+    number_returned: u32,
+    total_matches: u32,
+    update_id: u32,
+) -> String {
+    build_content_directory_response(
+        "SearchResponse",
+        didl_lite,
+        number_returned,
+        total_matches,
+        update_id,
+    )
+}
+
+/// Shared shape behind [`build_browse_response`] and [`build_cd_search_response`] -- the two response
+/// bodies differ only in their outer element name.
+fn build_content_directory_response(
+    outer_element: &str,
+    didl_lite: &str,
+    number_returned: u32,
+    total_matches: u32,
+    update_id: u32,
+) -> String {
     format!(
         "<?xml version=\"1.0\"?>\
          <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
          s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
-         <s:Body><u:BrowseResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+         <s:Body><u:{outer_element} xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
          <Result>{}</Result>\
          <NumberReturned>{number_returned}</NumberReturned>\
          <TotalMatches>{total_matches}</TotalMatches>\
          <UpdateID>{update_id}</UpdateID>\
-         </u:BrowseResponse></s:Body></s:Envelope>",
+         </u:{outer_element}></s:Body></s:Envelope>",
         escape_xml(didl_lite),
     )
 }
@@ -365,5 +507,116 @@ mod tests {
         let escaped = escape_xml(original);
         assert!(!escaped.contains(['<', '>', '"', '\'']) || escaped.contains("&lt;"));
         assert_eq!(unescape_xml(&escaped), original);
+    }
+
+    #[test]
+    fn every_container_is_now_searchable() {
+        let objects = vec![DidlObject {
+            id: "1".into(),
+            parent_id: "0".into(),
+            title: "Movies".into(),
+            class: ObjectClass::StorageFolder,
+            resource: None,
+        }];
+        let didl = build_didl_lite(&objects);
+        assert!(didl.contains("searchable=\"1\""), "{didl}");
+        assert!(!didl.contains("searchable=\"0\""), "{didl}");
+    }
+
+    fn search_soap(
+        container_id: &str,
+        criteria: &str,
+        starting_index: &str,
+        count: &str,
+    ) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+             <s:Body><u:Search xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+             <ContainerID>{container_id}</ContainerID><SearchCriteria>{criteria}</SearchCriteria>\
+             <Filter>*</Filter><StartingIndex>{starting_index}</StartingIndex>\
+             <RequestedCount>{count}</RequestedCount><SortCriteria></SortCriteria>\
+             </u:Search></s:Body></s:Envelope>"
+        )
+    }
+
+    #[test]
+    fn a_wildcard_search_criteria_is_match_all() {
+        let req = parse_search_request(&search_soap("0", "*", "0", "0")).unwrap();
+        assert_eq!(req.container_id, "0");
+        assert_eq!(req.criteria, SearchCriteria::MatchAll);
+    }
+
+    #[test]
+    fn a_title_contains_search_criteria_is_parsed_case_preserving_and_unquoted() {
+        let req =
+            parse_search_request(&search_soap("0", "dc:title contains \"chernobyl\"", "0", "50"))
+                .unwrap();
+        assert_eq!(req.criteria, SearchCriteria::TitleContains("chernobyl".into()));
+        assert_eq!(req.starting_index, 0);
+        assert_eq!(req.requested_count, 50);
+    }
+
+    #[test]
+    fn a_doubled_quote_inside_the_search_string_is_unescaped_to_one_literal_quote() {
+        // UPnP's own quoting for a literal `"` inside a search string is `""`, not backslash-escaping.
+        let req = parse_search_request(&search_soap(
+            "0",
+            "dc:title contains \"a \"\"quoted\"\" word\"",
+            "0",
+            "0",
+        ))
+        .unwrap();
+        assert_eq!(req.criteria, SearchCriteria::TitleContains("a \"quoted\" word".into()));
+    }
+
+    #[test]
+    fn a_malformed_or_unrecognised_criteria_is_unsupported_not_a_failed_parse() {
+        // The full boolean grammar, an unsupported property, and a truncated quoted string are all
+        // real shapes a client could send that this bounded parser does not attempt -- each must
+        // still yield a well-formed `SearchRequest` (the other fields are still genuinely known),
+        // just with `SearchCriteria::Unsupported`, never `None` for the whole request.
+        for criteria in [
+            "dc:creator contains \"Nolan\"",
+            "dc:title contains \"unterminated",
+            "upnp:class derivedfrom \"object.item\"",
+            "dc:title contains \"a\" and dc:title contains \"b\"",
+        ] {
+            let req = parse_search_request(&search_soap("0", criteria, "0", "0")).unwrap();
+            assert_eq!(req.criteria, SearchCriteria::Unsupported, "{criteria}");
+        }
+    }
+
+    #[test]
+    fn a_missing_container_id_or_search_criteria_fails_the_whole_request() {
+        assert!(parse_search_request("<s:Body></s:Body>").is_none());
+        assert!(
+            parse_search_request("<s:Body><ContainerID>0</ContainerID></s:Body>").is_none(),
+            "no SearchCriteria at all"
+        );
+        assert!(
+            parse_search_request("<s:Body><SearchCriteria>*</SearchCriteria></s:Body>").is_none(),
+            "no ContainerID at all"
+        );
+    }
+
+    #[test]
+    fn missing_search_pagination_fields_default_rather_than_being_refused() {
+        let soap = "<s:Body><u:Search><ContainerID>0</ContainerID>\
+                     <SearchCriteria>*</SearchCriteria></u:Search></s:Body>";
+        let req = parse_search_request(soap).unwrap();
+        assert_eq!(req.starting_index, 0);
+        assert_eq!(req.requested_count, 0, "0 means unlimited, the correct absent-header default");
+    }
+
+    #[test]
+    fn a_search_response_carries_a_search_response_outer_element_not_browse() {
+        let didl = build_didl_lite(&[]);
+        let response = build_cd_search_response(&didl, 2, 5, 3);
+        assert!(response.contains("<u:SearchResponse"), "{response}");
+        assert!(response.contains("</u:SearchResponse>"), "{response}");
+        assert!(!response.contains("BrowseResponse"), "{response}");
+        assert!(response.contains("<NumberReturned>2</NumberReturned>"));
+        assert!(response.contains("<TotalMatches>5</TotalMatches>"));
+        assert!(response.contains("<UpdateID>3</UpdateID>"));
     }
 }
