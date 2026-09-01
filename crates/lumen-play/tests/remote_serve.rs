@@ -771,6 +771,14 @@ fn hls_playlist_and_segments_are_generated_lazily_cached_and_authenticated() {
     let outsider = outside.0.join("Secret.mkv");
     std::fs::write(&outsider, b"not in the library").unwrap();
 
+    // `$init` (the value following `-hls_fmp4_init_filename`) is a bare file name, not a path --
+    // `lumen_segment::command::build_command` gives ffmpeg only "init.mp4", matching a real ffmpeg
+    // build's own behavior (confirmed against ffmpeg 6.1.1): unlike `-hls_segment_filename` and the
+    // playlist path, which it honors as given even when absolute, its HLS muxer resolves
+    // `-hls_fmp4_init_filename` relative to the output's own directory regardless -- an absolute
+    // value there is naively concatenated onto that directory rather than replacing it, which is
+    // exactly the bug a real-ffmpeg test in `lumen-segment` now exists to catch. This fake script
+    // mirrors that same resolution rule (`$dir/$init`) rather than treating `$init` as standalone.
     let log_path = dir.0.join("ffmpeg-invocations.log");
     let fake_ffmpeg = dir.0.join("fake-ffmpeg.sh");
     std::fs::write(
@@ -789,7 +797,7 @@ fn hls_playlist_and_segments_are_generated_lazily_cached_and_authenticated() {
              printf 'seg0' > \"$dir/seg_00000.m4s\"\n\
              printf 'seg1' > \"$dir/seg_00001.m4s\"\n\
              printf 'seg2' > \"$dir/seg_00002.m4s\"\n\
-             printf 'init' > \"$init\"\n\
+             printf 'init' > \"$dir/$init\"\n\
              printf '#EXTM3U\\n' > \"$last\"\n\
              printf '#EXT-X-VERSION:7\\n' >> \"$last\"\n\
              printf '#EXT-X-TARGETDURATION:6\\n' >> \"$last\"\n\

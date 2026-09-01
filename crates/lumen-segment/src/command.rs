@@ -47,11 +47,19 @@ impl HlsSegmentJob {
     fn segment_filename_pattern(&self) -> PathBuf {
         self.output_dir.join(format!("seg_%05d.{}", self.format.segment_extension()))
     }
-
-    fn init_segment_path(&self) -> PathBuf {
-        self.output_dir.join("init.mp4")
-    }
 }
+
+/// The value ffmpeg's `-hls_fmp4_init_filename` is given. Deliberately a bare file name, never
+/// `output_dir` joined onto it -- confirmed against a real ffmpeg build (6.1.1), not just read from
+/// its docs: unlike `-hls_segment_filename` and the main playlist path, both of which the HLS muxer
+/// honors as given (including a full absolute path), an *absolute* `-hls_fmp4_init_filename` is
+/// naively concatenated onto the output's own directory rather than replacing it, producing a
+/// doubled, nonexistent path (`<output_dir>/<output_dir>/init.mp4`) and a hard "Could not write
+/// header" failure -- silent to every test in this crate that only ever exercised a fake `ffmpeg`
+/// shell script, which does not reproduce a real muxer's own path-resolution quirks. A bare name
+/// lands exactly where this crate wants it anyway, since ffmpeg resolves it relative to
+/// `playlist_path()`'s own directory -- which *is* `output_dir`.
+const INIT_SEGMENT_FILENAME: &str = "init.mp4";
 
 /// Builds the full `ffmpeg` argument list for `job` -- pure and side-effect-free, exactly like
 /// `lumen_exec::build_command`, so every case is testable without a real `ffmpeg` binary anywhere.
@@ -77,7 +85,7 @@ pub fn build_command(job: &HlsSegmentJob) -> Vec<String> {
             "-hls_segment_type".to_string(),
             "fmp4".to_string(),
             "-hls_fmp4_init_filename".to_string(),
-            job.init_segment_path().to_string_lossy().into_owned(),
+            INIT_SEGMENT_FILENAME.to_string(),
         ]);
     }
 
@@ -193,7 +201,13 @@ mod tests {
     fn fmp4_segments_declare_an_init_filename_and_the_fmp4_segment_type() {
         let args = build_command(&job(SegmentFormat::Fmp4));
         assert!(args.windows(2).any(|w| w == ["-hls_segment_type", "fmp4"]));
-        assert!(args.iter().any(|a| a.ends_with("init.mp4")));
+        // Bare, not `output_dir` joined onto it -- see `INIT_SEGMENT_FILENAME`'s own doc comment for
+        // why: a real ffmpeg build resolves an absolute value here relative to its own output
+        // directory regardless, producing a doubled path and a hard failure.
+        assert!(
+            args.windows(2).any(|w| w == ["-hls_fmp4_init_filename", "init.mp4"]),
+            "the init filename must be exactly the bare literal \"init.mp4\": {args:?}"
+        );
         assert!(args.iter().any(|a| a.ends_with("seg_%05d.m4s")));
     }
 
@@ -277,6 +291,131 @@ mod tests {
         };
         let err = execute(&job, &fake_ffmpeg).unwrap_err();
         assert!(matches!(err, HlsExecError::NoSegmentsProduced));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every other test above proves `build_command`'s output parses and `execute` spawns/verifies
+    /// correctly -- against a FAKE ffmpeg that ignores its real arguments. This is the one test that
+    /// exercises a genuine ffmpeg build, and it is what actually caught the bug
+    /// [`INIT_SEGMENT_FILENAME`]'s own doc comment describes: a real HLS muxer's own path-resolution
+    /// quirk (`-hls_fmp4_init_filename` given as an absolute path is naively concatenated onto
+    /// `output_dir`, not honored as-is, unlike `-hls_segment_filename` and the playlist path) that
+    /// every fake-ffmpeg test in this file was structurally unable to notice. Skipped, not failed,
+    /// when `ffmpeg`/`ffprobe` are not on `PATH` -- the same "this is infrastructure, not a defect"
+    /// convention `lumen-play`'s own mpv-dependent tests already use.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_ffmpeg_build_produces_a_valid_playable_fmp4_init_and_segment() {
+        if !std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipping: ffmpeg is not on PATH in this environment");
+            return;
+        }
+        if !std::process::Command::new("ffprobe")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipping: ffprobe is not on PATH in this environment");
+            return;
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("lumen-segment-real-ffmpeg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // A short, real, stream-copyable source -- encoded with ffmpeg itself (via lavfi test
+        // sources) so this test needs no other tool on `PATH`.
+        let source = dir.join("source.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=10:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                source.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg must be runnable to encode the source");
+        assert!(status.success(), "encoding the real source file failed");
+
+        let job = HlsSegmentJob {
+            source,
+            output_dir: out_dir.clone(),
+            playlist_name: "playlist.m3u8".into(),
+            segment_seconds: 6,
+            format: SegmentFormat::Fmp4,
+        };
+        let outcome = execute(&job, Path::new("ffmpeg"))
+            .expect("a real ffmpeg build must accept exactly what build_command produces");
+        assert!(outcome.segment_count >= 1);
+
+        let init = out_dir.join(INIT_SEGMENT_FILENAME);
+        let seg = out_dir.join("seg_00000.m4s");
+        assert!(init.is_file(), "a bare -hls_fmp4_init_filename must land inside output_dir");
+        assert!(seg.is_file());
+
+        // The real proof: concatenate the real init segment with the real first media segment --
+        // exactly how a CMAF/fMP4 player consumes them -- and confirm `ffprobe` (a second,
+        // independent real tool) reads back a genuinely valid, playable file carrying the source's
+        // own stream-copied codecs, not just "some bytes landed on disk".
+        let combined = dir.join("combined.mp4");
+        let mut bytes = std::fs::read(&init).unwrap();
+        bytes.extend(std::fs::read(&seg).unwrap());
+        std::fs::write(&combined, &bytes).unwrap();
+
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type,codec_name",
+                "-of",
+                "csv=p=0",
+                combined.to_str().unwrap(),
+            ])
+            .output()
+            .expect("ffprobe must be runnable");
+        assert!(
+            probe.status.success(),
+            "ffprobe rejected the reassembled init+segment: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        let out = String::from_utf8_lossy(&probe.stdout);
+        // Column order in ffprobe's csv output is not being relied on here -- just that some line
+        // names both the right codec_type and the right codec_name together.
+        assert!(
+            out.lines().any(|l| l.contains("h264") && l.contains("video")),
+            "expected a stream-copied h264 video stream:\n{out}"
+        );
+        assert!(
+            out.lines().any(|l| l.contains("aac") && l.contains("audio")),
+            "expected a stream-copied aac audio stream:\n{out}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
