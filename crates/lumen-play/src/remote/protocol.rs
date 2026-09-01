@@ -80,8 +80,10 @@ pub enum ClientMessage {
     /// the legitimate MVP, distinct from (and a smaller slice than) the persisted, incremental
     /// `lumen-index`-backed engine the rest of that section describes and this does not attempt: no
     /// on-disk index, no diffing against a previous run, just a fresh scan replacing the in-memory one
-    /// `server.rs` already holds. A background filesystem watcher stays the honest phase-2 item that
-    /// section already names, not something this pretends to be.
+    /// `server.rs` already holds. This is also what `server.rs`'s background filesystem watcher
+    /// (`spawn_library_watcher`) calls automatically once a burst of on-disk changes settles — this
+    /// message and that watcher share one `rescan_library` function, so a client that asks explicitly
+    /// and a change that happens on its own produce identically-shaped results.
     Rescan {
         id: String,
     },

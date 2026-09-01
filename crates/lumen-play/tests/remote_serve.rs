@@ -825,6 +825,298 @@ fn rescan_makes_library_version_real_and_reflects_a_newly_added_file() {
     let _ = server.wait();
 }
 
+/// Spawns a real `lumen serve` pointed at `dir`, waits for its pairing code and TLS fingerprint on
+/// stdout, then pairs and hands back the ready connection -- the exact startup sequence
+/// `rescan_makes_library_version_real_and_reflects_a_newly_added_file` above already performs once,
+/// factored out here because both automatic-rescan tests below need to repeat it verbatim.
+fn spawn_paired_server(dir: &std::path::Path, port: u16) -> (KillOnDrop, ClientTls) {
+    let config_dir = dir.join("config");
+    let bin = env!("CARGO_BIN_EXE_lumen");
+    let mut server = KillOnDrop(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                dir.to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--",
+                "--vo=null",
+                "--ao=null",
+                "--force-window=no",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("APPDATA", &config_dir)
+            .env("HOME", &config_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("lumen must be runnable"),
+    );
+
+    if let Some(stderr) = server.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[lumen serve stderr] {line}");
+            }
+        });
+    }
+
+    let stdout = server.stdout.take().unwrap();
+    let mut lines = BufReader::new(stdout).lines();
+    let mut code = None;
+    let mut fingerprint = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let Some(Ok(line)) = lines.next() else { break };
+        println!("[lumen serve stdout] {line}");
+        if let Some(rest) = line.strip_prefix("pairing code: ") {
+            code = Some(rest.split_whitespace().next().unwrap().to_string());
+        }
+        if let Some(rest) = line.strip_prefix("tls fingerprint: ") {
+            fingerprint = Some(rest.split("  ").next().unwrap().to_string());
+        }
+        if code.is_some() && fingerprint.is_some() {
+            break;
+        }
+    }
+    let code = code.expect("the server must print a pairing code on startup");
+    let fingerprint = fingerprint.expect("the server must print a TLS fingerprint on startup");
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            println!("[lumen serve stdout] {line}");
+        }
+    });
+
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let mut tls = connect_tls(port, &fingerprint, Duration::from_secs(10));
+    tls.write_all(request("1", &format!("\"type\":\"pair\",\"code\":\"{code}\"")).as_bytes())
+        .unwrap();
+    let paired = read_reply(&mut tls);
+    assert_eq!(paired.ty().as_deref(), Some("paired"));
+
+    (server, tls)
+}
+
+/// A short read timeout on `tls`'s own socket, so a poll loop waiting on this connection can retry
+/// rather than block forever. Needed because the server only ever pushes a fresh `state` line when
+/// something in it actually changed (see `handle_connection`) -- unlike `read_message` elsewhere in
+/// this file, which assumes a reply is always imminent, a test proving "nothing further happens"
+/// has to time out gracefully instead of hanging on a line that is never coming.
+fn set_poll_timeout(tls: &mut ClientTls) {
+    tls.sock
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("setting a socket read timeout must not fail");
+}
+
+/// Mirrors `server.rs`'s own `is_timeout` exactly: `WouldBlock` is Unix's spelling of a timed-out
+/// socket read, `TimedOut` is Windows'.
+fn is_client_timeout(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
+}
+
+/// One line, tolerating a timed-out read (nothing new yet) rather than panicking on it -- `None` in
+/// that case. Requires [`set_poll_timeout`] to have been called on `tls` already, or this blocks
+/// exactly like `read_message` does.
+fn try_read_message(tls: &mut ClientTls) -> Option<Reply> {
+    let mut line = String::new();
+    match tls.read_line(&mut line) {
+        Ok(0) => panic!("connection closed while a message was expected"),
+        Ok(_) => Some(Reply::parse(&line)),
+        Err(e) if is_client_timeout(&e) => None,
+        Err(e) => panic!("unexpected I/O error reading from the server: {e}"),
+    }
+}
+
+/// Polls `tls` until a `state` push carries a `library_version` different from `since`, or `timeout`
+/// elapses (`None` on timeout). A deadline loop, not a sleep-and-hope -- the same convention every
+/// other wait in this file already follows for server-side async behaviour whose timing is this
+/// test's to observe, not to control.
+fn wait_for_library_version_change(
+    tls: &mut ClientTls,
+    since: Option<u64>,
+    timeout: Duration,
+) -> Option<u64> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let Some(msg) = try_read_message(tls) else { continue };
+        if msg.ty().as_deref() == Some("state") {
+            let v = num_in(&msg.0, "library_version").map(|n| n as u64);
+            if v != since {
+                return v;
+            }
+        }
+    }
+    None
+}
+
+/// Every distinct `library_version` a `state` push carries over `window`, in the order first seen --
+/// used to tell "a burst of filesystem events was coalesced into exactly one rescan" (one entry) apart
+/// from "several rescans raced each other" (more than one). Consecutive-value dedup is enough because
+/// `library_version` only ever increases -- see `rescan_library`'s own `fetch_add`.
+fn distinct_library_versions_over(tls: &mut ClientTls, window: Duration) -> Vec<u64> {
+    let deadline = std::time::Instant::now() + window;
+    let mut seen: Vec<u64> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let Some(msg) = try_read_message(tls) else { continue };
+        if msg.ty().as_deref() == Some("state") {
+            if let Some(v) = num_in(&msg.0, "library_version").map(|n| n as u64) {
+                if seen.last() != Some(&v) {
+                    seen.push(v);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Sends a `library` request and returns the raw reply line -- needed where a test wants to see
+/// inside the array `ReplyBody::Library` carries, which `serde_json_lite`'s array parsing (see its own
+/// comment) deliberately discards. A raw substring check on the file name is enough to confirm a
+/// specific entry is listed without teaching the probe parser to understand arrays just for this.
+fn library_reply_raw(tls: &mut ClientTls, id: &str) -> String {
+    tls.write_all(request(id, "\"type\":\"library\"").as_bytes()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let mut line = String::new();
+        match tls.read_line(&mut line) {
+            Ok(0) => panic!("connection closed while a message was expected"),
+            Ok(_) => {
+                let reply = Reply::parse(&line);
+                if reply.ty().as_deref() != Some("state") {
+                    return line;
+                }
+            }
+            Err(e) if is_client_timeout(&e) => continue,
+            Err(e) => panic!("unexpected I/O error reading from the server: {e}"),
+        }
+    }
+    panic!("no library reply arrived within the deadline");
+}
+
+/// Proves `docs/15` §A's phase-2 item: `library_version` moves on its own when a file appears on disk,
+/// with no client ever sending a `rescan` message. Everything else about the manual trigger is already
+/// covered by `rescan_makes_library_version_real_and_reflects_a_newly_added_file` above; this test's
+/// whole point is what happens to the same number when nobody asks.
+#[test]
+fn an_unprompted_filesystem_change_triggers_an_automatic_rescan() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("watch-single");
+    // A dummy file is enough -- `scan::scan` classifies by extension and name, not by successfully
+    // decoding the bytes (see `scan.rs`'s own `VIDEO_EXTS` doc comment), and this test never plays
+    // anything. Real mpv is still required because `server::run` unconditionally spawns an idle mpv
+    // regardless of what the library actually contains.
+    std::fs::write(dir.0.join("Existing.mkv"), b"not a real container, just needs to exist")
+        .unwrap();
+    let port = 29500 + (std::process::id() % 4000) as u16;
+    let (mut server, mut tls) = spawn_paired_server(&dir.0, port);
+    set_poll_timeout(&mut tls);
+
+    // The very first unprompted state push must still start at version 0 -- same invariant the
+    // manual-rescan test above already proves, re-checked here because this test's premise is what
+    // happens to that number *without* a `rescan` message ever being sent.
+    let initial = wait_for_library_version_change(&mut tls, None, Duration::from_secs(10));
+    assert_eq!(initial, Some(0), "library_version must start at 0");
+
+    // Drop a new real file into the library on disk. No `rescan` message is sent anywhere in this
+    // test -- if the version ever moves, the watcher is what moved it.
+    std::fs::write(dir.0.join("AutoDetected.mkv"), b"not a real container, just needs to exist")
+        .unwrap();
+
+    // `WATCHER_DEBOUNCE` (1.5s) plus real walk time, generously bounded -- a poll loop, not a fixed
+    // sleep, proves "it happens", not just "it happens within some sleep duration this test picked".
+    let bumped = wait_for_library_version_change(&mut tls, Some(0), Duration::from_secs(10));
+    assert_eq!(
+        bumped,
+        Some(1),
+        "the watcher must bump library_version on its own once the new file settles"
+    );
+
+    // Confirm the fresh walk actually saw the new file, not just that some counter moved.
+    let library = library_reply_raw(&mut tls, "lib1");
+    assert!(
+        library.contains("AutoDetected.mkv"),
+        "the library listing after an automatic rescan must include the newly dropped file: {library}"
+    );
+
+    // No self-triggered loop: a rescan itself writes nothing into the watched directory (it only
+    // replaces an in-memory `Scan` and bumps an `AtomicU64`), so once the change above has settled,
+    // the version must sit still rather than keep climbing on its own.
+    let after_settling = distinct_library_versions_over(&mut tls, Duration::from_secs(5));
+    assert!(
+        after_settling.is_empty(),
+        "library_version must not keep climbing once nothing further has changed on disk: saw {after_settling:?}"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// Proves the debounce actually debounces: several files written back to back (a small burst, the way
+/// a real multi-file copy or extraction would produce) collapse into exactly one automatic rescan that
+/// reflects all of them, not several racing rescans each catching a different partial state of the
+/// burst.
+#[test]
+fn a_burst_of_new_files_is_coalesced_into_one_automatic_rescan() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("watch-burst");
+    std::fs::write(dir.0.join("Existing.mkv"), b"not a real container, just needs to exist")
+        .unwrap();
+    let port = 34000 + (std::process::id() % 4000) as u16;
+    let (mut server, mut tls) = spawn_paired_server(&dir.0, port);
+    set_poll_timeout(&mut tls);
+
+    let initial = wait_for_library_version_change(&mut tls, None, Duration::from_secs(10));
+    assert_eq!(initial, Some(0), "library_version must start at 0");
+
+    // Write several files back to back, with no delay between them -- the burst a batch copy or
+    // archive extraction produces, and exactly the shape a per-event (rather than debounced) rescan
+    // trigger would answer with several overlapping walks instead of one.
+    const BURST_FILES: [&str; 4] = ["Burst0.mkv", "Burst1.mkv", "Burst2.mkv", "Burst3.mkv"];
+    for name in BURST_FILES {
+        std::fs::write(dir.0.join(name), b"not a real container, just needs to exist").unwrap();
+    }
+
+    let bumped = wait_for_library_version_change(&mut tls, Some(0), Duration::from_secs(10));
+    assert_eq!(
+        bumped,
+        Some(1),
+        "a whole burst written back to back must still only bump the version once"
+    );
+
+    // The one rescan the burst triggered must have seen every file in it, not just the first or the
+    // last to land -- proof this is a single walk after the burst settled, not a walk that started
+    // partway through it.
+    let library = library_reply_raw(&mut tls, "lib1");
+    for name in BURST_FILES {
+        assert!(
+            library.contains(name),
+            "the post-burst library listing must include every file from the burst, missing {name}: {library}"
+        );
+    }
+
+    // The real proof the debounce coalesced the burst rather than merely happening to settle on the
+    // same value: no *other* version was ever observed in between -- not 2, not 3, not one per file.
+    let after_settling = distinct_library_versions_over(&mut tls, Duration::from_secs(5));
+    assert!(
+        after_settling.is_empty(),
+        "a coalesced burst must produce exactly one version transition, with nothing further \
+         afterward: saw {after_settling:?} beyond it"
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
 /// A second, distinctly-named real encoded clip, for the rescan test's "a file appeared after startup"
 /// scenario -- kept separate from `encode_probe_file` rather than parameterizing it, since every other
 /// call site wants exactly `Probe.mkv` and gains nothing from a filename argument threaded through it.

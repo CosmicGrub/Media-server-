@@ -31,21 +31,46 @@ holds; only the storage engine changed.
 `lumen scan` and `lumen serve` both call the same walker in
 [`lumen-play/src/scan.rs`](../crates/lumen-play/src/scan.rs), and it is **stateless**: every
 invocation re-walks the tree and re-probes every file from zero. `server.rs` holds the result as
-`library: Arc<Mutex<Scan>>` — one snapshot taken at startup, held in memory, never refreshed unless a
-client asks. The wire protocol already has a `library_version: u64` field on `PlaybackState`
+`library: Arc<Mutex<Scan>>` — one snapshot taken at startup, held in memory. The wire protocol already
+has a `library_version: u64` field on `PlaybackState`
 ([`protocol.rs`](../crates/lumen-play/src/remote/protocol.rs)) — its own doc comment says a client
 uses it "to cheaply decide whether its cached listing is stale."
 
-**Update: the manual-trigger half of this is done, the persisted/incremental half below is not.**
-`ClientMessage::Rescan` now re-walks `library_root` on request, replaces the in-memory `Scan`, and
-bumps a real `ServerContext::library_version` that every subsequent `PlaybackState` push carries — the
-exact "periodic re-diff on `serve` startup plus the manual command is a legitimate MVP" shape this
-section's own CLI note below already pre-approved. What is **not** built: no `lumen-index` wiring into
-`serve` (still only reachable via the separate `lumen reindex`/`lumen verify` subcommands), no
-persisted on-disk index, no diff against a previous run (every rescan re-probes everything and bumps
-the version whether anything actually changed or not), and no automatic re-diff on `serve` startup —
-a rescan only happens when a client explicitly asks. The rest of this section (the real design below)
-is the larger engine that would close those, and remains what it always was: designed, not built.
+**Update: the manual-trigger half of this is done, a real filesystem watcher on top of it is now also
+done, and the persisted/incremental half below is still not.** `ClientMessage::Rescan` re-walks
+`library_root` on request, replaces the in-memory `Scan`, and bumps a real
+`ServerContext::library_version` that every subsequent `PlaybackState` push carries — the exact
+"periodic re-diff on `serve` startup plus the manual command is a legitimate MVP" shape this section's
+own CLI note below already pre-approved. On top of that manual trigger, `server.rs`'s
+`spawn_library_watcher` now runs a background thread (`notify`, recursive, the platform-recommended
+backend) that calls the same rescan path automatically whenever the library actually changes on disk,
+debounced so a burst of raw filesystem events (a multi-file copy, or one file's own
+create+write+close sequence) collapses into a single rescan rather than one per event. Both triggers
+share one function — `rescan_library` — so there is exactly one definition of what a rescan does,
+manual or automatic. A watcher that fails to start (permission denied, an exhausted inotify watch
+limit, an unsupported filesystem) logs a warning and leaves automatic refresh absent for that session;
+the manual command still works either way, and `lumen serve` itself never fails to start over it. What
+is **still not** built: no `lumen-index` wiring into `serve` (still only reachable via the separate
+`lumen reindex`/`lumen verify` subcommands), no persisted on-disk index, and no diff against a
+previous run — every rescan, manual or watcher-triggered, re-probes everything and bumps the version
+whether anything actually changed or not; catching genuinely nothing-changed and skipping the bump (or
+skipping re-probing files whose `(path, size, mtime)` didn't move) is exactly the incremental piece the
+design below still describes and this still does not attempt. The rest of this section (the real
+design below) is the larger engine that would close that, and remains what it always was: designed,
+not built.
+
+One real bug the watcher's own live end-to-end test caught, worth naming because the reasoning below
+in this section's original CLI note got it wrong: "a rescan itself doesn't write to the watched
+directory" is true but not sufficient for "a rescan can't retrigger the watcher". `rescan_library`'s
+walk *opens and reads* every file to sniff its header (`scan.rs`'s own module doc: "decides what each
+file actually is by reading its first bytes"), and on Linux `notify`'s inotify backend watches
+`IN_OPEN`/`IN_CLOSE` right alongside real content changes by default — without filtering those out,
+every rescan's own read of the library it had just walked looked exactly like a fresh external change,
+and the watcher rescanned itself in an unbroken loop. The fix is filtering out `notify::EventKind::Access`
+(open/read/close, nothing created, written, removed, or renamed) everywhere the watcher looks at an
+event, both when deciding whether a burst has started and when deciding whether one is still ongoing.
+Confirmed fixed by a live test that keeps watching well past the point a burst should have settled and
+asserts `library_version` does not keep climbing on its own.
 
 Separately: `lumen-meta` (provider fragments, artwork selection, field merge with provenance) and
 `lumen-subs` (subtitle acquisition ladder, sync correction) are both fully built, independently
@@ -87,10 +112,18 @@ never abort a 20,000-file re-index. Per-file probe/match/enrich failures are rec
 
 **CLI**: `lumen serve <path> --index <db-path>` — opt-in, so the existing stateless mode keeps
 working unchanged for anyone who doesn't want a database file sitting in their library.
-`lumen reindex <path>` for a manual trigger. A live filesystem watcher (`notify` crate) is real, but
-deliberately **out of scope for the first cut** — periodic re-diff on `serve` startup plus the manual
-command is a legitimate MVP, and a background watcher is the honest phase-2 item, not something to
-claim as done before it exists.
+`lumen reindex <path>` for a manual trigger.
+
+**Update: the live filesystem watcher named below is no longer a future item — it exists, today, for
+the in-memory rescan this section's own Update note above describes.** `server.rs`'s
+`spawn_library_watcher` uses the `notify` crate exactly as originally proposed here (recursive,
+platform-recommended backend, debounced) to trigger `rescan_library` automatically. What it does *not*
+do is anything `--index <db-path>` above describes — it has no persisted index to diff against, no
+`(path, size, mtime)` skip-unchanged-files check, and nothing wired to `lumen-index`; it triggers
+exactly the same full in-memory re-walk the manual `rescan` command already performed, just
+automatically instead of only on request. A watcher that *also* drives the incremental, persisted
+engine below — reacting to a change by diffing and re-probing only what moved, rather than by
+re-walking and re-probing everything — is still designed, not built.
 
 **New wire messages**, once search is cheap because the index is real:
 `ClientMessage::Search { id, query }` → `ReplyBody::SearchResults(Vec<LibraryEntry>)`, matched

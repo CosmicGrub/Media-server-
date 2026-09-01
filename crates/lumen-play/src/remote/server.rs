@@ -31,6 +31,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use notify::Watcher;
+
 use crate::ipc::{self, Mpv};
 use crate::remote::pairing::{self, AttemptLimiter, PairResult, PendingCode, TokenStore};
 use crate::remote::protocol::{
@@ -55,6 +57,17 @@ const MPV_POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// reading back as "unknown" for one 400ms cycle is a far smaller cost than a client's command
 /// appearing to hang for seconds.
 const STATE_POLL_PROPERTY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long the library filesystem watcher waits, after the most recent change event, before it
+/// actually rescans — `docs/15` §A's automatic-rescan phase-2 item. A single logical change (a
+/// batch copy of dozens of files, or even one file's own create+write+close sequence on some
+/// platforms and filesystems) arrives as a burst of many raw events; without coalescing them, a
+/// 50-file copy would trigger up to 50 overlapping full re-walks racing each other instead of one
+/// that sees the finished result. 1.5 seconds is comfortably longer than the gap between events
+/// within one such burst (they land within milliseconds of each other) while still being short
+/// enough that a person watching a single dropped-in file appear sees it show up in about the time
+/// it takes to glance back at the screen, not something that reads as "did it even notice."
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(1500);
 
 type TlsStream = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
@@ -233,9 +246,11 @@ struct ServerContext {
     dash_active_readers: Mutex<HashMap<String, u32>>,
     /// Backs `PlaybackState::library_version` — see that field's own doc comment and `docs/15` §A.
     /// Starts at 0, the same value every state push already carried before this existed; bumped once
-    /// per completed [`ClientMessage::Rescan`], never on the free-running `MPV_POLL_INTERVAL` poll
-    /// that reads it. `drive_mpv` only ever loads this — `dispatch`'s `Rescan` arm is the one writer,
-    /// so there is exactly one place a client-visible version bump can come from.
+    /// per completed rescan, never on the free-running `MPV_POLL_INTERVAL` poll that reads it.
+    /// `drive_mpv` only ever loads this — `rescan_library` is the one function that ever writes it,
+    /// called both from a client's own [`ClientMessage::Rescan`] and from the background filesystem
+    /// watcher (see `spawn_library_watcher`), so there is exactly one place a client-visible version
+    /// bump can come from regardless of which trigger caused it.
     library_version: Arc<AtomicU64>,
 }
 
@@ -370,6 +385,12 @@ pub fn run(
         dash_active_readers: Mutex::new(HashMap::new()),
         library_version,
     });
+
+    // `docs/15` §A's automatic-rescan phase-2 item, on top of the manual `ClientMessage::Rescan`
+    // trigger built above. Spawned after `ctx` exists so it can share the exact same `Arc` the TCP
+    // accept loop below hands each connection — never fatal to `run()` itself: see
+    // `spawn_library_watcher`'s own doc comment for why.
+    spawn_library_watcher(Arc::clone(&ctx), Arc::clone(&log));
 
     let listener = TcpListener::bind((bind, port))
         .map_err(|e| format!("cannot listen on {bind}:{port}: {e}"))?;
@@ -751,14 +772,135 @@ fn dispatch(msg: ClientMessage, ctx: &ServerContext, authed: &mut bool) -> Serve
         // routing it through that channel would block every other client's commands behind it for as
         // long as the walk takes.
         ClientMessage::Rescan { .. } => {
-            let fresh =
-                scan::scan(std::slice::from_ref(&ctx.library_root), &ScanOptions::default());
-            let file_count = fresh.playable().count() as u64;
-            *ctx.library.lock().unwrap() = fresh;
-            let library_version = ctx.library_version.fetch_add(1, Ordering::AcqRel) + 1;
+            let (file_count, library_version) = rescan_library(ctx);
             ServerMessage::Reply { id, result: ReplyBody::Rescan { file_count, library_version } }
         }
     }
+}
+
+/// Re-walk `ctx.library_root`, replace the in-memory `Scan` every `Library`/`Play` request reads
+/// from, and bump `ctx.library_version` — the one place either actually happens. Both
+/// [`ClientMessage::Rescan`]'s dispatch arm above and the background filesystem watcher
+/// (`spawn_library_watcher`) call this rather than each doing their own walk-and-bump, so a manual
+/// rescan and an automatic one can never drift into two different definitions of what a rescan does.
+/// Returns `(file_count, library_version)` — the same pair `ReplyBody::Rescan` already carries back
+/// to a client that asked directly, and what a watcher-triggered rescan logs for an operator watching
+/// the terminal.
+fn rescan_library(ctx: &ServerContext) -> (u64, u64) {
+    let fresh = scan::scan(std::slice::from_ref(&ctx.library_root), &ScanOptions::default());
+    let file_count = fresh.playable().count() as u64;
+    *ctx.library.lock().unwrap() = fresh;
+    let library_version = ctx.library_version.fetch_add(1, Ordering::AcqRel) + 1;
+    (file_count, library_version)
+}
+
+/// Starts a background thread that watches `ctx.library_root` for filesystem changes and triggers
+/// [`rescan_library`] automatically, once a burst of events has gone quiet — `docs/15` §A names this
+/// "the honest phase-2 item" on top of the manual `ClientMessage::Rescan` trigger. Uses `notify`'s own
+/// recommended backend per platform (inotify on Linux, `ReadDirectoryChangesW` on Windows, FSEvents on
+/// macOS) in recursive mode, so a change anywhere under the library root — not just directly inside
+/// it — is seen.
+///
+/// Never fails `run()` itself. Initializing a watcher or starting the watch can fail for reasons
+/// entirely outside this server's control — permission denied, an exhausted inotify watch limit, an
+/// unsupported filesystem — and none of those are reasons the rest of `lumen serve` should refuse to
+/// start. This mirrors the exact posture `run()` already takes with `hls_cache_root`/`dash_cache_root`
+/// creation and `ffmpeg_bin` resolution: log a clear warning and continue running with that one piece
+/// of functionality degraded or absent, never abort the whole server over it. Here, "absent" means
+/// automatic refresh simply does not happen — the manual `rescan` command a client can already send is
+/// still there as the fallback it already was before this function existed.
+fn spawn_library_watcher(ctx: Arc<ServerContext>, log: Arc<dyn Fn(&str) + Send + Sync>) {
+    let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = match notify::recommended_watcher(tx) {
+        Ok(w) => w,
+        Err(e) => {
+            log(&format!(
+                "warning: could not start the library filesystem watcher ({e}); automatic rescans \
+                 are disabled for this session — the manual `rescan` command still works"
+            ));
+            return;
+        }
+    };
+    if let Err(e) = watcher.watch(&ctx.library_root, notify::RecursiveMode::Recursive) {
+        log(&format!(
+            "warning: could not watch {} for changes ({e}); automatic rescans are disabled for this \
+             session — the manual `rescan` command still works",
+            ctx.library_root.display()
+        ));
+        return;
+    }
+    log(&format!("watching {} for library changes", ctx.library_root.display()));
+
+    std::thread::spawn(move || {
+        // The watcher must outlive every event this thread ever reads from `rx` — dropping it would
+        // stop delivery immediately, the same "must outlive its user" shape `Mpv`'s own IPC
+        // connection has in `drive_mpv`. Moving it into this closure, never let go of until the
+        // thread itself exits, is what keeps it alive for exactly that long and no longer.
+        let _watcher = watcher;
+        loop {
+            // Block for the first event that actually means something changed. `EventKind::Access`
+            // (a plain open/read/close, nothing created, written, removed, or renamed) is filtered
+            // out here and below, not just as an optimization: `rescan_library`'s own walk opens
+            // every file to sniff its header (see `scan.rs`'s module doc), and on Linux `notify`'s
+            // inotify backend watches `IN_OPEN`/`IN_CLOSE` right alongside real changes. Without
+            // this filter, every rescan's own read of the library it had just walked would look
+            // exactly like a fresh external change, and this loop would never stop rescanning
+            // itself — a real self-triggering loop this feature's own live test caught by actually
+            // running long enough to notice, not something reasoning about "a rescan doesn't write
+            // to the watched directory" alone would have surfaced.
+            loop {
+                let event = match rx.recv() {
+                    Ok(event) => event,
+                    Err(_) => {
+                        log(
+                            "library watcher: event channel closed; automatic rescans are disabled \
+                             for the rest of this session",
+                        );
+                        return;
+                    }
+                };
+                match event {
+                    Ok(e) if e.kind.is_access() => continue,
+                    Ok(_) => break,
+                    Err(e) => {
+                        log(&format!("library watcher: event error: {e}"));
+                        continue;
+                    }
+                }
+            }
+            // Keep waiting for `WATCHER_DEBOUNCE` past the most recent *real* event, not the first —
+            // this is what coalesces a burst (a multi-file copy, or one file's own create+write+close
+            // sequence) into a single rescan instead of one per raw event. Tracked as an explicit
+            // deadline rather than simply looping `recv_timeout(WATCHER_DEBOUNCE)` so that an
+            // `Access` event arriving during the wait is discarded without pushing the deadline back
+            // out, for the same self-triggering reason it was filtered out above.
+            let mut deadline = std::time::Instant::now() + WATCHER_DEBOUNCE;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(Ok(e)) if e.kind.is_access() => {}
+                    Ok(Ok(_)) => deadline = std::time::Instant::now() + WATCHER_DEBOUNCE,
+                    Ok(Err(e)) => log(&format!("library watcher: event error: {e}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        log(
+                            "library watcher: event channel closed; automatic rescans are disabled \
+                             for the rest of this session",
+                        );
+                        return;
+                    }
+                }
+            }
+            let (file_count, library_version) = rescan_library(&ctx);
+            log(&format!(
+                "library watcher: filesystem change detected -> rescanned, {file_count} playable \
+                 files, library_version now {library_version}"
+            ));
+        }
+    });
 }
 
 /// Seconds from now until `target`. Negative, not clamped to zero, when `target` has already passed —

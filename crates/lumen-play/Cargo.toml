@@ -37,6 +37,14 @@ time = { version = "0.3", default-features = false }
 # was needed for the OS random source. Every platform backend this pulls in (`rustix`, `windows-sys`)
 # is already in the dependency graph via `rustls`/`getrandom`, so this adds no new transitive crate.
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+# `lumen serve`'s automatic-rescan watcher (`docs/15` §A's "honest phase-2 item"): a real, cross-
+# platform filesystem-event source (inotify on Linux, `ReadDirectoryChangesW` on Windows, FSEvents on
+# macOS) with no `unsafe_code` of our own needed to drive any of them, the same reason `getrandom` and
+# `fs4` above were reached for instead of a hand-rolled platform call. `notify-debouncer-mini` is not
+# pulled in alongside it -- the debounce this watcher needs (coalesce a burst of events into one
+# rescan) is ~20 lines against primitives (`mpsc`, a `recv_timeout` loop) this file already leans on
+# everywhere else, so a second small crate would buy nothing a few lines here don't already cover.
+notify = "8"
 
 [dev-dependencies]
 # Backdating a file's or directory's own mtime in `hls.rs`'s eviction/sweep tests. `std::fs::File`
