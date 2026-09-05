@@ -22,6 +22,20 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// One self-deleting temp directory holding two *sibling* subdirectories: `library/`, the root the
+/// spawned server is pointed at (and therefore the root both of its filesystem watchers recurse
+/// over), and `config/`, which the server is told is its OS config directory.
+///
+/// Siblings, never `config/` inside the library: `remote::server::run` creates its HLS and DASH cache
+/// directories under the config directory on the main thread only *after* mpv's IPC socket has
+/// connected, while `dlna::run` arms its watcher before that on its own thread. With the config
+/// directory under the watched root, those two `create_dir_all`s are real change events the DLNA
+/// watcher sees -- and whether they coalesce into the first drop's refresh, get discarded by its quiet
+/// period, or trigger a *second* refresh depends entirely on how long mpv took to start. That made
+/// the auto-refresh test's `SystemUpdateID` assertions a function of mpv startup latency (reproduced:
+/// an mpv delayed by 4s produced `SystemUpdateID` 3 for one dropped file and failed the "must not
+/// keep climbing" check). Keeping the server's own writes outside the tree it watches is what makes
+/// "one file dropped is one refresh" a statement about the watcher rather than about the runner.
 struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
@@ -32,12 +46,25 @@ impl TempDir {
             std::ptr::from_ref(&anchor) as usize
         ));
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(d.join("library")).unwrap();
+        std::fs::create_dir_all(d.join("config")).unwrap();
         Self(d)
     }
 
+    /// The library root the server serves and watches.
+    fn library(&self) -> PathBuf {
+        self.0.join("library")
+    }
+
+    /// The directory the server is told is its OS config directory -- beside the library, never
+    /// under it (see the type's own doc).
+    fn config(&self) -> PathBuf {
+        self.0.join("config")
+    }
+
+    /// Writes a fixture file at `rel` *under the library root*.
     fn file(&self, rel: &str, bytes: &[u8]) -> PathBuf {
-        let p = self.0.join(rel);
+        let p = self.library().join(rel);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -159,10 +186,11 @@ fn browse_soap(object_id: &str, flag: &str) -> String {
 }
 
 /// Send a real `Browse` SOAP request over a fresh, real TCP connection to the DLNA port, and return
-/// the DIDL-Lite text out of `<Result>...</Result>`, unescaped. Panics loudly (with the full response)
-/// if the reply is not a well-formed `BrowseResponse` -- a SOAP fault included, since every call site
-/// below that expects success is asserting the happy path.
-fn browse(port: u16, object_id: &str, flag: &str) -> String {
+/// the full `BrowseResponse` SOAP body as text. Panics loudly (with the full response) if the reply is
+/// not a well-formed `BrowseResponse` -- a SOAP fault included, since every call site that expects
+/// success is asserting the happy path. [`browse`] narrows this to the DIDL-Lite; the auto-refresh
+/// test reads the `<UpdateID>` off the whole envelope too.
+fn browse_response(port: u16, object_id: &str, flag: &str) -> String {
     let mut tcp = connect_with_retry(port, Duration::from_secs(5));
     let body = browse_soap(object_id, flag);
     let request = format!(
@@ -178,11 +206,55 @@ fn browse(port: u16, object_id: &str, flag: &str) -> String {
     let text = String::from_utf8(resp_body).expect("a Browse response must be valid UTF-8");
     assert_eq!(status, 200, "a successful Browse is always wrapped in a 200: {text}");
     assert!(!text.contains("<errorCode>"), "expected a BrowseResponse, got a SOAP fault: {text}");
+    text
+}
 
+/// [`browse_response`], narrowed to the DIDL-Lite text out of `<Result>...</Result>`, unescaped.
+fn browse(port: u16, object_id: &str, flag: &str) -> String {
+    let text = browse_response(port, object_id, flag);
     let start =
         text.find("<Result>").expect("a Browse response must carry <Result>") + "<Result>".len();
     let end = text.find("</Result>").expect("a Browse response must carry </Result>");
     unescape(&text[start..end])
+}
+
+/// The decimal text of one leaf element (`<UpdateID>7</UpdateID>`, `<Id>7</Id>`) in a SOAP
+/// response -- the same bounded "find the one known tag" scan every other helper here uses, not a
+/// parser.
+fn leaf_u32(response: &str, tag: &str) -> u32 {
+    let open = format!("<{tag}>");
+    let start =
+        response.find(&open).unwrap_or_else(|| panic!("no <{tag}> in: {response}")) + open.len();
+    let end = start + response[start..].find('<').expect("a closing tag");
+    response[start..end].parse().unwrap_or_else(|_| panic!("<{tag}> is not a u32: {response}"))
+}
+
+/// A real `GetSystemUpdateID` SOAP request over a fresh, real TCP connection -- the action a
+/// spec-following control point polls to learn whether anything it cached is stale -- returning the
+/// `Id` it reports. Panics loudly on anything but a well-formed `GetSystemUpdateIDResponse`.
+fn get_system_update_id(port: u16) -> u32 {
+    let mut tcp = connect_with_retry(port, Duration::from_secs(5));
+    let body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+                <s:Body><u:GetSystemUpdateID xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"/>\
+                </s:Body></s:Envelope>";
+    let request = format!(
+        "POST /dlna/cd/control HTTP/1.1\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         SOAPACTION: \"urn:schemas-upnp-org:service:ContentDirectory:1#GetSystemUpdateID\"\r\n\
+         Content-Type: text/xml; charset=\"utf-8\"\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    tcp.write_all(request.as_bytes()).unwrap();
+    let (status, _headers, resp_body) = read_http_response(&mut tcp);
+    let text =
+        String::from_utf8(resp_body).expect("a GetSystemUpdateID response must be valid UTF-8");
+    assert_eq!(status, 200, "GetSystemUpdateID must succeed: {text}");
+    assert!(
+        text.contains("<u:GetSystemUpdateIDResponse"),
+        "not a GetSystemUpdateIDResponse: {text}"
+    );
+    leaf_u32(&text, "Id")
 }
 
 /// Same as [`browse`], but for a request this test expects to be *refused* -- returns the raw response
@@ -290,42 +362,21 @@ fn find_object_id(didl: &str, tag: &str, title: &str) -> String {
     panic!("no <{tag}> titled {title:?} found in DIDL-Lite: {didl}");
 }
 
-#[test]
-fn a_real_server_serves_a_real_nested_folder_hierarchy_over_real_soap_and_streams_real_bytes() {
-    if !mpv_on_path() {
-        eprintln!("skipping: mpv is not on PATH in this environment");
-        return;
-    }
-
-    let dir = TempDir::new("hierarchy");
-    // A real nested tree: two top-level folders (one a show with a season, one a single file at the
-    // root), plus a directory holding nothing playable -- the exact shape `LibraryTree`'s own unit
-    // tests already cover in isolation, here proven end to end over the real wire protocol.
-    //
-    // Every file starts with the real EBML magic (`lumen_probe::magic` matches this at
-    // `Confidence::Certain`; see `lumen-probe/src/magic.rs`'s own tests for the same 4-byte minimal
-    // case) so `content_type_for` resolves each one as real Matroska rather than the
-    // `application/octet-stream` fallback an unrecognised extension-only file would get -- DLNA
-    // browsing itself never reads a file's bytes, but the streamed `Content-Type` this test also
-    // checks does depend on it, and a meaningless payload would make that assertion meaningless too.
-    let ebml_magic: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3];
-    let mkv_bytes = |tag: &[u8]| [ebml_magic, tag].concat();
-    let interstellar =
-        dir.file("Movies/Interstellar (2014).mkv", &mkv_bytes(b"movie bytes, not a real video"));
-    dir.file("Shows/Chernobyl/Season 01/Chernobyl.S01E01.mkv", &mkv_bytes(b"episode one"));
-    dir.file("Shows/Chernobyl/Season 01/Chernobyl.S01E02.mkv", &mkv_bytes(b"episode two"));
-    let root_file = dir.file("RootFile.mkv", &mkv_bytes(b"a file directly under the library root"));
-    std::fs::create_dir_all(dir.0.join("Movies/Empty")).unwrap();
-
-    let port = 21000 + (std::process::id() % 3000) as u16;
-    let dlna_port = 24000 + (std::process::id() % 3000) as u16;
-    let config_dir = dir.0.join("config");
+/// Spawns a real `lumen serve --dlna` pointed at `dir.library()` with `dir.config()` as its config
+/// directory, waits for its DLNA listener's own startup line on stdout (never a fixed sleep -- flaky
+/// either way, too slow in the common case and too fast under load, if guessed at), keeps draining
+/// both pipes live so the server can never block on a full pipe buffer (`remote_serve.rs`'s own basic
+/// test explains why in detail), and returns once the listener actually accepts a connection. The
+/// exact startup sequence both tests in this file need verbatim.
+fn spawn_dlna_server(dir: &TempDir, port: u16, dlna_port: u16) -> KillOnDrop {
+    let library = dir.library();
+    let config_dir = dir.config();
     let bin = env!("CARGO_BIN_EXE_lumen");
     let mut server = KillOnDrop(
         std::process::Command::new(bin)
             .args([
                 "serve",
-                dir.0.to_str().unwrap(),
+                library.to_str().unwrap(),
                 "--port",
                 &port.to_string(),
                 "--bind",
@@ -359,8 +410,6 @@ fn a_real_server_serves_a_real_nested_folder_hierarchy_over_real_soap_and_stream
         });
     }
 
-    // Wait for the DLNA listener's own startup line rather than a fixed sleep -- flaky either way
-    // (too slow in the common case, too fast under load) if guessed at instead.
     let stdout = server.stdout.take().unwrap();
     let mut lines = BufReader::new(stdout).lines();
     let mut dlna_ready = false;
@@ -375,8 +424,6 @@ fn a_real_server_serves_a_real_nested_folder_hierarchy_over_real_soap_and_stream
     }
     assert!(dlna_ready, "the server must announce its DLNA listener on startup");
 
-    // Drain the rest of stdout live so the server's own pipe buffer never fills and blocks it --
-    // `remote_serve.rs`'s own basic test explains why this matters in detail.
     std::thread::spawn(move || {
         for line in lines.map_while(Result::ok) {
             println!("[lumen serve stdout] {line}");
@@ -385,6 +432,39 @@ fn a_real_server_serves_a_real_nested_folder_hierarchy_over_real_soap_and_stream
 
     // The listener itself may need a moment past the log line to actually accept connections.
     let _ = connect_with_retry(dlna_port, Duration::from_secs(10));
+    server
+}
+
+#[test]
+fn a_real_server_serves_a_real_nested_folder_hierarchy_over_real_soap_and_streams_real_bytes() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("hierarchy");
+    // A real nested tree: two top-level folders (one a show with a season, one a single file at the
+    // root), plus a directory holding nothing playable -- the exact shape `LibraryTree`'s own unit
+    // tests already cover in isolation, here proven end to end over the real wire protocol.
+    //
+    // Every file starts with the real EBML magic (`lumen_probe::magic` matches this at
+    // `Confidence::Certain`; see `lumen-probe/src/magic.rs`'s own tests for the same 4-byte minimal
+    // case) so `content_type_for` resolves each one as real Matroska rather than the
+    // `application/octet-stream` fallback an unrecognised extension-only file would get -- DLNA
+    // browsing itself never reads a file's bytes, but the streamed `Content-Type` this test also
+    // checks does depend on it, and a meaningless payload would make that assertion meaningless too.
+    let ebml_magic: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3];
+    let mkv_bytes = |tag: &[u8]| [ebml_magic, tag].concat();
+    let interstellar =
+        dir.file("Movies/Interstellar (2014).mkv", &mkv_bytes(b"movie bytes, not a real video"));
+    dir.file("Shows/Chernobyl/Season 01/Chernobyl.S01E01.mkv", &mkv_bytes(b"episode one"));
+    dir.file("Shows/Chernobyl/Season 01/Chernobyl.S01E02.mkv", &mkv_bytes(b"episode two"));
+    let root_file = dir.file("RootFile.mkv", &mkv_bytes(b"a file directly under the library root"));
+    std::fs::create_dir_all(dir.library().join("Movies/Empty")).unwrap();
+
+    let port = 21000 + (std::process::id() % 3000) as u16;
+    let dlna_port = 24000 + (std::process::id() % 3000) as u16;
+    let mut server = spawn_dlna_server(&dir, port, dlna_port);
 
     // 1. Root DirectChildren: two real folders (Movies, Shows) and one real file (RootFile.mkv) --
     // never the empty "Movies/Empty" directory, and never a flat list of every file in the tree.
@@ -528,6 +608,182 @@ fn a_real_server_serves_a_real_nested_folder_hierarchy_over_real_soap_and_stream
     // 10. An unknown container_id is a real 701 SOAP fault over the wire, exactly like Browse.
     let search_fault = search_expect_fault(dlna_port, "d999", "*");
     assert!(search_fault.contains("<errorCode>701</errorCode>"), "{search_fault}");
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// Polls a real `Browse(object_id, DirectChildren)` until its DIDL-Lite names `title`, or `timeout`
+/// elapses -- returning the full `BrowseResponse` that first showed it (`None` on timeout), so the
+/// caller can read the `UpdateID` that very response carried. A deadline loop, not a sleep-and-hope:
+/// the watcher's timing (debounce, walk, quiet period) is the server's to decide and this test's only
+/// to observe, the same convention `remote_serve.rs`'s automatic-rescan tests already follow.
+fn wait_for_browse_to_list(
+    port: u16,
+    object_id: &str,
+    title: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let response = browse_response(port, object_id, "BrowseDirectChildren");
+        if unescape(&response).contains(&format!("<dc:title>{title}</dc:title>")) {
+            return Some(response);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    None
+}
+
+/// Every `SystemUpdateID` value `GetSystemUpdateID` reports over `window` that is strictly greater
+/// than `baseline` (the value the caller has already confirmed is current), in increasing order --
+/// the same "distinct versions beyond baseline" idea `remote_serve.rs`'s
+/// `distinct_library_versions_over` uses to tell "one coalesced refresh, then quiet" apart from "the
+/// watcher keeps retriggering itself". Empty means the counter never moved past what was already
+/// confirmed.
+fn system_update_ids_beyond(port: u16, baseline: u32, window: Duration) -> Vec<u32> {
+    let deadline = std::time::Instant::now() + window;
+    let mut max_seen = baseline;
+    let mut beyond = Vec::new();
+    while std::time::Instant::now() < deadline {
+        let id = get_system_update_id(port);
+        if id > max_seen {
+            beyond.push(id);
+            max_seen = id;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    beyond
+}
+
+/// Proves the DLNA half of `docs/15` §A's phase-2 item end to end, with no client-side trigger of any
+/// kind: a real `lumen serve --dlna`, a real `GetSystemUpdateID` over SOAP at its starting value, a
+/// file dropped into the real library directory on disk, and then -- driven by nothing but the
+/// server's own filesystem watcher -- a real `Browse` that lists the new file, carrying an `UpdateID`
+/// that moved, agreeing with what `GetSystemUpdateID` now reports. Then the negative half: once the
+/// change has settled, the counter must stay put (no self-triggered refresh loop -- the exact bug the
+/// watcher's `Access` filter and post-rescan quiet period exist to close, and one that two watchers on
+/// the same tree, each re-reading every file, would be a fresh opportunity to reintroduce). Finally a
+/// second drop after that quiet period proves the watcher is still alive, not one-shot.
+///
+/// Deadlines are generous on purpose: the watcher waits `WATCHER_DEBOUNCE` (1.5s) past the last
+/// event before re-walking, and ignores everything for a further `POST_RESCAN_QUIET_PERIOD` (1.5s)
+/// after -- so the first appearance can legitimately take ~2s, and a second drop landing inside the
+/// quiet window is only picked up on the *next* trigger. 15s bounds each wait without ever being the
+/// thing that decides the outcome.
+#[test]
+fn a_file_dropped_into_the_library_appears_in_browse_and_moves_system_update_id_unprompted() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("auto-refresh");
+    // Dummy bytes are enough -- `scan::scan` classifies by extension and name (see the other test in
+    // this file, and `remote_serve.rs`'s own watcher tests). Each file's bytes are distinct so that
+    // step 2's "the URL still streams the *same* file" check cannot pass by accident.
+    let existing_bytes: &[u8] = b"EXISTING: not a real container, just needs to exist";
+    dir.file("Movies/Existing.mkv", existing_bytes);
+
+    // A port range disjoint from the hierarchy test above (21000..23999 / 24000..26999), since both
+    // run concurrently in this one test process.
+    let port = 38000 + (std::process::id() % 3000) as u16;
+    let dlna_port = 41000 + (std::process::id() % 3000) as u16;
+    let mut server = spawn_dlna_server(&dir, port, dlna_port);
+
+    // 1. Baseline: the starting SystemUpdateID (1, the constant every UpdateID always was), reported
+    // both by GetSystemUpdateID and by a Browse's own UpdateID -- one counter, not two.
+    let baseline = get_system_update_id(dlna_port);
+    assert_eq!(baseline, 1, "a fresh server starts at the value clients always saw");
+    let root_before = browse_response(dlna_port, "0", "BrowseDirectChildren");
+    assert_eq!(leaf_u32(&root_before, "UpdateID"), baseline, "{root_before}");
+    let movies_id = find_object_id(&unescape(&root_before), "container", "Movies");
+    let movies_before = browse(dlna_port, &movies_id, "BrowseDirectChildren");
+    assert!(movies_before.contains("<dc:title>Existing</dc:title>"), "{movies_before}");
+    assert!(!movies_before.contains("AutoDetected"), "{movies_before}");
+    // The <res> URL a renderer would now be playing Existing from -- kept across the refresh below.
+    let (_, existing_path) = split_url(&extract_res_url(&movies_before, "Existing"));
+
+    // 2. Drop a new file into the real library directory. No request of any kind tells the server
+    // about it -- if Browse ever lists it, the watcher is what made that happen. The name sorts
+    // *before* Existing's, so a position-based id scheme would have shifted Existing's id here.
+    dir.file("Movies/AutoDetected.mkv", b"AUTODETECTED: not a real container, just needs to exist");
+
+    let appeared =
+        wait_for_browse_to_list(dlna_port, &movies_id, "AutoDetected", Duration::from_secs(15))
+            .expect("the new file must appear in a real Browse with no client-side trigger");
+    let update_id_when_appeared = leaf_u32(&appeared, "UpdateID");
+
+    // The URL handed out before the refresh, re-requested the way a renderer seeks -- a fresh
+    // connection with a Range header -- must still stream Existing's own bytes, not the newcomer's
+    // that now sorts ahead of it. This is the live, over-the-wire form of `dlna.rs`'s own
+    // `a_stream_url_handed_out_before_a_refresh_still_serves_the_same_file_after_it`.
+    let mut seek = connect_with_retry(dlna_port, Duration::from_secs(5));
+    seek.write_all(
+        format!(
+            "GET {existing_path} HTTP/1.1\r\nHost: 127.0.0.1:{dlna_port}\r\nRange: bytes=9-\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let (status, _headers, body) = read_http_response(&mut seek);
+    assert_eq!(status, 206, "a Range re-request of a still-present file is a real 206");
+    assert_eq!(
+        body,
+        &existing_bytes[9..],
+        "the stream URL a renderer was already playing must name the same file after a refresh"
+    );
+    assert_eq!(
+        split_url(&extract_res_url(&unescape(&appeared), "Existing")).1,
+        existing_path,
+        "and the refreshed listing still advertises Existing at that same URL"
+    );
+    assert!(
+        update_id_when_appeared > baseline,
+        "the Browse that first showed the new file must already carry a moved UpdateID -- the \
+         snapshot and the counter are swapped together, never one before the other: {appeared}"
+    );
+    assert_eq!(
+        get_system_update_id(dlna_port),
+        update_id_when_appeared,
+        "GetSystemUpdateID must report the same value the Browse just carried"
+    );
+    assert_eq!(
+        update_id_when_appeared,
+        baseline + 1,
+        "one file dropped in one burst is exactly one refresh, not one per raw filesystem event"
+    );
+
+    // 3. Nothing further changes on disk, so the counter must not keep climbing: the refresh's own
+    // re-read of every file (and the paired channel's own watcher doing the same on the same tree
+    // whenever *it* fires -- it is armed only once mpv is up, so it may or may not have caught this
+    // first drop) must never look like a fresh external change. 6s comfortably spans the 1.5s quiet
+    // period plus another full debounce window in which a self-triggered event would have fired.
+    // The server's own config-directory writes cannot be what moves the counter here either -- the
+    // fixture keeps them outside the watched root (see `TempDir`).
+    let after_settling =
+        system_update_ids_beyond(dlna_port, update_id_when_appeared, Duration::from_secs(6));
+    assert!(
+        after_settling.is_empty(),
+        "SystemUpdateID must not keep climbing once nothing further has changed on disk: saw \
+         {after_settling:?} beyond {update_id_when_appeared}"
+    );
+
+    // 4. The watcher is still alive after its quiet period: a second drop is picked up too, and
+    // advances the counter by exactly one more.
+    dir.file("Movies/SecondDrop.mkv", b"not a real container, just needs to exist");
+    let second =
+        wait_for_browse_to_list(dlna_port, &movies_id, "SecondDrop", Duration::from_secs(15))
+            .expect("a second file dropped after the quiet period must be picked up as well");
+    assert_eq!(leaf_u32(&second, "UpdateID"), update_id_when_appeared + 1, "{second}");
+    assert_eq!(get_system_update_id(dlna_port), update_id_when_appeared + 1);
+    let movies_final = unescape(&second);
+    for expected in ["Existing", "AutoDetected", "SecondDrop"] {
+        assert!(
+            movies_final.contains(&format!("<dc:title>{expected}</dc:title>")),
+            "{expected} missing from the final Movies listing: {movies_final}"
+        );
+    }
 
     let _ = server.kill();
     let _ = server.wait();

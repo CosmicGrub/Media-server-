@@ -19,6 +19,7 @@ mod ffmpegbin;
 mod fidelity;
 mod ipc;
 mod json;
+mod library_watch;
 mod mpvbin;
 mod reindex;
 mod remote;

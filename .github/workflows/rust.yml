@@ -172,23 +172,30 @@ jobs:
 
       # The step above deliberately runs before mpv is on PATH, so it exercises `lumen setup`'s own
       # download path rather than short-circuiting on "mpv is already available". Only now, with
-      # `target/debug/mpv.exe` fetched and proven, is it safe to put it on PATH and re-run
-      # `remote_serve.rs` for real -- it self-skips otherwise, the same silent gap Linux had before
+      # `target/debug/mpv.exe` fetched and proven, is it safe to put it on PATH and re-run the
+      # real-mpv integration tests -- they self-skip otherwise, the same silent gap Linux had before
       # mpv was installed for it above. This is the Windows leg of the same fix.
-      - name: Put the fetched mpv on PATH and re-run the real-mpv integration test (Windows)
+      #
+      # Both mpv-gated test binaries, not just `remote_serve`: `dlna_serve.rs` spawns the same
+      # `lumen serve` (which always starts mpv, `--dlna` or not) and is the only end-to-end proof
+      # that the DLNA listener's own filesystem watcher refreshes the library -- and that watcher's
+      # post-rescan quiet period exists *because* `ReadDirectoryChangesW` once re-triggered a rescan
+      # on this very runner in a way inotify never did. With two watchers now on one tree, the one
+      # platform the quiet period was written for is the one it most needs to run on.
+      - name: Put the fetched mpv on PATH and re-run the real-mpv integration tests (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Add-Content -Path $env:GITHUB_PATH -Value "$pwd\target\debug"
 
-      - name: Test remote_serve with real mpv (Windows)
+      - name: Test remote_serve and dlna_serve with real mpv (Windows)
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
           set -euo pipefail
           command -v mpv || command -v mpv.exe
-          cargo test -p lumen-play --test remote_serve -- --nocapture
+          cargo test -p lumen-play --test remote_serve --test dlna_serve -- --nocapture
 
   lint:
     name: fmt + clippy

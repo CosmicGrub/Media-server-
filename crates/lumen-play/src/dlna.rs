@@ -27,26 +27,43 @@
 //! second filter bolted on afterward.
 //!
 //! Object IDs are `"0"` for the UPnP-mandated root, `"d<n>"` for a directory, and `"f<n>"` for a file
-//! (`<n>` is that file's index into `Scan::playable()`'s own enumeration) -- three disjoint prefixes,
-//! so no two distinct objects can ever share an id (see [`LibraryTree`]'s own doc for the bare-integer
-//! collision this replaced). IDs are stable only for the lifetime of one `lumen serve` process (the
-//! same "one snapshot taken at startup, never refreshed" limitation `docs/15` Engine A already
-//! documents for the paired control channel's own library listing -- this shares that gap rather than
-//! inventing a second one).
+//! -- three disjoint prefixes, so no two distinct objects can ever share an id (see [`LibraryTree`]'s
+//! own doc for the bare-integer collision this replaced). `<n>` is a number handed out once per path,
+//! the first time a [`LibraryTree`] build sees that path, and carried forward unchanged by every later
+//! build (see [`LibraryTree::build`]); it is *not* a position in any listing.
+//!
+//! **The library refreshes itself; an id names the same path for the life of the process.** `run`
+//! spawns its own `crate::library_watch` instance over `library_root` (the same debounced,
+//! self-trigger-proof watcher the paired control channel runs for its own `library_version`, reused
+//! as code and not as state -- see [`run`]'s doc). When a file is added, removed, or renamed on disk,
+//! [`refresh_library`] re-walks the root, rebuilds the [`LibraryTree`] with the previous tree's ids
+//! carried forward, swaps scan and tree in together, and increments `SystemUpdateID`. A refresh
+//! therefore only ever *adds* ids (for paths that are new) and *retires* ids (for paths that are
+//! gone, which then answer `701`/`404` honestly); it never re-points an existing id at a different
+//! file. That matters beyond tidiness: the `<res>` URL in every `Browse` response is
+//! `/dlna/stream/f<n>`, and a renderer re-requests that exact URL, on a fresh connection with a
+//! `Range` header, every time the viewer seeks. `SystemUpdateID` moving obliges a control point to
+//! re-`Browse` its cached *listings* -- nothing in `ContentDirectory:1` says a `res` URI already handed
+//! to the renderer stops identifying the resource it was handed for -- so an id that shifted with a
+//! refresh would splice another file's bytes into a playing stream as a perfectly valid-looking
+//! `206`. Ids are still never persisted anywhere, so a `lumen serve` restart resets both the
+//! numbering and `SystemUpdateID` (back to 1), which is spec-permitted -- clients cache neither
+//! across a server's own `ssdp:byebye`/re-announce.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use lumen_discovery::{
     Announcement, BrowseFlag, DeviceIdentity, DidlObject, DidlResource, ObjectClass, Responder,
     SearchCriteria, build_browse_response, build_cd_search_response, build_device_description,
     build_didl_lite, build_get_current_connection_ids_response, build_get_protocol_info_response,
-    build_soap_fault, connection_manager_scpd, content_directory_scpd, parse_browse_request,
-    parse_search_request,
+    build_get_system_update_id_response, build_soap_fault, connection_manager_scpd,
+    content_directory_scpd, parse_browse_request, parse_search_request,
 };
 use lumen_model::Container;
 
@@ -90,8 +107,11 @@ const SOURCE_MIME_TYPES: &[&str] = &[
 /// Scans `library_root` itself rather than sharing the paired control channel's `Scan` -- this
 /// listener is deliberately separate infrastructure (see the module doc), and `lumen serve` may run
 /// with or without `--dlna` independently of whether pairing is even in use, so tying the two
-/// together would reintroduce exactly the coupling this module exists to avoid. The same "one
-/// snapshot at startup" limitation applies here as it does there.
+/// together would reintroduce exactly the coupling this module exists to avoid. For the same reason
+/// it runs its *own* `crate::library_watch` instance over the root rather than being fanned out to by
+/// `remote::server`'s: the watcher module is shared code, not shared state, and each side's refresh
+/// (`refresh_library` here, `rescan_library` there) replaces only its own snapshot and bumps only its
+/// own counter. Two watches and two re-walks per real change is the accepted price of that.
 pub fn run(
     library_root: PathBuf,
     bind: &str,
@@ -108,12 +128,7 @@ pub fn run(
     // check and here) rather than refusing to serve at all.
     let library_root = library_root.canonicalize().unwrap_or(library_root);
 
-    let scan = crate::scan::scan(
-        std::slice::from_ref(&library_root),
-        &crate::scan::ScanOptions::default(),
-    );
-    let tree = LibraryTree::build(&scan, &library_root);
-    let library = Arc::new(Mutex::new(scan));
+    let library = RwLock::new(LibrarySnapshot::scan(&library_root, None));
 
     let advertise_host = if bind == "0.0.0.0" {
         local_ip_for_lan().unwrap_or(Ipv4Addr::LOCALHOST)
@@ -159,9 +174,11 @@ pub fn run(
         )
     })?;
     // `log` is `Fn`, not `Clone`, but `Arc<T>` is `Clone` regardless of whether `T` is -- wrapping it
-    // once here is all the SSDP thread and this function's own later use of `log` need to each get
-    // their own handle to the same closure.
-    let log = Arc::new(log);
+    // once here is all the SSDP thread, the library watcher, and this function's own later use of
+    // `log` need to each get their own handle to the same closure. `dyn` rather than the concrete
+    // type because `library_watch::spawn` takes it as `Arc<dyn Fn>`, the same shape
+    // `remote::server::run` already hands its own watcher.
+    let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(log);
     {
         let log = Arc::clone(&log);
         std::thread::spawn(move || responder.run(RENOTIFY_INTERVAL, |m| log(m)));
@@ -171,7 +188,37 @@ pub fn run(
         .map_err(|e| format!("cannot listen on {bind}:{port} for DLNA: {e}"))?;
     log(&format!("DLNA: advertising \"{friendly_name}\" at {base_url}/dlna/desc.xml"));
 
-    let ctx = Arc::new(DlnaContext { library, tree, base_url, friendly_name, uuid });
+    let ctx = Arc::new(DlnaContext {
+        library,
+        system_update_id: AtomicU32::new(INITIAL_SYSTEM_UPDATE_ID),
+        library_root,
+        base_url,
+        friendly_name,
+        uuid,
+    });
+
+    // Spawned after `ctx` exists so the watcher's callback can share the exact same `Arc` every
+    // connection thread below reads from -- never fatal to `run()` itself: see
+    // `library_watch::spawn`'s own doc for why a watcher that cannot start only costs this session
+    // its automatic refresh, not the whole DLNA listener.
+    {
+        let ctx = Arc::clone(&ctx);
+        let root = ctx.library_root.clone();
+        let on_change_log = Arc::clone(&log);
+        crate::library_watch::spawn(
+            &root,
+            "DLNA library watcher",
+            move || {
+                let (file_count, system_update_id) = refresh_library(&ctx);
+                on_change_log(&format!(
+                    "DLNA: library changed -> rescanned, {file_count} playable files, \
+                     SystemUpdateID now {system_update_id}"
+                ));
+            },
+            Arc::clone(&log),
+        );
+    }
+
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else { continue };
         let ctx = Arc::clone(&ctx);
@@ -180,13 +227,40 @@ pub fn run(
     Ok(())
 }
 
+/// The `SystemUpdateID` a freshly started `lumen serve --dlna` reports before any refresh has
+/// happened. `1` and not `0` because `1` is the constant every `Browse`/`Search` response carried as
+/// its `UpdateID` before the counter was real -- a client that cached a listing from an older build
+/// and then talks to this one sees the same starting value it always did, and only ever sees it move
+/// when the library actually changed. Nothing else depends on the exact number; the spec only requires
+/// that it change whenever the content does.
+const INITIAL_SYSTEM_UPDATE_ID: u32 = 1;
+
 struct DlnaContext {
-    library: Arc<Mutex<Scan>>,
-    /// The library's real folder hierarchy -- built once in [`run`] from the same startup `Scan` as
-    /// `library` above. Never mutated after construction, sharing the "one snapshot taken at startup,
-    /// never refreshed" limitation `library` itself already carries, so a `Mutex` here would only add
-    /// contention this design has no use for.
-    tree: LibraryTree,
+    /// The library as this listener currently knows it: one `Scan` and the `LibraryTree` built from
+    /// it, held *together* under one lock -- see [`LibrarySnapshot`] for why they cannot be two.
+    /// `RwLock`, not `Mutex`: every request is a reader, and only a watcher-triggered
+    /// [`refresh_library`] ever writes, briefly, after doing its walk outside the lock entirely. Two
+    /// TVs browsing at once never wait on each other, and a refresh waits only for in-flight
+    /// *response construction* -- every reader drops the guard before writing a response body to
+    /// its socket (see `handle_browse`), so a slow client can never hold a refresh, and therefore
+    /// every other reader queued behind that pending writer, hostage. The one exception is the
+    /// short SOAP-fault paths (`701`/`708`, a few hundred fixed bytes), written with the guard still
+    /// held: a write that small lands entirely in the kernel's send buffer and returns without ever
+    /// waiting on the peer, so releasing first would buy nothing and cost a second code shape.
+    library: RwLock<LibrarySnapshot>,
+    /// UPnP `ContentDirectory:1`'s `SystemUpdateID` (a `ui4`, hence `u32`): starts at
+    /// [`INITIAL_SYSTEM_UPDATE_ID`] and is incremented exactly once per completed [`refresh_library`],
+    /// *inside* that function's write-lock critical section. Readers load it while holding the read
+    /// lock, which is what makes the `(snapshot, UpdateID)` pair a `Browse` reports consistent: a
+    /// response can never carry the new tree with the old id or vice versa, because no writer can be
+    /// between the swap and the increment while any reader holds the lock. `GetSystemUpdateID` alone
+    /// reads it lock-free -- it reports no content, so it has no pair to keep consistent. Wraps at
+    /// `u32::MAX`, which the spec explicitly permits for a `ui4` counter.
+    system_update_id: AtomicU32,
+    /// The canonicalized root `run` scanned and watches -- what [`refresh_library`] re-walks, and the
+    /// root `LibraryTree::build` computes every file's directory ancestry against (see `run`'s own
+    /// comment on why it must be the canonical form).
+    library_root: PathBuf,
     base_url: String,
     friendly_name: String,
     /// Generated once in [`run`] and carried here so every `desc.xml` response agrees with the UUID
@@ -194,11 +268,75 @@ struct DlnaContext {
     uuid: String,
 }
 
+/// One consistent view of the library: a [`Scan`] and the [`LibraryTree`] built from exactly that
+/// scan, replaced as a unit and never separately.
+///
+/// **Why one struct under one lock, rather than the `Arc<Mutex<Scan>>` plus bare `LibraryTree` this
+/// replaced.** Every `"f<n>"` id is a position in `scan.playable()`'s enumeration, and every
+/// `DirNode::child_files` entry and `LibraryTree::file_parent` slot is that same position, computed
+/// from that same enumeration by `LibraryTree::build`. A request that read the tree from before a
+/// refresh and the scan from after it would resolve `child_files[k]` against a different file list
+/// than the one it was built from -- listing a file under the wrong folder, streaming the wrong file
+/// for an id, or indexing past the end. Two locks taken in sequence cannot rule that out (a writer
+/// can slip between them); one lock around the pair can, trivially, and costs nothing extra since a
+/// refresh has to replace both anyway.
+struct LibrarySnapshot {
+    scan: Scan,
+    tree: LibraryTree,
+}
+
+impl LibrarySnapshot {
+    /// Walk `library_root` and build the matching tree, carrying every id `previous` had already
+    /// assigned forward (see [`LibraryTree::build`]) -- the same two steps `run` performed inline at
+    /// startup before refreshes existed, now the one definition both the startup scan (`previous` =
+    /// `None`: every id is fresh) and every [`refresh_library`] share. Done entirely outside any
+    /// lock when called with `None`: a walk of a large library over a network share can take
+    /// seconds, and nothing a `Browse` reads is touched until the finished result is swapped in.
+    /// [`refresh_library`] splits the two steps itself, for the reason its own doc gives.
+    fn scan(library_root: &PathBuf, previous: Option<&LibraryTree>) -> Self {
+        let scan = crate::scan::scan(
+            std::slice::from_ref(library_root),
+            &crate::scan::ScanOptions::default(),
+        );
+        let tree = LibraryTree::build(&scan, library_root, previous);
+        Self { scan, tree }
+    }
+}
+
+/// Re-walk `ctx.library_root`, swap the resulting [`LibrarySnapshot`] in, and bump
+/// `SystemUpdateID` -- the one place either happens. Called by the watcher `run` spawns; the unit
+/// tests call it directly to exercise the exact same path without waiting on real filesystem events.
+/// Returns `(playable file count, new SystemUpdateID)`, the pair the watcher's log line reports.
+///
+/// The walk -- the only part that touches the disk, and the only part that can take seconds -- runs
+/// first, with no lock held. Under the write lock happen exactly three things, together: the new
+/// tree is built with the *current* tree's ids carried forward (an in-memory pass over the file
+/// list, microseconds for a personal library -- and it has to read the tree being replaced, which
+/// only the lock can hold still), the snapshot is swapped, and the counter is incremented. Doing
+/// all three in one critical section is what guarantees both that a reader never observes the new
+/// snapshot with the old id or vice versa (see `DlnaContext::system_update_id`), and that two
+/// refreshes can never each carry forward from the same predecessor and hand the same fresh id to
+/// two different new files.
+fn refresh_library(ctx: &DlnaContext) -> (usize, u32) {
+    let scan = crate::scan::scan(
+        std::slice::from_ref(&ctx.library_root),
+        &crate::scan::ScanOptions::default(),
+    );
+    let file_count = scan.playable().count();
+    let mut guard = ctx.library.write().unwrap();
+    let tree = LibraryTree::build(&scan, &ctx.library_root, Some(&guard.tree));
+    *guard = LibrarySnapshot { scan, tree };
+    let system_update_id = ctx.system_update_id.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    drop(guard);
+    (file_count, system_update_id)
+}
+
 /// One directory in the served library's own folder hierarchy -- a DLNA `StorageFolder` container.
 ///
 /// `LibraryTree::dirs[0]` is always the root, with the UPnP-mandated fixed id `"0"`; every other
-/// node's id is `"d<n>"`, where `<n>` is an incrementing counter assigned in creation order by
-/// [`LibraryTree::build`].
+/// node's id is `"d<n>"`, where `<n>` was assigned from an incrementing counter the first time any
+/// [`LibraryTree::build`] created a node for this directory's library-relative path, and is carried
+/// forward by every later build (see that function's doc).
 #[derive(Debug)]
 struct DirNode {
     id: String,
@@ -209,18 +347,19 @@ struct DirNode {
     /// Indices into the owning [`LibraryTree`]'s own `dirs`.
     child_dirs: Vec<usize>,
     /// Indices into `scan.playable()`'s own enumeration -- the same ordering `handle_browse` already
-    /// built its (Stage 1, flat) file list from, so a file's object id keeps meaning what it already
-    /// meant.
+    /// built its (Stage 1, flat) file list from. The file's object id is `LibraryTree::file_ids` at
+    /// that same index.
     child_files: Vec<usize>,
 }
 
-/// The served library's real folder hierarchy, built once at startup (see [`run`]) from the same
-/// [`Scan`] and library root every playable file was found under.
+/// The served library's real folder hierarchy, built from the same [`Scan`] and library root every
+/// playable file was found under -- once at startup and again on every [`refresh_library`], always
+/// alongside the scan it indexes into (see [`LibrarySnapshot`]).
 ///
 /// **Why this exists, not just a flat list**: a smart TV's Browse UI should show `Movies`, a show's
 /// own folder, `Season 01`, and so on -- not one giant flat list of every file in the collection.
-/// Building this once, rather than walking the filesystem again per request, matches this module's
-/// existing "one snapshot at startup" posture for the library itself.
+/// Building this per scan, rather than walking the filesystem again per request, keeps every request
+/// a pure in-memory lookup.
 ///
 /// **Fixes a real, latent id-collision bug along the way.** Stage 1 gave playable files bare-integer
 /// object ids ("0", "1", ...) -- the same string space the root container's own fixed id ("0") lives
@@ -229,19 +368,44 @@ struct DirNode {
 /// always won, no matter what the client actually meant. Every directory now gets a `"d<n>"` id and
 /// every file an `"f<n>"` id -- three disjoint
 /// prefixes (`"0"`, `"d..."`, `"f..."`), so no two distinct objects can ever share a string again.
+///
+/// **Ids are per path and survive a rebuild.** `<n>` comes from a counter that only ever counts up
+/// (`next_dir_id`/`next_file_id`, carried from build to build), and a path that already had an id
+/// in the previous tree keeps it -- see [`LibraryTree::build`] for why a position in the file list
+/// would not do.
 #[derive(Debug)]
 struct LibraryTree {
     dirs: Vec<DirNode>,
     /// `DirNode::id` -> index into `dirs`, for every node including the root -- `O(1)` id lookups for
     /// both `Browse` flags, instead of a linear scan per request.
     by_id: HashMap<String, usize>,
+    /// Each non-root directory's library-relative path -> its `"d<n>"` id: what the *next* build
+    /// reads to hand the same directory the same id again. Relative, not absolute, only because that
+    /// is the form `build` already computes for its own memoization; the root never changes within
+    /// one `DlnaContext`, so either would do.
+    dir_id_by_rel_path: HashMap<PathBuf, String>,
+    /// The `"f<n>"` id of each playable file -- indexed exactly the way `scan.playable()`'s own
+    /// enumeration is, the same way `file_parent` and every `DirNode::child_files` entry are.
+    file_ids: Vec<String>,
+    /// The inverse of `file_ids`: `"f<n>"` -> index into `scan.playable()`'s enumeration, for the
+    /// `Browse(Metadata "f<n>")` and `/dlna/stream/f<n>` lookups that start from an id a client sent
+    /// back. `O(1)`, like `by_id`.
+    file_by_id: HashMap<String, usize>,
+    /// Each playable file's absolute path -> its `"f<n>"` id: what the *next* build reads to carry
+    /// that id forward. Absolute because that is exactly what `ScannedFile::path` holds, so the
+    /// lookup key on the next build is the same bytes with no re-derivation to get subtly wrong.
+    file_id_by_path: HashMap<PathBuf, String>,
+    /// The next `"d<n>"`/`"f<n>"` number a build may hand out. Carried forward so a retired id
+    /// (a removed file's) is never re-issued to a different path within one process: a renderer
+    /// still holding the old URL gets an honest `404`, never another file's bytes.
+    next_dir_id: u64,
+    next_file_id: u64,
     /// The parent directory's own id, for each playable file -- indexed exactly the way
-    /// `scan.playable()`'s own enumeration (and therefore each file's own `"f<n>"` id) already is.
-    /// Looked up by a `Browse(Metadata)` naming a bare file id directly, and by `handle_search` for
-    /// every matched file (a file three levels under the searched container must report its own true
-    /// immediate parent, not the container that was searched from) -- every `DirectChildren` listing
-    /// already has its directory's id in hand from the [`DirNode`] being listed, so it never needs
-    /// this.
+    /// `scan.playable()`'s own enumeration (and therefore `file_ids`) already is. Looked up by a
+    /// `Browse(Metadata)` naming a bare file id directly, and by `handle_search` for every matched
+    /// file (a file three levels under the searched container must report its own true immediate
+    /// parent, not the container that was searched from) -- every `DirectChildren` listing already
+    /// has its directory's id in hand from the [`DirNode`] being listed, so it never needs this.
     file_parent: Vec<String>,
 }
 
@@ -252,7 +416,20 @@ impl LibraryTree {
     /// created once. A directory nothing playable lives under (recursively) is therefore never
     /// visited at all, and so never gets a node -- the "empty directories are never listed" guarantee
     /// falls straight out of this construction rather than needing a second, separate check.
-    fn build(scan: &Scan, library_root: &Path) -> Self {
+    ///
+    /// **`previous` is what makes ids stable across a refresh.** Every directory (by library-relative
+    /// path) and every file (by absolute path) that `previous` already had an id for gets that same
+    /// id again; only a path `previous` never saw draws a fresh number from the carried-forward
+    /// counter. `None` -- the startup build, and every test that constructs a tree from nothing --
+    /// numbers everything from zero in walk order, which is exactly the numbering the pre-refresh
+    /// code produced, so nothing that only ever builds once sees a difference. Ids were originally
+    /// positions in `scan.playable()`'s path-sorted list, and that was a real bug once refreshes
+    /// existed: dropping `Aardvark.mkv` into the library shifted every other file's number, and the
+    /// `/dlna/stream/f<n>` URL a renderer was mid-playback on silently started serving a different
+    /// file's bytes on its next `Range` request (see the module doc). Keying by path is the smallest
+    /// fix that closes it; a content hash would survive renames too, but would cost a read of every
+    /// file per refresh for a property no renderer relies on.
+    fn build(scan: &Scan, library_root: &Path, previous: Option<&LibraryTree>) -> Self {
         let mut dirs = vec![DirNode {
             id: "0".to_string(),
             parent_id: "-1".to_string(),
@@ -263,7 +440,12 @@ impl LibraryTree {
         let mut by_id: HashMap<String, usize> = HashMap::new();
         by_id.insert("0".to_string(), 0);
         let mut by_rel_dir: HashMap<PathBuf, usize> = HashMap::new();
-        let mut next_dir_id: usize = 0;
+        let mut dir_id_by_rel_path: HashMap<PathBuf, String> = HashMap::new();
+        let mut file_ids = Vec::new();
+        let mut file_by_id: HashMap<String, usize> = HashMap::new();
+        let mut file_id_by_path: HashMap<PathBuf, String> = HashMap::new();
+        let mut next_dir_id: u64 = previous.map_or(0, |p| p.next_dir_id);
+        let mut next_file_id: u64 = previous.map_or(0, |p| p.next_file_id);
         let mut file_parent = Vec::new();
 
         for f in scan.playable() {
@@ -295,8 +477,14 @@ impl LibraryTree {
                 parent_idx = match by_rel_dir.get(&rel) {
                     Some(&idx) => idx,
                     None => {
-                        let id = format!("d{next_dir_id}");
-                        next_dir_id += 1;
+                        let id = match previous.and_then(|p| p.dir_id_by_rel_path.get(&rel)) {
+                            Some(kept) => kept.clone(),
+                            None => {
+                                let id = format!("d{next_dir_id}");
+                                next_dir_id += 1;
+                                id
+                            }
+                        };
                         dirs.push(DirNode {
                             id: id.clone(),
                             parent_id: dirs[parent_idx].id.clone(),
@@ -306,21 +494,59 @@ impl LibraryTree {
                         });
                         let new_idx = dirs.len() - 1;
                         dirs[parent_idx].child_dirs.push(new_idx);
-                        by_id.insert(id, new_idx);
+                        by_id.insert(id.clone(), new_idx);
                         by_rel_dir.insert(rel.clone(), new_idx);
+                        dir_id_by_rel_path.insert(rel.clone(), id);
                         new_idx
                     }
                 };
             }
-            dirs[parent_idx].child_files.push(file_parent.len());
+            let position = file_parent.len();
+            dirs[parent_idx].child_files.push(position);
             file_parent.push(dirs[parent_idx].id.clone());
+
+            let id = match previous.and_then(|p| p.file_id_by_path.get(&f.path)) {
+                Some(kept) => kept.clone(),
+                None => {
+                    let id = format!("f{next_file_id}");
+                    next_file_id += 1;
+                    id
+                }
+            };
+            file_by_id.insert(id.clone(), position);
+            file_id_by_path.insert(f.path.clone(), id.clone());
+            file_ids.push(id);
         }
 
-        Self { dirs, by_id, file_parent }
+        Self {
+            dirs,
+            by_id,
+            dir_id_by_rel_path,
+            file_ids,
+            file_by_id,
+            file_id_by_path,
+            next_dir_id,
+            next_file_id,
+            file_parent,
+        }
     }
 
     fn dir_by_id(&self, id: &str) -> Option<&DirNode> {
         self.by_id.get(id).map(|&i| &self.dirs[i])
+    }
+
+    /// The `"f<n>"` id of the playable file at `position` in `scan.playable()`'s enumeration --
+    /// every place that lists a file (both `Browse` flags, `Search`) goes through this so the id in a
+    /// `<item id>` and the id in its `<res>` URL can never come from two different schemes.
+    fn file_id(&self, position: usize) -> &str {
+        &self.file_ids[position]
+    }
+
+    /// The inverse: the position in `scan.playable()`'s enumeration of the file `id` names, or `None`
+    /// for an id this tree never issued -- including one a *previous* tree issued for a file that has
+    /// since gone away, which is the whole point of not re-issuing numbers.
+    fn file_position(&self, id: &str) -> Option<usize> {
+        self.file_by_id.get(id).copied()
     }
 }
 
@@ -387,7 +613,10 @@ fn route(tcp: &mut TcpStream, req: &HttpRequest, body: &[u8], ctx: &DlnaContext)
 }
 
 /// Dispatches `POST /dlna/cd/control` on its `SOAPACTION` header -- the same header-based routing
-/// `handle_connection_manager_control` already uses for its own three actions.
+/// `handle_connection_manager_control` already uses for its own three actions. Exactly the three
+/// actions `content_directory_scpd` declares (`Browse`, `Search`, `GetSystemUpdateID`) are answered;
+/// anything else is the `401 Invalid Action` fault the SCPD's own doc promises never to need for an
+/// action it declared.
 fn handle_content_directory_control(
     tcp: &mut TcpStream,
     req: &HttpRequest,
@@ -400,6 +629,15 @@ fn handle_content_directory_control(
         handle_browse(tcp, &soap, ctx);
     } else if action.contains("#Search") {
         handle_search(tcp, &soap, ctx);
+    } else if action.contains("#GetSystemUpdateID") {
+        // No body to parse (the action has no in-arguments) and no snapshot to read: the counter
+        // alone is the whole answer, so no lock is taken -- see `DlnaContext::system_update_id`.
+        let id = ctx.system_update_id.load(Ordering::Acquire);
+        write_ok(
+            tcp,
+            "text/xml; charset=\"utf-8\"",
+            build_get_system_update_id_response(id).as_bytes(),
+        );
     } else {
         write_soap_fault(tcp, 401, "Invalid Action");
     }
@@ -411,9 +649,14 @@ fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
         return;
     };
 
-    let scan = ctx.library.lock().unwrap();
-    let files: Vec<_> = scan.playable().collect();
-    let tree = &ctx.tree;
+    // One read guard for the whole lookup, so the tree and the file list it indexes into are the same
+    // snapshot (see `LibrarySnapshot`), and the `UpdateID` loaded under it is the one that snapshot
+    // was published with (see `DlnaContext::system_update_id`). Released -- explicitly, below --
+    // before a single response byte is written.
+    let library = ctx.library.read().unwrap();
+    let update_id = ctx.system_update_id.load(Ordering::Acquire);
+    let files: Vec<_> = library.scan.playable().collect();
+    let tree = &library.tree;
 
     let (objects, total) = match browse.flag {
         BrowseFlag::DirectChildren => {
@@ -438,12 +681,12 @@ fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
             }));
             combined.extend(dir.child_files.iter().filter_map(|&i| {
                 files.get(i).map(|f| DidlObject {
-                    id: format!("f{i}"),
+                    id: tree.file_id(i).to_string(),
                     parent_id: dir.id.clone(),
                     title: f.label(),
                     class: object_class_for(f.container),
                     resource: Some(DidlResource {
-                        url: format!("{}/dlna/stream/f{i}", ctx.base_url),
+                        url: format!("{}/dlna/stream/{}", ctx.base_url, tree.file_id(i)),
                         mime_type: content_type_for(f.container, f.extension.as_deref())
                             .to_string(),
                         size_bytes: Some(f.size),
@@ -482,18 +725,16 @@ fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
                     }],
                     1,
                 )
-            } else if let Some(i) =
-                browse.object_id.strip_prefix('f').and_then(|s| s.parse::<usize>().ok())
-            {
+            } else if let Some(i) = tree.file_position(&browse.object_id) {
                 match (files.get(i), tree.file_parent.get(i)) {
                     (Some(f), Some(parent_id)) => (
                         vec![DidlObject {
-                            id: format!("f{i}"),
+                            id: tree.file_id(i).to_string(),
                             parent_id: parent_id.clone(),
                             title: f.label(),
                             class: object_class_for(f.container),
                             resource: Some(DidlResource {
-                                url: format!("{}/dlna/stream/f{i}", ctx.base_url),
+                                url: format!("{}/dlna/stream/{}", ctx.base_url, tree.file_id(i)),
                                 mime_type: content_type_for(f.container, f.extension.as_deref())
                                     .to_string(),
                                 size_bytes: Some(f.size),
@@ -507,8 +748,9 @@ fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
                     }
                 }
             } else {
-                // Neither a known directory nor a known file -- an unknown "d<n>"/"f<n>" index, or a
-                // bare-numeric legacy id from Stage 1's now-retired flat scheme.
+                // Neither a known directory nor a known file -- a "d<n>"/"f<n>" this process never
+                // issued, one it issued for a path that has since gone away, or a bare-numeric
+                // legacy id from Stage 1's now-retired flat scheme.
                 write_soap_fault(tcp, 701, "No such object");
                 return;
             }
@@ -516,7 +758,11 @@ fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
     };
 
     let didl = build_didl_lite(&objects);
-    let response = build_browse_response(&didl, objects.len() as u32, total as u32, 1);
+    let response = build_browse_response(&didl, objects.len() as u32, total as u32, update_id);
+    // `objects` borrows nothing from the snapshot (every `DidlObject` owns its strings), so the lock
+    // can go before the socket write -- a client draining this response slowly must not be able to
+    // stall a refresh, and through it every other reader, behind its own socket.
+    drop(library);
     write_ok(tcp, "text/xml; charset=\"utf-8\"", response.as_bytes());
 }
 
@@ -532,14 +778,16 @@ fn handle_search(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
         write_soap_fault(tcp, 402, "Invalid Args");
         return;
     };
-    let tree = &ctx.tree;
+    // Same one-guard-for-the-whole-lookup shape as `handle_browse`, for the same consistency reason.
+    let library = ctx.library.read().unwrap();
+    let update_id = ctx.system_update_id.load(Ordering::Acquire);
+    let tree = &library.tree;
     if tree.dir_by_id(&search.container_id).is_none() {
         write_soap_fault(tcp, 701, "No such object");
         return;
     }
 
-    let scan = ctx.library.lock().unwrap();
-    let files: Vec<_> = scan.playable().collect();
+    let files: Vec<_> = library.scan.playable().collect();
 
     let matched: Vec<usize> = match &search.criteria {
         SearchCriteria::MatchAll => collect_file_indices_recursive(tree, &search.container_id),
@@ -570,7 +818,7 @@ fn handle_search(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
         .take(count)
         .filter_map(|i| {
             files.get(i).map(|f| DidlObject {
-                id: format!("f{i}"),
+                id: tree.file_id(i).to_string(),
                 // The file's own true immediate parent (from `LibraryTree::file_parent`), never
                 // `search.container_id` -- a search recursing several levels down must report each
                 // result's real containing directory, exactly like `Browse(Metadata)` on a file
@@ -579,7 +827,7 @@ fn handle_search(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
                 title: f.label(),
                 class: object_class_for(f.container),
                 resource: Some(DidlResource {
-                    url: format!("{}/dlna/stream/f{i}", ctx.base_url),
+                    url: format!("{}/dlna/stream/{}", ctx.base_url, tree.file_id(i)),
                     mime_type: content_type_for(f.container, f.extension.as_deref()).to_string(),
                     size_bytes: Some(f.size),
                 }),
@@ -588,7 +836,8 @@ fn handle_search(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
         .collect();
 
     let didl = build_didl_lite(&objects);
-    let response = build_cd_search_response(&didl, objects.len() as u32, total as u32, 1);
+    let response = build_cd_search_response(&didl, objects.len() as u32, total as u32, update_id);
+    drop(library); // Before the socket write, for the reason `handle_browse` gives.
     write_ok(tcp, "text/xml; charset=\"utf-8\"", response.as_bytes());
 }
 
@@ -630,21 +879,21 @@ fn handle_connection_manager_control(tcp: &mut TcpStream, req: &HttpRequest, _bo
 }
 
 fn serve_stream(tcp: &mut TcpStream, req: &HttpRequest, id: &str, ctx: &DlnaContext) {
-    let scan = ctx.library.lock().unwrap();
-    // `/dlna/stream/<id>` URLs are built with the same "f<n>" ids `build_didl_lite`-driven items carry
-    // (see `handle_browse` and `handle_search`) -- strip that prefix before the numeric lookup so
-    // this parses exactly the ids this responder itself hands out.
-    let Some(f) = id
-        .strip_prefix('f')
-        .and_then(|s| s.parse::<usize>().ok())
-        .and_then(|i| scan.playable().nth(i))
+    let library = ctx.library.read().unwrap();
+    // `/dlna/stream/<id>` URLs carry the same "f<n>" ids `build_didl_lite`-driven items do (see
+    // `handle_browse` and `handle_search`), so the lookup is the tree's own id -> position map, never
+    // a parse of `<n>` as a list position. Resolved against whatever snapshot is current *now*, which
+    // is safe precisely because a refresh carries ids forward per path (see `LibraryTree::build`): a
+    // URL a renderer is mid-playback on names the same file after a refresh as before it, and names
+    // nothing (`404`) only if that file really is gone.
+    let Some(f) = library.tree.file_position(id).and_then(|i| library.scan.playable().nth(i))
     else {
         write_error(tcp, 404, "Not Found");
         return;
     };
     let path = f.path.clone();
     let content_type = content_type_for(f.container, f.extension.as_deref()).to_string();
-    drop(scan);
+    drop(library);
 
     let Ok(mut file) = std::fs::File::open(&path) else {
         write_error(tcp, 404, "Not Found");
@@ -953,18 +1202,63 @@ mod tests {
         let root = d.0.canonicalize().unwrap();
         let scan =
             crate::scan::scan(std::slice::from_ref(&root), &crate::scan::ScanOptions::default());
-        let tree = LibraryTree::build(&scan, &root);
+        let tree = LibraryTree::build(&scan, &root, None);
         (d, root, scan, tree)
     }
 
-    fn test_context(tree: LibraryTree, scan: Scan) -> DlnaContext {
+    /// A context over an already-built snapshot, exactly as `run` assembles one at startup --
+    /// `system_update_id` at [`INITIAL_SYSTEM_UPDATE_ID`], no watcher (the refresh tests call
+    /// `refresh_library` directly, so they never have to wait on real filesystem events or the
+    /// debounce). `root` is what a refresh re-walks, so it must be the same canonical root the
+    /// snapshot was scanned from.
+    fn test_context(tree: LibraryTree, scan: Scan, root: PathBuf) -> DlnaContext {
         DlnaContext {
-            library: Arc::new(Mutex::new(scan)),
-            tree,
+            library: RwLock::new(LibrarySnapshot { scan, tree }),
+            system_update_id: AtomicU32::new(INITIAL_SYSTEM_UPDATE_ID),
+            library_root: root,
             base_url: "http://127.0.0.1:7891".to_string(),
             friendly_name: "test".to_string(),
             uuid: "00000000-0000-4000-8000-000000000000".to_string(),
         }
+    }
+
+    /// The `<UpdateID>` a `Browse`/`Search` response carries, or the `<Id>` a `GetSystemUpdateID`
+    /// response carries -- both are the plain decimal text of one leaf element.
+    fn leaf_u32(response: &str, tag: &str) -> u32 {
+        let open = format!("<{tag}>");
+        let start = response.find(&open).unwrap_or_else(|| panic!("no <{tag}> in: {response}"))
+            + open.len();
+        let end = start + response[start..].find('<').expect("a closing tag");
+        response[start..end].parse().unwrap_or_else(|_| panic!("<{tag}> is not a u32: {response}"))
+    }
+
+    /// Drives `handle_content_directory_control` with a real `#GetSystemUpdateID` SOAPACTION over a
+    /// real loopback connection, the same way [`browse`]/[`search`] drive their own actions, and
+    /// returns the full response text. The body is the spec's own empty-argument-list envelope.
+    fn get_system_update_id(ctx: &DlnaContext) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).unwrap();
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "soapaction".to_string(),
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#GetSystemUpdateID\"".to_string(),
+        );
+        let req = HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
+        let body = "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">\
+                    <s:Body><u:GetSystemUpdateID xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\"/>\
+                    </s:Body></s:Envelope>";
+        handle_content_directory_control(&mut server_stream, &req, body.as_bytes(), ctx);
+        drop(server_stream);
+
+        reader.join().unwrap()
     }
 
     /// The inverse of `lumen_discovery::content_directory`'s own (private) `escape_xml` -- duplicated
@@ -1070,6 +1364,42 @@ mod tests {
         reader.join().unwrap()
     }
 
+    /// Drives `route` with a real `GET /dlna/stream/<id>` -- the request a renderer sends for the
+    /// `<res>` URL a `Browse` handed it, including the fresh-connection `Range` re-request every real
+    /// renderer issues on a seek -- over a real loopback TCP connection, returning the status code and
+    /// the body bytes. Goes through `route` rather than `serve_stream` directly so the prefix-stripping
+    /// the real path takes is exercised too.
+    fn fetch_stream(ctx: &DlnaContext, id: &str, range: Option<&str>) -> (u16, Vec<u8>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).unwrap();
+            resp
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut headers = HashMap::new();
+        if let Some(range) = range {
+            headers.insert("range".to_string(), range.to_string());
+        }
+        let req = HttpRequest { method: "GET".into(), path: format!("/dlna/stream/{id}"), headers };
+        route(&mut server_stream, &req, b"", ctx);
+        drop(server_stream);
+
+        let raw = reader.join().unwrap();
+        let header_end = find_header_end(&raw).expect("a complete response header block");
+        let status: u16 = std::str::from_utf8(&raw[..header_end])
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .expect("a status code")
+            .parse()
+            .expect("a numeric status code");
+        (status, raw[header_end..].to_vec())
+    }
+
     /// Pulls the DIDL-Lite text back out of a `Browse` response's `<Result>...</Result>`, unescaped so
     /// assertions can read it directly (`build_browse_response`'s own doc explains why it is escaped
     /// once more on the way in).
@@ -1109,7 +1439,7 @@ mod tests {
         let root = d.0.canonicalize().unwrap();
         let scan =
             crate::scan::scan(std::slice::from_ref(&root), &crate::scan::ScanOptions::default());
-        let tree = LibraryTree::build(&scan, &root);
+        let tree = LibraryTree::build(&scan, &root, None);
 
         let root_node = tree.dir_by_id("0").unwrap();
         assert_eq!(root_node.child_files.len(), 1, "Root.mkv attaches directly to the root");
@@ -1152,7 +1482,7 @@ mod tests {
 
     #[test]
     fn root_direct_children_lists_directories_before_files_with_correct_ids() {
-        let (_d, _root, scan, tree) = scan_tree(
+        let (_d, root, scan, tree) = scan_tree(
             "root-children",
             &[
                 ("Movies/Interstellar.mkv", b"a"),
@@ -1161,7 +1491,7 @@ mod tests {
                 ("RootFile.mkv", b"d"),
             ],
         );
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let response = browse(&ctx, "0", "BrowseDirectChildren", 0, 0);
         assert!(response.contains("<NumberReturned>3</NumberReturned>"), "{response}");
@@ -1182,7 +1512,7 @@ mod tests {
 
     #[test]
     fn a_directorys_direct_children_returns_only_its_own_children() {
-        let (_d, _root, scan, tree) = scan_tree(
+        let (_d, root, scan, tree) = scan_tree(
             "dir-children",
             &[
                 ("Movies/Interstellar.mkv", b"a"),
@@ -1192,7 +1522,7 @@ mod tests {
         );
         // "Shows" is the second directory created (Movies is created first, from the
         // alphabetically-earlier `Movies/Interstellar.mkv`), so it is "d1".
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let response = browse(&ctx, "d1", "BrowseDirectChildren", 0, 0);
         assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
@@ -1206,9 +1536,9 @@ mod tests {
 
     #[test]
     fn metadata_resolves_the_root_a_directory_and_a_file_and_rejects_every_unknown_shape() {
-        let (_d, _root, scan, tree) =
+        let (_d, root, scan, tree) =
             scan_tree("metadata", &[("Movies/Interstellar.mkv", b"a"), ("RootFile.mkv", b"d")]);
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let root_didl = result_didl(&browse(&ctx, "0", "BrowseMetadata", 0, 0));
         assert!(root_didl.contains("<container id=\"0\" parentID=\"-1\""), "{root_didl}");
@@ -1236,8 +1566,8 @@ mod tests {
         // been object id "0" -- the exact same string as the root container's own fixed id. A client
         // asking `Browse("0", Metadata)` could only ever reach the root, never this file. Confirm both
         // ids now resolve to their own, distinct object.
-        let (_d, _root, scan, tree) = scan_tree("collision", &[("OnlyFile.mkv", b"x")]);
-        let ctx = test_context(tree, scan);
+        let (_d, root, scan, tree) = scan_tree("collision", &[("OnlyFile.mkv", b"x")]);
+        let ctx = test_context(tree, scan, root);
 
         let root_didl = result_didl(&browse(&ctx, "0", "BrowseMetadata", 0, 0));
         assert!(root_didl.contains("<dc:title>lumen</dc:title>"), "{root_didl}");
@@ -1252,8 +1582,232 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_after_a_file_is_added_on_disk_makes_browse_list_it_and_advances_system_update_id()
+    {
+        let (d, root, scan, tree) = scan_tree("refresh-add", &[("Movies/Interstellar.mkv", b"a")]);
+        let ctx = test_context(tree, scan, root);
+
+        // Before: exactly the one file, at the starting UpdateID every response always carried.
+        let before = browse(&ctx, "0", "BrowseDirectChildren", 0, 0);
+        assert_eq!(leaf_u32(&before, "UpdateID"), INITIAL_SYSTEM_UPDATE_ID, "{before}");
+        let movies_before = result_didl(&browse(&ctx, "d0", "BrowseDirectChildren", 0, 0));
+        assert!(movies_before.contains("Interstellar"), "{movies_before}");
+        assert!(!movies_before.contains("Tenet"), "{movies_before}");
+
+        // A file lands on disk. Nothing this context serves changes until a refresh runs -- the
+        // snapshot is a snapshot, not a live view of the filesystem.
+        d.file("Movies/Tenet.mkv", b"b");
+        let unrefreshed = result_didl(&browse(&ctx, "d0", "BrowseDirectChildren", 0, 0));
+        assert!(!unrefreshed.contains("Tenet"), "no refresh has run yet: {unrefreshed}");
+
+        // The exact function the watcher's callback calls, invoked directly.
+        let (file_count, id) = refresh_library(&ctx);
+        assert_eq!(file_count, 2, "the re-walk must see both files");
+        assert_eq!(id, INITIAL_SYSTEM_UPDATE_ID + 1, "one completed refresh, one increment");
+        assert_eq!(ctx.system_update_id.load(Ordering::Acquire), id);
+
+        let after = browse(&ctx, "d0", "BrowseDirectChildren", 0, 0);
+        assert_eq!(leaf_u32(&after, "UpdateID"), id, "{after}");
+        let movies_after = result_didl(&after);
+        assert!(movies_after.contains("Interstellar"), "{movies_after}");
+        assert!(movies_after.contains("Tenet"), "the new file must now be listed: {movies_after}");
+        assert_eq!(movies_after.matches("<item").count(), 2, "{movies_after}");
+    }
+
+    #[test]
+    fn a_refresh_keeps_every_surviving_objects_id_and_only_a_new_path_draws_a_fresh_one() {
+        // `scan::scan` sorts by path, so a file that sorts *before* every existing one would have
+        // shifted every id when `"f<n>"` was a list position. Now it must not: Yak stays "f0" (and
+        // Shows stays "d0") through a refresh that puts new entries ahead of both in walk order, the
+        // newcomers get numbers the previous tree never issued, and the rebuilt tree's
+        // `child_files` still index the rebuilt scan with no off-by-one.
+        let (d, root, scan, tree) =
+            scan_tree("refresh-stable-ids", &[("Shows/Zebra.mkv", b"z"), ("Shows/Yak.mkv", b"y")]);
+        let ctx = test_context(tree, scan, root);
+        let f0_before = result_didl(&browse(&ctx, "f0", "BrowseMetadata", 0, 0));
+        assert!(f0_before.contains("<item id=\"f0\" parentID=\"d0\""), "{f0_before}");
+        assert!(f0_before.contains("<dc:title>Yak</dc:title>"), "{f0_before}");
+
+        // Both sort first: a file directly under the root, and a whole new directory, ahead of `Shows/`.
+        d.file("Aardvark.mkv", b"a");
+        d.file("Anthology/Ant.mkv", b"ant");
+        refresh_library(&ctx);
+
+        let f0_after = result_didl(&browse(&ctx, "f0", "BrowseMetadata", 0, 0));
+        assert!(f0_after.contains("<dc:title>Yak</dc:title>"), "f0 is still Yak: {f0_after}");
+        assert!(
+            f0_after.contains("<item id=\"f0\" parentID=\"d0\""),
+            "and its parent is still the Shows node, still d0: {f0_after}"
+        );
+        let f1_after = result_didl(&browse(&ctx, "f1", "BrowseMetadata", 0, 0));
+        assert!(f1_after.contains("<dc:title>Zebra</dc:title>"), "{f1_after}");
+
+        let shows = result_didl(&browse(&ctx, "d0", "BrowseDirectChildren", 0, 0));
+        assert!(shows.contains("Yak") && shows.contains("Zebra"), "{shows}");
+        assert!(!shows.contains("Aardvark") && !shows.contains("Ant"), "{shows}");
+
+        // The two newcomers drew the next unused numbers in walk order -- `scan` sorts by full path,
+        // and "Aardvark.mkv" < "Anthology/Ant.mkv" < "Shows/...", so Aardvark is f2, Ant is f3, and
+        // Anthology is the first directory created after Shows: d1.
+        let root_didl = result_didl(&browse(&ctx, "0", "BrowseDirectChildren", 0, 0));
+        assert!(root_didl.contains("<container id=\"d1\" parentID=\"0\""), "{root_didl}");
+        assert!(root_didl.contains("<dc:title>Anthology</dc:title>"), "{root_didl}");
+        assert!(root_didl.contains("<item id=\"f2\" parentID=\"0\""), "{root_didl}");
+        assert!(root_didl.contains("<dc:title>Aardvark</dc:title>"), "{root_didl}");
+        let anthology = result_didl(&browse(&ctx, "d1", "BrowseDirectChildren", 0, 0));
+        assert!(anthology.contains("<item id=\"f3\" parentID=\"d1\""), "{anthology}");
+        assert!(anthology.contains("<dc:title>Ant</dc:title>"), "{anthology}");
+    }
+
+    #[test]
+    fn a_retired_id_is_never_reissued_and_a_path_that_comes_back_is_a_new_object() {
+        // Remove Yak, refresh, then put a file back at the very same path and refresh again. The
+        // counter only counts up, so the returned file is a brand-new object with a fresh id and the
+        // old "f0" stays dead -- a renderer that cached the old URL cannot be handed bytes it did not
+        // ask for just because a path was reused, and a control point that saw SystemUpdateID move
+        // sees a genuinely new item, which is what actually happened on disk.
+        let (d, root, scan, tree) =
+            scan_tree("retired-ids", &[("Yak.mkv", b"y"), ("Zebra.mkv", b"z")]);
+        let ctx = test_context(tree, scan, root);
+        assert_eq!(fetch_stream(&ctx, "f0", None), (200, b"y".to_vec()));
+
+        std::fs::remove_file(d.0.join("Yak.mkv")).unwrap();
+        refresh_library(&ctx);
+        assert_eq!(fetch_stream(&ctx, "f0", None).0, 404);
+        let gone = browse(&ctx, "f0", "BrowseMetadata", 0, 0);
+        assert!(gone.contains("<errorCode>701</errorCode>"), "{gone}");
+        assert_eq!(fetch_stream(&ctx, "f1", None), (200, b"z".to_vec()), "Zebra is untouched");
+
+        d.file("Yak.mkv", b"y2");
+        refresh_library(&ctx);
+        assert_eq!(fetch_stream(&ctx, "f0", None).0, 404, "the retired id stays retired");
+        let root_didl = result_didl(&browse(&ctx, "0", "BrowseDirectChildren", 0, 0));
+        assert!(root_didl.contains("<item id=\"f2\" parentID=\"0\""), "{root_didl}");
+        assert!(root_didl.contains("<item id=\"f1\" parentID=\"0\""), "{root_didl}");
+        assert!(!root_didl.contains("id=\"f0\""), "{root_didl}");
+        assert_eq!(fetch_stream(&ctx, "f2", None), (200, b"y2".to_vec()));
+    }
+
+    #[test]
+    fn a_stream_url_handed_out_before_a_refresh_still_serves_the_same_file_after_it() {
+        // The scenario a real renderer produces: it is playing `Yak.mkv` via the `<res>` URL a
+        // `Browse` gave it, a file that sorts *before* Yak lands on disk, the watcher refreshes, and
+        // the renderer's next seek is a fresh `GET` of that same URL with a `Range` header. It must
+        // get Yak's bytes -- never a `206` full of some other file's, and never a `404` for a file
+        // that is still right there on disk.
+        let (d, root, scan, tree) =
+            scan_tree("stable-stream", &[("Shows/Zebra.mkv", b"zebra"), ("Shows/Yak.mkv", b"yak")]);
+        let ctx = test_context(tree, scan, root);
+        let shows = result_didl(&browse(&ctx, "d0", "BrowseDirectChildren", 0, 0));
+        let yak_id = {
+            let pos = shows.find("<dc:title>Yak</dc:title>").unwrap();
+            let open = shows[..pos].rfind("<item id=\"").unwrap() + "<item id=\"".len();
+            shows[open..open + shows[open..].find('"').unwrap()].to_string()
+        };
+        let (status, body) = fetch_stream(&ctx, &yak_id, None);
+        assert_eq!((status, body.as_slice()), (200, &b"yak"[..]));
+
+        d.file("Aardvark.mkv", b"aardvark"); // Sorts first: before `Shows/` and everything in it.
+        refresh_library(&ctx);
+
+        let (status, body) = fetch_stream(&ctx, &yak_id, Some("bytes=1-"));
+        assert_eq!(status, 206, "a Range re-request of a still-present file is a real 206");
+        assert_eq!(
+            body, b"ak",
+            "the bytes after a refresh must come from the same file the URL was handed out for"
+        );
+
+        // And a file that really did go away is an honest 404 on its old URL -- while the survivors'
+        // URLs keep working, untouched by the removal.
+        std::fs::remove_file(d.0.join("Shows/Zebra.mkv")).unwrap();
+        let zebra_id = {
+            let pos = shows.find("<dc:title>Zebra</dc:title>").unwrap();
+            let open = shows[..pos].rfind("<item id=\"").unwrap() + "<item id=\"".len();
+            shows[open..open + shows[open..].find('"').unwrap()].to_string()
+        };
+        refresh_library(&ctx);
+        assert_eq!(fetch_stream(&ctx, &zebra_id, None).0, 404, "Zebra is gone: {zebra_id}");
+        assert_eq!(fetch_stream(&ctx, &yak_id, None), (200, b"yak".to_vec()));
+    }
+
+    #[test]
+    fn every_browse_and_search_response_reports_the_contexts_current_system_update_id() {
+        let (_d, root, scan, tree) =
+            scan_tree("update-id-echo", &[("Movies/Interstellar.mkv", b"a")]);
+        let ctx = test_context(tree, scan, root);
+
+        // Advance the counter past its starting value by real refreshes, not by poking the atomic --
+        // the claim is that responses echo whatever the *refresh path* left there.
+        refresh_library(&ctx);
+        refresh_library(&ctx);
+        refresh_library(&ctx);
+        let current = ctx.system_update_id.load(Ordering::Acquire);
+        assert_eq!(current, INITIAL_SYSTEM_UPDATE_ID + 3);
+
+        for flag in ["BrowseDirectChildren", "BrowseMetadata"] {
+            let response = browse(&ctx, "0", flag, 0, 0);
+            assert_eq!(leaf_u32(&response, "UpdateID"), current, "{flag}: {response}");
+        }
+        let file_meta = browse(&ctx, "f0", "BrowseMetadata", 0, 0);
+        assert_eq!(leaf_u32(&file_meta, "UpdateID"), current, "{file_meta}");
+        let search_response = search(&ctx, "0", "*", 0, 0);
+        assert_eq!(leaf_u32(&search_response, "UpdateID"), current, "{search_response}");
+        let title_search = search(&ctx, "0", "dc:title contains \"inter\"", 0, 0);
+        assert_eq!(leaf_u32(&title_search, "UpdateID"), current, "{title_search}");
+    }
+
+    #[test]
+    fn get_system_update_id_answers_over_the_control_endpoint_and_tracks_every_refresh() {
+        let (_d, root, scan, tree) = scan_tree("get-system-update-id", &[("A.mkv", b"a")]);
+        let ctx = test_context(tree, scan, root);
+
+        let response = get_system_update_id(&ctx);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("<u:GetSystemUpdateIDResponse"), "{response}");
+        assert_eq!(leaf_u32(&response, "Id"), INITIAL_SYSTEM_UPDATE_ID, "{response}");
+
+        let (_, after_first) = refresh_library(&ctx);
+        assert_eq!(leaf_u32(&get_system_update_id(&ctx), "Id"), after_first);
+        let (_, after_second) = refresh_library(&ctx);
+        assert_eq!(leaf_u32(&get_system_update_id(&ctx), "Id"), after_second);
+        assert_eq!(after_second, after_first + 1);
+
+        // And it is the same number a Browse issued right now would report -- one counter, not two.
+        let browse_now = browse(&ctx, "0", "BrowseDirectChildren", 0, 0);
+        assert_eq!(leaf_u32(&browse_now, "UpdateID"), after_second, "{browse_now}");
+    }
+
+    #[test]
+    fn an_undeclared_content_directory_action_is_still_a_401_fault() {
+        // The SCPD now declares three actions; anything else must remain the honest `Invalid Action`
+        // fault, not fall through into one of the real handlers by accident of substring matching.
+        let (_d, root, scan, tree) = scan_tree("invalid-action", &[("A.mkv", b"a")]);
+        let ctx = test_context(tree, scan, root);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).unwrap();
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let mut headers = HashMap::new();
+        headers.insert(
+            "soapaction".to_string(),
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#GetSearchCapabilities\"".to_string(),
+        );
+        let req = HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
+        handle_content_directory_control(&mut server_stream, &req, b"", &ctx);
+        drop(server_stream);
+        let response = reader.join().unwrap();
+        assert!(response.contains("<errorCode>401</errorCode>"), "{response}");
+    }
+
+    #[test]
     fn pagination_applies_over_the_combined_directories_then_files_sequence() {
-        let (_d, _root, scan, tree) = scan_tree(
+        let (_d, root, scan, tree) = scan_tree(
             "paginate",
             &[
                 ("Movies/Interstellar.mkv", b"a"),
@@ -1262,7 +1816,7 @@ mod tests {
             ],
         );
         // Root's combined DirectChildren sequence is [Movies(d0), Shows(d1), RootFile(f1)] -- 3 total.
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let response = browse(&ctx, "0", "BrowseDirectChildren", 1, 1);
         assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
@@ -1281,7 +1835,7 @@ mod tests {
 
     #[test]
     fn search_match_all_finds_every_file_recursively_not_just_direct_children() {
-        let (_d, _root, scan, tree) = scan_tree(
+        let (_d, root, scan, tree) = scan_tree(
             "search-matchall",
             &[
                 ("Movies/Interstellar.mkv", b"a"),
@@ -1290,7 +1844,7 @@ mod tests {
                 ("RootFile.mkv", b"d"),
             ],
         );
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let response = search(&ctx, "0", "*", 0, 0);
         assert!(response.contains("<NumberReturned>4</NumberReturned>"), "{response}");
@@ -1316,7 +1870,7 @@ mod tests {
 
     #[test]
     fn search_title_contains_matches_case_insensitively_and_only_the_right_files() {
-        let (_d, _root, scan, tree) = scan_tree(
+        let (_d, root, scan, tree) = scan_tree(
             "search-title",
             &[
                 ("Movies/Interstellar.mkv", b"a"),
@@ -1324,7 +1878,7 @@ mod tests {
                 ("Shows/Chernobyl/Season 01/Chernobyl.S01E02.mkv", b"c"),
             ],
         );
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let response = search(&ctx, "0", "dc:title contains \"CHERNOBYL\"", 0, 0);
         assert!(response.contains("<NumberReturned>2</NumberReturned>"), "{response}");
@@ -1336,7 +1890,7 @@ mod tests {
 
     #[test]
     fn search_from_a_non_root_container_only_returns_files_under_that_subtree() {
-        let (_d, _root, scan, tree) = scan_tree(
+        let (_d, root, scan, tree) = scan_tree(
             "search-subtree",
             &[
                 ("Movies/Interstellar.mkv", b"a"),
@@ -1347,7 +1901,7 @@ mod tests {
         // "Shows" is the second directory created (Movies is created first, from the
         // alphabetically-earlier `Movies/Interstellar.mkv`), so it is "d1" -- matching
         // `a_directorys_direct_children_returns_only_its_own_children`'s own fixture and reasoning.
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let response = search(&ctx, "d1", "*", 0, 0);
         assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
@@ -1359,9 +1913,9 @@ mod tests {
 
     #[test]
     fn search_pagination_works_like_browses_over_the_matched_flat_list() {
-        let (_d, _root, scan, tree) =
+        let (_d, root, scan, tree) =
             scan_tree("search-paginate", &[("A.mkv", b"a"), ("B.mkv", b"b"), ("C.mkv", b"c")]);
-        let ctx = test_context(tree, scan);
+        let ctx = test_context(tree, scan, root);
 
         let response = search(&ctx, "0", "*", 1, 1);
         assert!(response.contains("<NumberReturned>1</NumberReturned>"), "{response}");
@@ -1373,8 +1927,8 @@ mod tests {
 
     #[test]
     fn search_with_an_unknown_container_id_is_a_701_fault() {
-        let (_d, _root, scan, tree) = scan_tree("search-unknown", &[("A.mkv", b"a")]);
-        let ctx = test_context(tree, scan);
+        let (_d, root, scan, tree) = scan_tree("search-unknown", &[("A.mkv", b"a")]);
+        let ctx = test_context(tree, scan, root);
 
         let response = search(&ctx, "d999", "*", 0, 0);
         assert!(response.contains("<errorCode>701</errorCode>"), "{response}");
@@ -1382,8 +1936,8 @@ mod tests {
 
     #[test]
     fn search_with_unsupported_criteria_is_a_708_fault() {
-        let (_d, _root, scan, tree) = scan_tree("search-unsupported", &[("A.mkv", b"a")]);
-        let ctx = test_context(tree, scan);
+        let (_d, root, scan, tree) = scan_tree("search-unsupported", &[("A.mkv", b"a")]);
+        let ctx = test_context(tree, scan, root);
 
         let response = search(&ctx, "0", "dc:creator contains \"X\"", 0, 0);
         assert!(response.contains("<errorCode>708</errorCode>"), "{response}");

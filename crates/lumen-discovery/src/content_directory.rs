@@ -294,6 +294,24 @@ fn build_content_directory_response(
     )
 }
 
+/// `ContentDirectory:1#GetSystemUpdateID`'s response: the current `SystemUpdateID` as its single
+/// `Id` out-argument. Per the UPnP `ContentDirectory:1` spec a control point compares this value (or
+/// the `UpdateID` every `Browse`/`Search` response already carries) against the one it last saw and
+/// re-browses whatever it has cached when they differ -- which is why a server whose library can
+/// change underneath a client must answer this action with a value that actually moves, rather than
+/// the constant this crate's callers passed before `dlna.rs` grew a live refresh. The value is a
+/// UPnP `ui4`, so `u32` here and in the SCPD, not a wider integer.
+pub fn build_get_system_update_id_response(id: u32) -> String {
+    format!(
+        "<?xml version=\"1.0\"?>\
+         <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+         s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+         <s:Body><u:GetSystemUpdateIDResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+         <Id>{id}</Id>\
+         </u:GetSystemUpdateIDResponse></s:Body></s:Envelope>"
+    )
+}
+
 /// A SOAP fault, for a `Browse` request this responder could not satisfy -- an unrecognised
 /// `ObjectID`, chief among the real cases, is `701` ("No such object") per the ContentDirectory spec.
 pub fn build_soap_fault(code: u32, description: &str) -> String {
@@ -491,6 +509,30 @@ mod tests {
         // like a real child element of `<Result>` instead of text content).
         assert!(response.contains("&lt;DIDL-Lite"));
         assert!(!response.contains("<Result><DIDL-Lite"));
+    }
+
+    #[test]
+    fn a_get_system_update_id_response_carries_the_id_in_its_own_response_element() {
+        let response = build_get_system_update_id_response(42);
+        assert!(response.contains("<u:GetSystemUpdateIDResponse"), "{response}");
+        assert!(response.contains("</u:GetSystemUpdateIDResponse>"), "{response}");
+        assert!(response.contains("<Id>42</Id>"), "{response}");
+        assert!(
+            response.contains("urn:schemas-upnp-org:service:ContentDirectory:1"),
+            "the response element must be in the ContentDirectory namespace: {response}"
+        );
+        assert!(
+            !response.contains("<Result>") && !response.contains("<UpdateID>"),
+            "GetSystemUpdateID has exactly one out-argument, Id -- not Browse's shape: {response}"
+        );
+    }
+
+    #[test]
+    fn a_get_system_update_id_response_renders_the_full_ui4_range_without_wrapping_or_signing() {
+        // `SystemUpdateID` is a UPnP `ui4`: the largest value a client could legitimately be told must
+        // render as that exact unsigned decimal, never a negative number or a truncated one.
+        let response = build_get_system_update_id_response(u32::MAX);
+        assert!(response.contains("<Id>4294967295</Id>"), "{response}");
     }
 
     #[test]

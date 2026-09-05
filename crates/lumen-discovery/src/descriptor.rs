@@ -56,16 +56,24 @@ pub fn build_device_description(identity: &DeviceIdentity, base_url: &str) -> St
     )
 }
 
-/// `ContentDirectory:1`'s SCPD: the two actions this responder actually implements (`Browse` and
-/// `Search` -- the latter only over the bounded `SearchCriteria` subset `content_directory`'s own
-/// module doc describes: `"*"` and single-clause `dc:title contains "..."`, not the full UPnP search
-/// grammar), plus the two read-only state variables every real client expects to find declared even
-/// when it never queries them directly (`SystemUpdateID`, `SortCriteria`). Declaring an action this
-/// server does not implement would be the dishonest direction to get wrong -- a client that trusts the
-/// SCPD and calls it gets a SOAP fault it had no way to expect. `Search`'s `ContainerID` argument
-/// reuses `A_ARG_TYPE_ObjectID` rather than declaring its own state variable, matching the real UPnP
-/// `ContentDirectory:1` spec's own SCPD (a container id and an object id are the same string type;
-/// UPnP does not require a state variable's name to mirror the argument name that uses it).
+/// `ContentDirectory:1`'s SCPD: the three actions this responder actually implements (`Browse`;
+/// `Search` -- only over the bounded `SearchCriteria` subset `content_directory`'s own module doc
+/// describes: `"*"` and single-clause `dc:title contains "..."`, not the full UPnP search grammar;
+/// and `GetSystemUpdateID`, whose single `Id` out-argument is the evented `SystemUpdateID` state
+/// variable itself, answered from `dlna.rs`'s live counter -- see
+/// [`crate::build_get_system_update_id_response`]), plus the read-only state variables every real
+/// client expects to find declared even when it never queries them directly (`SortCriteria` among
+/// them). Declaring an action this server does not implement would be the dishonest direction to get
+/// wrong -- a client that trusts the SCPD and calls it gets a SOAP fault it had no way to expect --
+/// which is exactly why `GetSystemUpdateID` was *not* declared until `dlna.rs` had a value that
+/// actually moves to answer it with. `SystemUpdateID` is declared `sendEvents="yes"` per the spec,
+/// but this responder serves no `eventSubURL` subscription (GENA) -- a client learns of a change by
+/// polling `GetSystemUpdateID` or by comparing the `UpdateID` its next `Browse` returns, both of which
+/// real renderers already do; pushing GENA events is future work, not a claim made here. `Search`'s
+/// `ContainerID` argument reuses `A_ARG_TYPE_ObjectID` rather than declaring its own state variable,
+/// matching the real UPnP `ContentDirectory:1` spec's own SCPD (a container id and an object id are
+/// the same string type; UPnP does not require a state variable's name to mirror the argument name
+/// that uses it).
 pub fn content_directory_scpd() -> &'static str {
     "<?xml version=\"1.0\"?>\
      <scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\
@@ -99,6 +107,12 @@ pub fn content_directory_scpd() -> &'static str {
      <argument><name>NumberReturned</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
      <argument><name>TotalMatches</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Count</relatedStateVariable></argument>\
      <argument><name>UpdateID</name><direction>out</direction><relatedStateVariable>A_ARG_TYPE_UpdateID</relatedStateVariable></argument>\
+     </argumentList>\
+     </action>\
+     <action>\
+     <name>GetSystemUpdateID</name>\
+     <argumentList>\
+     <argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument>\
      </argumentList>\
      </action>\
      </actionList>\
@@ -220,8 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn the_content_directory_scpd_declares_exactly_the_browse_and_search_actions_this_server_implements()
-     {
+    fn the_content_directory_scpd_declares_exactly_the_three_actions_this_server_implements() {
         let scpd = content_directory_scpd();
         assert!(scpd.contains("<name>Browse</name>"));
         assert!(scpd.contains("<name>ObjectID</name>"));
@@ -232,6 +245,31 @@ mod tests {
         assert!(
             scpd.contains("A_ARG_TYPE_SearchCriteria"),
             "SearchCriteria must be declared as its own state variable: {scpd}"
+        );
+        assert!(scpd.contains("<name>GetSystemUpdateID</name>"), "{scpd}");
+        assert_eq!(
+            scpd.matches("<action>").count(),
+            3,
+            "Browse, Search, GetSystemUpdateID -- and nothing this server does not answer: {scpd}"
+        );
+    }
+
+    #[test]
+    fn get_system_update_id_is_declared_with_a_single_out_argument_bound_to_system_update_id() {
+        let scpd = content_directory_scpd();
+        let start = scpd.find("<name>GetSystemUpdateID</name>").expect("the action is declared");
+        let end = start + scpd[start..].find("</action>").expect("the action is closed");
+        let action = &scpd[start..end];
+        assert_eq!(action.matches("<argument>").count(), 1, "exactly one argument: {action}");
+        assert!(action.contains("<name>Id</name>"), "{action}");
+        assert!(action.contains("<direction>out</direction>"), "{action}");
+        assert!(
+            action.contains("<relatedStateVariable>SystemUpdateID</relatedStateVariable>"),
+            "Id must be bound to the evented SystemUpdateID variable itself, not an A_ARG_TYPE: {action}"
+        );
+        assert!(
+            scpd.contains("<stateVariable sendEvents=\"yes\"><name>SystemUpdateID</name><dataType>ui4</dataType>"),
+            "the bound state variable must still be declared as a ui4: {scpd}"
         );
     }
 
