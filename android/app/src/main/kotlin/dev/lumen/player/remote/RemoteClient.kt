@@ -3,6 +3,7 @@ package dev.lumen.player.remote
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.io.Writer
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -21,6 +22,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
@@ -58,7 +61,7 @@ class RemoteClient {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var socket: Socket? = null
-    private var writer: OutputStreamWriter? = null
+    private var writer: LineWriter? = null
     private var readerJob: Job? = null
     private var trustManager: FingerprintTrustManager? = null
     private val nextId = AtomicLong(1)
@@ -101,7 +104,7 @@ class RemoteClient {
                 tls
             }
             socket = s
-            writer = OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8)
+            writer = LineWriter(OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8))
             _connection.value = ConnectionState.AwaitingPairing
             readerJob = scope.launch { readLoop(s) }
         } catch (e: java.io.IOException) {
@@ -140,19 +143,20 @@ class RemoteClient {
         pending.clear()
     }
 
-    /** Send one request and wait for its reply, matched by id. */
-    private suspend fun send(msg: RemoteProtocol.ClientMessage): RemoteProtocol.ServerMessage {
+    /** Send one request and wait for its reply, matched by id. [timeoutMs] is how long a reply may
+     * take before the request is reported as timed out; every request but [rescan] uses the default,
+     * see [REPLY_TIMEOUT_MS] and [RESCAN_TIMEOUT_MS] for why that one differs. */
+    private suspend fun send(
+        msg: RemoteProtocol.ClientMessage,
+        timeoutMs: Long = REPLY_TIMEOUT_MS,
+    ): RemoteProtocol.ServerMessage {
         val w = writer ?: return RemoteProtocol.ServerMessage.ReplyError("", "not connected")
         val id = nextId.getAndIncrement().toString()
         val deferred = CompletableDeferred<RemoteProtocol.ServerMessage>()
         pending[id] = deferred
         return try {
-            withContext(Dispatchers.IO) {
-                w.write(msg.toLine(id))
-                w.write("\n")
-                w.flush()
-            }
-            withTimeout(REPLY_TIMEOUT_MS) { deferred.await() }
+            withContext(Dispatchers.IO) { w.writeLine(msg.toLine(id)) }
+            withTimeout(timeoutMs) { deferred.await() }
         } catch (e: SocketTimeoutException) {
             pending.remove(id)
             RemoteProtocol.ServerMessage.ReplyError(id, "timed out: ${e.message}")
@@ -193,6 +197,32 @@ class RemoteClient {
             is RemoteProtocol.ServerMessage.ReplyOk -> Result.success(reply.library.orEmpty())
             is RemoteProtocol.ServerMessage.ReplyError -> Result.failure(RemoteException(reply.message))
             else -> Result.failure(RemoteException("unexpected reply to a library request"))
+        }
+
+    /** Ask the server to re-walk its library root now. Unlike [library], the listing itself is not
+     * returned — the bumped `library_version` on the next state push is what tells the caller to
+     * fetch it, so a rescan asked for here and one the server's own filesystem watcher triggers
+     * reach the UI by the same path.
+     *
+     * Waits [RESCAN_TIMEOUT_MS] for the reply, not the usual [REPLY_TIMEOUT_MS]: the server walks the
+     * whole library before answering, so how long this takes is a property of the disk, not of the
+     * connection. */
+    suspend fun rescan(): Result<RemoteProtocol.RescanResult> =
+        when (val reply = send(RemoteProtocol.ClientMessage.Rescan, timeoutMs = RESCAN_TIMEOUT_MS)) {
+            is RemoteProtocol.ServerMessage.ReplyOk ->
+                reply.rescan?.let { Result.success(it) }
+                    ?: Result.failure(RemoteException("the server acknowledged the rescan but sent no result"))
+            is RemoteProtocol.ServerMessage.ReplyError -> Result.failure(RemoteException(reply.message))
+            else -> Result.failure(RemoteException("unexpected reply to a rescan request"))
+        }
+
+    suspend fun health(): Result<RemoteProtocol.HealthReport> =
+        when (val reply = send(RemoteProtocol.ClientMessage.Health)) {
+            is RemoteProtocol.ServerMessage.ReplyOk ->
+                reply.health?.let { Result.success(it) }
+                    ?: Result.failure(RemoteException("the server acknowledged the health request but sent no report"))
+            is RemoteProtocol.ServerMessage.ReplyError -> Result.failure(RemoteException(reply.message))
+            else -> Result.failure(RemoteException("unexpected reply to a health request"))
         }
 
     suspend fun play(path: String): Result<Unit> = simpleCommand(RemoteProtocol.ClientMessage.Play(path))
@@ -236,7 +266,52 @@ class RemoteClient {
 
     companion object {
         const val CONNECT_TIMEOUT_MS = 8_000
+
+        /** How long any ordinary request may wait for its reply. Every request this covers has
+         * bounded latency on the server: `library` reads an in-memory listing, and `health` and the
+         * playback commands each go to the mpv driver thread, whose reply the server itself waits at
+         * most five seconds for (`server.rs`'s `run_command`) before answering with an error. Eight
+         * seconds is past that bound on a working connection, so a miss means the connection, not
+         * the server's work, is the problem. */
         const val REPLY_TIMEOUT_MS = 8_000L
+
+        /** How long a [rescan] may wait for its reply. The server answers only after it has re-walked
+         * the whole library root, reading the head of every file (`scan.rs`'s `HEAD_BYTES`), and it
+         * does that on the connection's own thread — so the wait is proportional to library size and
+         * disk speed, and a few thousand files on a spinning disk or a network share can take longer
+         * than [REPLY_TIMEOUT_MS] while the server is doing exactly what was asked. Reporting that as
+         * a failure would be false: the server finishes, bumps `library_version`, and the listing
+         * refreshes anyway, while the late reply is dropped unread. Ten minutes is not a measured
+         * bound, it is a ceiling that no library this project describes should reach; it exists at
+         * all because a request with no timeout would leave a server that silently never answers
+         * indistinguishable from a slow disk forever. */
+        const val RESCAN_TIMEOUT_MS = 10 * 60_000L
+    }
+}
+
+/**
+ * The write side of the connection: one JSON line per call, written whole.
+ *
+ * [RemoteClient.send] runs on whichever coroutine asked, and two can ask at once — on connect the
+ * library and health fetches go out together — landing on two different `Dispatchers.IO` threads.
+ * A `Writer` locks per call, not per line, so writing a message and its newline as separate calls
+ * from two threads can put both messages on one line. The server parses a line as exactly one JSON
+ * value and answers the concatenation with an error naming no id, which matches no pending request,
+ * so both requests then wait out their timeouts on a connection that is perfectly healthy. The mutex
+ * makes "one line, one writer" hold no matter which thread each caller lands on.
+ *
+ * A coroutine mutex rather than `synchronized`: the write blocks for as long as the socket takes,
+ * and a second caller should suspend for that time, not pin a second IO thread spinning on a lock.
+ */
+internal class LineWriter(private val out: Writer) {
+    private val mutex = Mutex()
+
+    suspend fun writeLine(line: String) {
+        mutex.withLock {
+            out.write(line)
+            out.write("\n")
+            out.flush()
+        }
     }
 }
 
