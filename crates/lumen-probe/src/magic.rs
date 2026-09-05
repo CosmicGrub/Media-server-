@@ -26,9 +26,20 @@ pub struct Candidate {
 }
 
 /// Signatures anchored at offset 0.
+///
+/// Deliberately excluded: `#EXTM3U`. An M3U/HLS playlist is a text manifest that *names* other media
+/// files — it never demuxes as anything, let alone as the Matroska this table used to (wrongly) claim.
+/// There is no `Container` variant that fits a manifest, and inventing one just to give this signature
+/// somewhere to point would mean threading "does not apply" through every table that assumes a
+/// `Container` is directly demuxable (carriage rules, remux preference, the fidelity ladder's codec
+/// search). Recognizing `#EXTM3U` as *not a container* is a separate, smaller feature than this
+/// crate's job today; until it exists, a playlist correctly gets no confident container candidate
+/// rather than an actively wrong one.
 const AT_ZERO: &[(&[u8], Container, &str)] = &[
     (&[0x1A, 0x45, 0xDF, 0xA3], Container::Matroska, "EBML header"),
-    (b"RIFF", Container::Avi, "RIFF (AVI or WAV)"),
+    // RIFF is deliberately not listed here: its form type (offset 8..12) decides AVI vs.
+    // everything else RIFF-based (WAV chief among them), and is handled below instead -- the same
+    // reason the EBML DocType is checked separately rather than folded into this flat table.
     (b"OggS", Container::Ogg, "Ogg page"),
     (b"FLV\x01", Container::Flv, "FLV header"),
     (&[0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11], Container::Asf, "ASF GUID"),
@@ -36,7 +47,6 @@ const AT_ZERO: &[(&[u8], Container, &str)] = &[
     (&[0x00, 0x00, 0x01, 0xB3], Container::RawElementaryStream, "MPEG-2 sequence header"),
     (&[0x00, 0x00, 0x00, 0x01], Container::RawElementaryStream, "AnnexB start code"),
     (&[0x00, 0x00, 0x01], Container::RawElementaryStream, "AnnexB 3-byte start code"),
-    (b"#EXTM3U", Container::Matroska, "HLS/M3U playlist"),
     (b"\x1FVP8", Container::WebM, "IVF/VP8"),
     (b"DKIF", Container::WebM, "IVF"),
     (b"\xFF\xD8\xFF", Container::RawElementaryStream, "JPEG"),
@@ -68,6 +78,16 @@ pub fn sniff(head: &[u8]) -> Vec<Candidate> {
         out.push(c);
     }
 
+    // The EBML magic is shared by Matroska and WebM; only the `DocType` in the header separates
+    // them, and it sits within the first few dozen bytes. The distinction is not cosmetic: a browser
+    // opens WebM and cannot open Matroska, so calling every `.webm` Matroska reports a remux that is
+    // not needed on the one endpoint where it would be expensive.
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3])
+        && crate::ebml::analyze(head).is_some_and(|l| l.is_webm_doctype())
+    {
+        push_unique(&mut out, Container::WebM, Confidence::Certain, "EBML header, DocType webm");
+    }
+
     for (sig, container, evidence) in AT_ZERO {
         if head.starts_with(sig) {
             let confidence =
@@ -80,15 +100,26 @@ pub fn sniff(head: &[u8]) -> Vec<Candidate> {
         push_unique(&mut out, c.container, c.confidence, c.evidence);
     }
 
-    // RIFF needs its form type to distinguish AVI from WAV; both are handled, but the demuxer
-    // ranking differs.
-    if head.starts_with(b"RIFF") && head.len() >= 12 && &head[8..12] != b"AVI " {
-        push_unique(
-            &mut out,
-            Container::RawElementaryStream,
-            Confidence::Probable,
-            "RIFF but not AVI (WAV or other)",
-        );
+    // RIFF needs its form type to distinguish AVI from everything else RIFF-based (chiefly WAV).
+    // Previously "RIFF" alone sat in `AT_ZERO` mapped straight to `Avi` at `Certain`, so this check
+    // never actually changed which candidate won for a WAV file -- `Avi`/`Certain` had already been
+    // pushed and outranked the `Probable` fallback added here. Handling RIFF only here, once, fixes
+    // that: a `.wav` file no longer reports itself as AVI.
+    if head.starts_with(b"RIFF") {
+        if head.len() >= 12 && &head[8..12] == b"AVI " {
+            push_unique(&mut out, Container::Avi, Confidence::Certain, "RIFF, AVI form type");
+        } else if head.len() >= 12 {
+            push_unique(
+                &mut out,
+                Container::RawElementaryStream,
+                Confidence::Probable,
+                "RIFF but not AVI (WAV or other)",
+            );
+        } else {
+            // Too short to see the form type at all. Still worth a low-confidence guess rather than
+            // none: most RIFF files a media library holds are AVI.
+            push_unique(&mut out, Container::Avi, Confidence::Probable, "RIFF, form type unknown");
+        }
     }
 
     // Guarantee G2: something is always attempted. A headerless elementary stream is the universal
@@ -100,7 +131,10 @@ pub fn sniff(head: &[u8]) -> Vec<Candidate> {
         "fallback: probe as a headerless elementary stream",
     );
 
-    out.sort_by(|a, b| b.confidence.cmp(&a.confidence));
+    // Strongest evidence first. `sort_by_key` with `Reverse` rather than a hand-written comparator:
+    // both are stable sorts, so candidates of equal confidence keep the order they were pushed in,
+    // which is what makes the first ISOBMFF hit win over a later offset-0 match.
+    out.sort_by_key(|c| std::cmp::Reverse(c.confidence));
     out
 }
 
@@ -235,6 +269,30 @@ mod tests {
 
     fn best(head: &[u8]) -> Container {
         sniff(head)[0].container
+    }
+
+    /// An EBML header carrying `DocType`, which is the only thing separating WebM from Matroska.
+    fn ebml_header(doctype: &str) -> Vec<u8> {
+        let mut children = vec![0x42, 0x82, 0x80 | doctype.len() as u8];
+        children.extend_from_slice(doctype.as_bytes());
+        let mut head = vec![0x1A, 0x45, 0xDF, 0xA3, 0x80 | children.len() as u8];
+        head.extend_from_slice(&children);
+        head
+    }
+
+    #[test]
+    fn webm_is_distinguished_from_matroska_by_its_doctype() {
+        // Not cosmetic: a browser opens WebM and cannot open Matroska, so conflating the two makes
+        // every `.webm` in a library look like it needs a remux on the one endpoint where a remux is
+        // expensive. Matroska stays on the list, because its demuxer does read WebM.
+        let webm = sniff(&ebml_header("webm"));
+        assert_eq!(webm[0].container, Container::WebM);
+        assert_eq!(webm[0].confidence, Confidence::Certain);
+        assert!(webm.iter().any(|c| c.container == Container::Matroska));
+
+        assert_eq!(best(&ebml_header("matroska")), Container::Matroska);
+        // A header too short to carry a DocType is Matroska, which is what the demuxer will try.
+        assert_eq!(best(&[0x1A, 0x45, 0xDF, 0xA3, 0x00]), Container::Matroska);
     }
 
     #[test]
@@ -384,5 +442,85 @@ mod tests {
         let mut head = vec![0x1A, 0x45, 0xDF, 0xA3];
         head.extend_from_slice(&[0u8; 32]);
         assert_eq!(best(&head), Container::Matroska);
+    }
+
+    #[test]
+    fn riff_avi_is_identified_at_certain_confidence() {
+        let mut head = b"RIFF".to_vec();
+        head.extend_from_slice(&[0u8; 4]); // chunk size, not inspected
+        head.extend_from_slice(b"AVI ");
+        let c = &sniff(&head)[0];
+        assert_eq!(c.container, Container::Avi);
+        assert_eq!(c.confidence, Confidence::Certain);
+    }
+
+    #[test]
+    fn riff_wav_is_not_reported_as_avi() {
+        // Regression: `RIFF` alone used to be enough to claim `Avi` at `Certain`, so a WAV file
+        // (RIFF....WAVE) outranked the dedicated non-AVI fallback and reported itself as AVI.
+        let mut head = b"RIFF".to_vec();
+        head.extend_from_slice(&[0u8; 4]);
+        head.extend_from_slice(b"WAVE");
+        assert_eq!(best(&head), Container::RawElementaryStream);
+        assert!(
+            sniff(&head).iter().all(|c| c.container != Container::Avi),
+            "a WAV file must never be offered as AVI at any confidence"
+        );
+    }
+
+    #[test]
+    fn a_riff_header_too_short_to_show_the_form_type_still_guesses_avi_weakly() {
+        let head = b"RIFF".to_vec();
+        let c = &sniff(&head)[0];
+        assert_eq!(c.container, Container::Avi);
+        assert_eq!(c.confidence, Confidence::Probable, "unconfirmed, so not Certain");
+    }
+
+    #[test]
+    fn every_at_zero_signature_is_identified() {
+        // Locks in every entry of the offset-0 signature table, not just the ones exercised
+        // incidentally by other tests.
+        let cases: &[(&[u8], Container)] = &[
+            (b"OggS", Container::Ogg),
+            (b"FLV\x01", Container::Flv),
+            (&[0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11], Container::Asf),
+            (&[0x00, 0x00, 0x01, 0xBA], Container::MpegPs),
+            (&[0x00, 0x00, 0x01, 0xB3], Container::RawElementaryStream),
+            (&[0x00, 0x00, 0x00, 0x01], Container::RawElementaryStream),
+            (&[0x00, 0x00, 0x01, 0x09], Container::RawElementaryStream), // 3-byte AnnexB start code
+            (b"\x1FVP8", Container::WebM),
+            (b"DKIF", Container::WebM),
+            (b"\xFF\xD8\xFF\xE0", Container::RawElementaryStream), // JPEG/JFIF
+            (b"ID3\x04", Container::RawElementaryStream),
+            (b"fLaC", Container::RawElementaryStream),
+            (b"\x0BwvpK", Container::RawElementaryStream),
+            (b"MAC ", Container::RawElementaryStream),
+            (b"DSD ", Container::RawElementaryStream),
+            (b"FRM8", Container::RawElementaryStream),
+        ];
+        for (sig, expected) in cases {
+            let mut head = sig.to_vec();
+            head.extend_from_slice(&[0u8; 32]);
+            assert_eq!(best(&head), *expected, "signature {sig:02x?}");
+        }
+    }
+
+    #[test]
+    fn short_signatures_are_probable_not_certain() {
+        // Sub-4-byte signatures collide too easily to call `Certain` -- e.g. the 3-byte AnnexB start
+        // code is a valid prefix of many unrelated byte sequences.
+        let mut head = vec![0x00, 0x00, 0x01, 0x09];
+        head.extend_from_slice(&[0u8; 16]);
+        let c = &sniff(&head)[0];
+        assert_eq!(c.container, Container::RawElementaryStream);
+        assert_eq!(c.confidence, Confidence::Probable);
+    }
+
+    #[test]
+    fn quicktime_brand_is_recognised_as_plain_mp4_not_fragmented() {
+        let mut head = vec![0, 0, 0, 0x14];
+        head.extend_from_slice(b"ftypqt  ");
+        head.extend_from_slice(&[0u8; 8]);
+        assert_eq!(best(&head), Container::Mp4);
     }
 }

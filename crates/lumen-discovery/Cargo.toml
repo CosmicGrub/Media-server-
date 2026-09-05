@@ -1,0 +1,20 @@
+[package]
+name = "lumen-discovery"
+description = "SSDP (UPnP discovery) message parsing and a multicast responder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# SSDP's own convention -- and a DLNA responder is routinely not the only SSDP participant on a LAN
+# (Windows' own "Media Player Network Sharing Service" commonly binds the same port already) --
+# requires SO_REUSEADDR before bind, which `std::net::UdpSocket` has no way to set. `socket2` is the
+# minimal, safe-surfaced way to configure that one option without hand-rolled unsafe FFI, which
+# `unsafe_code = "deny"` forbids workspace-wide; the resulting socket converts straight into a
+# standard `UdpSocket` for everything else this crate does.
+socket2 = { version = "0.5", features = ["all"] }
+
+[lints]
+workspace = true

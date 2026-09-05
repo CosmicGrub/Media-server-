@@ -29,8 +29,17 @@ pub use sync::{SyncCorrection, detect_correction};
 /// A language tag, re-exported so callers need only this crate.
 pub use lumen_meta_lang::LangTag;
 
-/// Minimal local mirror of the language type, so this crate does not depend on `lumen-meta` purely for
-/// a tag. Kept in one module so the two cannot drift.
+/// Minimal local mirror of the language type, kept deliberately separate from both `lumen_meta::LangTag`
+/// (this crate should not depend on `lumen-meta` purely for a tag type) and `lumen_model::Language`
+/// (which looks like the obvious shared type, but is not a safe substitute here: it normalises casing
+/// only and leaves the raw subtag alone — `Language::new("jpn").as_str() == "jpn"` — where this type
+/// additionally folds ISO 639-2 codes onto their ISO 639-1 equivalent, `LangTag::new("jpn").as_str() ==
+/// "ja"`. That fold is load-bearing: an embedded Matroska audio track tagged `jpn` (639-2, what
+/// Matroska's own `Language` element carries) has to compare equal to a provider or request tag written
+/// `ja` (BCP-47), or `acquisition_step`'s forced-track and dub/sub matching silently fails on every file
+/// whose muxer used the three-letter form). Unifying the two types would mean either giving every other
+/// `lumen_model::Language` consumer this crate's mapping table, or duplicating it there instead of here
+/// — this file is the smaller, more contained place for it to live.
 mod lumen_meta_lang {
     /// BCP-47-ish tag, normalised for comparison. Mirrors `lumen_meta::LangTag`.
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]

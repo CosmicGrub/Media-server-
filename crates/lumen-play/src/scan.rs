@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use lumen_identity::ContentSketch;
 use lumen_match::{EpisodeSpec, ParsedName};
 use lumen_model::Container;
 use lumen_probe::{Candidate, Confidence, sniff};
@@ -24,7 +25,10 @@ use lumen_probe::{Candidate, Confidence, sniff};
 const HEAD_BYTES: usize = 4096;
 
 /// Directories never worth descending into. Skipped by name at any depth.
-const SKIP_DIRS: &[&str] = &[
+///
+/// `pub(crate)` so `reindex.rs`'s lightweight candidate walker applies exactly the same skip list
+/// rather than maintaining a second one that could drift from this one.
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     ".svn",
     "node_modules",
@@ -37,12 +41,17 @@ const SKIP_DIRS: &[&str] = &[
     "target",
 ];
 
+/// Directory names that mark a disc structure. `docs/05` §_ (server-library): "Disc structures
+/// (`BDMV/`, `VIDEO_TS/`) are recognised as *one item*, not hundreds of `.m2ts` files." Matched
+/// case-insensitively, mirroring every other name-based check in this scanner.
+const DISC_STRUCTURE_DIRS: &[&str] = &["BDMV", "VIDEO_TS"];
+
 /// Extensions that are sidecar subtitles rather than playable media.
-const SUBTITLE_EXTS: &[&str] = &["srt", "ass", "ssa", "sub", "idx", "vtt", "sup", "smi"];
+pub(crate) const SUBTITLE_EXTS: &[&str] = &["srt", "ass", "ssa", "sub", "idx", "vtt", "sup", "smi"];
 
 /// Extensions for audio-only files. Container sniffing cannot tell an audio-only MP4 from a video
 /// one without parsing tracks, so the extension is the cheap first pass and mpv corrects it later.
-const AUDIO_EXTS: &[&str] =
+pub(crate) const AUDIO_EXTS: &[&str] =
     &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma", "alac", "aiff", "ape", "dsf", "wv"];
 
 /// Extensions worth opening even when the bytes are unrecognised.
@@ -50,7 +59,7 @@ const AUDIO_EXTS: &[&str] =
 /// Sniffing cannot identify a raw elementary stream or a fragmented segment from its head, and
 /// refusing those would violate the "no refusal" guarantee (`docs/11` §G2) at the scan stage — before
 /// the player ever gets a chance to try.
-const VIDEO_EXTS: &[&str] = &[
+pub(crate) const VIDEO_EXTS: &[&str] = &[
     "mkv", "mp4", "m4v", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mts", "mpg", "mpeg",
     "vob", "ogv", "3gp", "divx", "rmvb", "asf", "m2v", "mxf", "iso",
 ];
@@ -80,6 +89,11 @@ pub struct ScannedFile {
     pub extension_mismatch: bool,
     /// No signature matched at all. Not a refusal — the player still tries.
     pub unidentified: bool,
+    /// Content-derived identity, when `--identify` asked for it.
+    ///
+    /// Survives rename, move and remount, because it is derived from the bytes rather than the path.
+    /// Two files with the same sketch are the same content under different names.
+    pub identity: Option<ContentSketch>,
     pub parsed: ParsedName,
 }
 
@@ -149,6 +163,12 @@ impl ScannedFile {
 
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
+    /// Compute a content-derived identity for each playable file, which finds duplicates.
+    ///
+    /// Off by default because it is real I/O: the sniffer reads 4 KiB per file, and a sketch reads
+    /// up to 3 MiB. Across five thousand files that is 15 GiB rather than 20 MiB, which over a
+    /// network share is the difference between seconds and an afternoon.
+    pub identify: bool,
     /// Include files that parse as sample clips.
     pub include_samples: bool,
     /// Stop after this many playable files. `None` for no limit.
@@ -225,7 +245,60 @@ fn read_head(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn classify(path: &Path, size: u64) -> ScannedFile {
+/// Build the single [`ScannedFile`] representing a disc structure, from the folder it was found in
+/// (`title_dir`, whose name is what a real rip is conventionally named after) and the `BDMV`/
+/// `VIDEO_TS` marker directory itself (`disc_dir`, used only for its total size).
+fn disc_structure(title_dir: &Path, disc_dir: &Path) -> ScannedFile {
+    let name = title_dir.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    ScannedFile {
+        path: title_dir.to_path_buf(),
+        size: dir_total_size(disc_dir),
+        extension: None,
+        kind: MediaKind::Video,
+        container: Some(Container::DiscStructure),
+        confidence: Some(Confidence::Certain),
+        evidence: Some("BDMV/VIDEO_TS directory structure"),
+        extension_mismatch: false,
+        unidentified: false,
+        // A disc structure has no single byte stream to sketch; content identity for it is out of
+        // scope here regardless of `--identify`.
+        identity: None,
+        parsed: lumen_match::parse(&name),
+    }
+}
+
+/// Sum of file sizes under `path`, recursively. Best-effort: an unreadable entry contributes 0
+/// rather than aborting the sum, the same "one bad folder must not sink the scan" stance `walk`
+/// itself takes.
+fn dir_total_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            total += dir_total_size(&entry.path());
+        } else if let Ok(m) = entry.metadata() {
+            total += m.len();
+        }
+    }
+    total
+}
+
+/// Content identity for one file.
+///
+/// Failure is `None` rather than an error: a file the sketch cannot read is still a file the player
+/// should try, and losing the whole scan over one unreadable item would be the wrong trade.
+fn sketch(path: &Path, size: u64) -> Option<ContentSketch> {
+    let mut f = std::fs::File::open(path).ok()?;
+    lumen_identity::sketch_reader(&mut f, size).ok()
+}
+
+/// `pub(crate)` so `reindex.rs` can reuse the exact same sniff/parse/sketch logic as the probe step
+/// of an incremental reindex, rather than a second, drifting copy of it.
+pub(crate) fn classify(path: &Path, size: u64, identify: bool) -> ScannedFile {
     let ext = lower_ext(path);
     let name = path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let parsed = lumen_match::parse(&name);
@@ -242,8 +315,12 @@ fn classify(path: &Path, size: u64) -> ScannedFile {
     // `sniff` always ends its list with a `Weak` raw-elementary-stream fallback, because the demuxer
     // is entitled to try that on anything. For classification it means the opposite of a match:
     // treating it as identification would make every text file in the tree a video.
-    let best =
-        candidates.iter().filter(|c| c.confidence > Confidence::Weak).max_by_key(|c| c.confidence);
+    //
+    // `find` rather than `max_by_key`: `sniff` returns candidates strongest-first and breaks ties in
+    // a meaningful order, and `max_by_key` returns the *last* maximum, which quietly reversed that.
+    // It cost every WebM file its identity — WebM and Matroska both match the EBML magic with equal
+    // confidence, and the tie went to the wrong one.
+    let best = candidates.iter().find(|c| c.confidence > Confidence::Weak);
     let container = best.map(|c| c.container);
     let ext_container = ext.as_deref().and_then(container_for_ext);
 
@@ -266,6 +343,12 @@ fn classify(path: &Path, size: u64) -> ScannedFile {
         MediaKind::Other
     };
 
+    // Only for things that will be played. Sketching a sidecar subtitle costs a read and answers a
+    // question nobody asked.
+    let identity = (identify && matches!(kind, MediaKind::Video | MediaKind::Audio) && size > 0)
+        .then(|| sketch(path, size))
+        .flatten();
+
     ScannedFile {
         path: path.to_path_buf(),
         size,
@@ -276,8 +359,88 @@ fn classify(path: &Path, size: u64) -> ScannedFile {
         evidence: best.map(|c| c.evidence),
         extension_mismatch,
         unidentified: container.is_none(),
+        identity,
         parsed,
     }
+}
+
+/// Files that share a content identity: the same bytes under different names.
+///
+/// Returns groups of two or more indices into `scan.files`. A real library accumulates these — the
+/// same film downloaded twice, or kept at two qualities — and they are invisible to any check based
+/// on filename, which is exactly why they accumulate.
+pub fn duplicate_groups(scan: &Scan) -> Vec<Vec<usize>> {
+    let mut by_id: BTreeMap<u128, Vec<usize>> = BTreeMap::new();
+    for (i, f) in scan.files.iter().enumerate() {
+        if let Some(id) = f.identity {
+            by_id.entry(id.0).or_default().push(i);
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = by_id.into_values().filter(|g| g.len() > 1).collect();
+    // Largest group first: the worst offender is the one worth acting on.
+    groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+    groups
+}
+
+/// Confirm a candidate duplicate group is genuinely byte-identical, not merely sketch-equal.
+///
+/// `duplicate_groups` is fast on purpose: it trusts `lumen_identity`'s sampled sketch (head, middle,
+/// tail — 3 MiB regardless of file size) rather than reading every file in full. That sketch's own
+/// documentation is explicit that a same-length, different-content collision at those three sampled
+/// regions is "implausible in practice," not impossible — and this report tells a person "same bytes
+/// under different names," a strong enough claim that "implausible" is not the bar for it. This is the
+/// full read that actually earns that claim, and it only ever runs on files a sketch already flagged as
+/// candidates — a handful of files, not the whole library — so it does not undo the sampling's own cost
+/// savings.
+///
+/// Returns `Ok(true)` only if every file in `paths` is byte-for-byte identical to the first. A read
+/// failure on any file — permissions, the file having moved again since the scan — is reported as
+/// `Err` rather than silently treated as "not a duplicate", since that is not evidence either way.
+pub fn verify_duplicate_group(paths: &[&Path]) -> std::io::Result<bool> {
+    let Some((first, rest)) = paths.split_first() else { return Ok(true) };
+    for other in rest {
+        if !same_bytes(first, other)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let mut fa = std::fs::File::open(a)?;
+    let mut fb = std::fs::File::open(b)?;
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    const CHUNK: usize = 256 * 1024;
+    let mut ba = vec![0u8; CHUNK];
+    let mut bb = vec![0u8; CHUNK];
+    loop {
+        let na = read_full(&mut fa, &mut ba)?;
+        let nb = read_full(&mut fb, &mut bb)?;
+        if na != nb || ba[..na] != bb[..nb] {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Fill `buf` as far as the reader has bytes left, looping on short reads the way a pipe or a network
+/// share can produce them. Mirrors `lumen_identity`'s own `read_up_to` so the two crates' streaming
+/// reads behave identically rather than by two slightly different conventions.
+fn read_full<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 /// Walk `roots` and classify everything found.
@@ -290,7 +453,7 @@ pub fn scan(roots: &[PathBuf], opts: &ScanOptions) -> Scan {
     for root in roots {
         match std::fs::metadata(root) {
             Ok(m) if m.is_file() => {
-                let mut f = classify(root, m.len());
+                let mut f = classify(root, m.len(), opts.identify);
                 if f.kind == MediaKind::Other {
                     f.kind = MediaKind::Video;
                 }
@@ -353,6 +516,14 @@ fn walk(dir: &Path, depth: usize, opts: &ScanOptions, out: &mut Scan) {
             if SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) || name.starts_with('.') {
                 continue;
             }
+            // A disc structure is one playable item, not a pile of `.m2ts`/`.vob` fragments. The
+            // title lives on `dir` (the folder a real rip is conventionally named after), not on
+            // `BDMV`/`VIDEO_TS` itself, so the synthesized entry points at the parent and the whole
+            // subtree is skipped rather than walked file by file.
+            if DISC_STRUCTURE_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) {
+                out.files.push(disc_structure(dir, &path));
+                continue;
+            }
             walk(&path, depth + 1, opts, out);
             continue;
         }
@@ -361,7 +532,7 @@ fn walk(dir: &Path, depth: usize, opts: &ScanOptions, out: &mut Scan) {
         }
 
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        let f = classify(&path, size);
+        let f = classify(&path, size, opts.identify);
         if f.kind == MediaKind::Other {
             continue;
         }
@@ -370,6 +541,70 @@ fn walk(dir: &Path, depth: usize, opts: &ScanOptions, out: &mut Scan) {
             continue;
         }
         out.files.push(f);
+    }
+}
+
+/// Every path under `roots` that is plausibly worth indexing, discovered by extension alone --
+/// deliberately not the full content-sniffed `MediaKind` decision `classify` makes.
+///
+/// This is `reindex.rs`'s cheap pre-pass: enumerating candidates costs one `read_dir` walk, no file
+/// content read. The real, content-sniffed classification (and its cost -- a magic-byte read, and for
+/// `--identify`, up to a 3 MiB content sketch) only happens inside `classify`, called for a path from
+/// `reindex.rs` *only* when `lumen_index::Index::reindex` says the path is new or changed.
+///
+/// **Known limitation, stated rather than hidden**: a file with a missing or wrong extension that
+/// `classify`'s content-sniffing would still recognise (this scanner's own `MediaKind` decision is
+/// explicitly content-first, never extension-first, for exactly this reason) is invisible to this
+/// candidate pass and so never enters the index. That is a real, narrower guarantee than `docs/11`'s
+/// G0 for playback -- G0 is unaffected, since a file `lumen play`/`scan` finds directly is still
+/// classified by content as always; this limitation is specific to what an *incremental index* will
+/// discover on its own without ever having probed the file at all once before.
+pub(crate) fn candidate_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for root in roots {
+        match std::fs::metadata(root) {
+            Ok(m) if m.is_file() => {
+                if is_candidate_extension(root) {
+                    out.push(root.clone());
+                }
+            }
+            Ok(_) => walk_candidates(root, &mut out),
+            Err(_) => {} // unreadable roots are the caller's problem to report; this pass just skips them
+        }
+    }
+    out.sort();
+    out
+}
+
+fn is_candidate_extension(path: &Path) -> bool {
+    let Some(ext) = lower_ext(path) else { return false };
+    let ext = ext.as_str();
+    VIDEO_EXTS.contains(&ext) || AUDIO_EXTS.contains(&ext) || SUBTITLE_EXTS.contains(&ext)
+}
+
+fn walk_candidates(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            if SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(&name)) || name.starts_with('.') {
+                continue;
+            }
+            walk_candidates(&path, out);
+            continue;
+        }
+        if name.starts_with('.') {
+            continue;
+        }
+        if is_candidate_extension(&path) {
+            out.push(path);
+        }
     }
 }
 
@@ -553,6 +788,24 @@ mod tests {
     }
 
     #[test]
+    fn a_webm_file_keeps_its_own_identity_rather_than_being_called_matroska() {
+        // WebM and Matroska share the EBML magic and are separated only by the header's `DocType`,
+        // so both come back with equal confidence and the tie-break decides. It used to go the wrong
+        // way, and the cost was not cosmetic: a browser opens WebM and cannot open Matroska, so
+        // every `.webm` in a library was reported as needing a remux it does not need.
+        let d = TempDir::new("webm");
+        let mut bytes = vec![0x1A, 0x45, 0xDF, 0xA3, 0x87, 0x42, 0x82, 0x84];
+        bytes.extend_from_slice(b"webm");
+        bytes.extend(std::iter::repeat_n(0u8, 100_000));
+        d.file("Doc.2012.720p.WEBRip.VP9.webm", &bytes);
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        let f = &s.files[0];
+        assert_eq!(f.container, Some(Container::WebM));
+        assert!(!f.extension_mismatch);
+    }
+
+    #[test]
     fn an_unidentifiable_file_with_a_media_extension_is_still_offered() {
         // Refusing at scan time would break the "no refusal" guarantee before the player ever tried.
         // Plenty of real media has no signature: raw elementary streams, and any file whose header
@@ -607,6 +860,64 @@ mod tests {
             "{:?}",
             s.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_video_ts_folder_is_one_item_not_a_pile_of_vobs() {
+        // docs/05 §_ (server-library): recognised as *one item*, not hundreds of `.m2ts`/`.vob`
+        // files. A real DVD rip splits a single title across several VOBs at the old FAT32 limit.
+        let d = TempDir::new("videots");
+        d.file("Interstellar (2014)/VIDEO_TS/VTS_01_1.VOB", &[0u8; 1_000_000]);
+        d.file("Interstellar (2014)/VIDEO_TS/VTS_01_2.VOB", &[0u8; 1_000_000]);
+        d.file("Interstellar (2014)/VIDEO_TS/VIDEO_TS.IFO", &[0u8; 1_000]);
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert_eq!(
+            s.playable().count(),
+            1,
+            "{:?}",
+            s.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+
+        let disc = &s.files[0];
+        assert!(disc.path.ends_with("Interstellar (2014)"), "{:?}", disc.path);
+        assert_eq!(disc.container, Some(Container::DiscStructure));
+        assert_eq!(disc.confidence, Some(Confidence::Certain));
+        assert_eq!(disc.kind, MediaKind::Video);
+        assert!(!disc.unidentified);
+        assert_eq!(disc.parsed.title, "Interstellar");
+        assert_eq!(disc.parsed.year, Some(2014));
+        assert_eq!(disc.size, 2_001_000, "sums every file under the disc structure");
+    }
+
+    #[test]
+    fn a_bdmv_folder_is_also_recognised_case_insensitively() {
+        let d = TempDir::new("bdmv");
+        d.file("Some Movie/bdmv/STREAM/00000.m2ts", &[0u8; 500_000]);
+        d.file("Some Movie/bdmv/PLAYLIST/00000.mpls", &[0u8; 200]);
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert_eq!(s.playable().count(), 1);
+        let disc = &s.files[0];
+        assert!(disc.path.ends_with("Some Movie"), "{:?}", disc.path);
+        assert_eq!(disc.container, Some(Container::DiscStructure));
+    }
+
+    #[test]
+    fn a_regular_library_next_to_a_disc_structure_is_unaffected() {
+        let d = TempDir::new("mixed");
+        d.file("Interstellar (2014)/VIDEO_TS/VTS_01_1.VOB", &[0u8; 100_000]);
+        d.file("Arrival (2016).mkv", &mkv_bytes());
+
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert_eq!(
+            s.playable().count(),
+            2,
+            "{:?}",
+            s.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert!(s.files.iter().any(|f| f.container == Some(Container::DiscStructure)));
+        assert!(s.files.iter().any(|f| f.container == Some(Container::Matroska)));
     }
 
     #[test]
@@ -707,6 +1018,117 @@ mod tests {
     }
 
     #[test]
+    fn identity_is_off_unless_asked_for() {
+        // It is real I/O — 3 MiB a file against the sniffer's 4 KiB. Across a large library over a
+        // network share that is the difference between seconds and an afternoon, so it must never
+        // happen because someone ran a plain `scan`.
+        let d = TempDir::new("noid");
+        d.file("Film.mkv", &mkv_bytes());
+        let s = scan(std::slice::from_ref(&d.0), &ScanOptions::default());
+        assert!(s.files[0].identity.is_none());
+        assert!(duplicate_groups(&s).is_empty());
+    }
+
+    #[test]
+    fn the_same_content_under_different_names_is_one_group() {
+        // The case a filename-based check can never see, and the reason libraries accumulate
+        // duplicates: the same film downloaded twice under two release names.
+        let d = TempDir::new("dupe");
+        let bytes = mkv_bytes();
+        d.file("Arrival (2016) 1080p GROUP.mkv", &bytes);
+        d.file("Arrival.2016.1080p.OTHER.mkv", &bytes);
+        d.file("Something Else (2019).mkv", &mp4_bytes());
+
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { identify: true, ..Default::default() });
+        let groups = duplicate_groups(&s);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].len(), 2);
+        // Both members are the two Arrival copies, not the unrelated file.
+        for &i in &groups[0] {
+            assert!(s.files[i].file_name().contains("Arrival"), "{}", s.files[i].file_name());
+        }
+    }
+
+    #[test]
+    fn different_content_of_the_same_length_does_not_collide() {
+        // Length alone is a terrible identity: two different films at the same byte count are
+        // ordinary. The sketch mixes length *and* three sampled regions for exactly this reason.
+        let d = TempDir::new("samelen");
+        let mut a = mkv_bytes();
+        let mut b = mkv_bytes();
+        // Differ only in the middle, which is where a head-only hash would miss it.
+        let mid = a.len() / 2;
+        a[mid] = 0x11;
+        b[mid] = 0x22;
+        d.file("A.mkv", &a);
+        d.file("B.mkv", &b);
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { identify: true, ..Default::default() });
+        assert_eq!(
+            s.files[0].size, s.files[1].size,
+            "the test needs equal lengths to mean anything"
+        );
+        assert_ne!(s.files[0].identity, s.files[1].identity);
+        assert!(duplicate_groups(&s).is_empty());
+    }
+
+    #[test]
+    fn verify_duplicate_group_confirms_genuinely_identical_files() {
+        let d = TempDir::new("verify-same");
+        let bytes = mkv_bytes();
+        let a = d.file("A.mkv", &bytes);
+        let b = d.file("B.mkv", &bytes);
+        let c = d.file("C.mkv", &bytes);
+        assert!(verify_duplicate_group(&[&a, &b, &c]).unwrap());
+    }
+
+    #[test]
+    fn verify_duplicate_group_refuses_a_group_that_only_agreed_on_the_sketch() {
+        // Simulates the exact gap this function exists to close: two files a sketch could plausibly
+        // treat as candidates (same length) but whose bytes actually differ somewhere the 3 MiB
+        // head/middle/tail sample would not have caught -- deep enough into the middle to miss the
+        // sample's own midpoint by a wide margin.
+        let d = TempDir::new("verify-diff");
+        let mut a = vec![0xAAu8; 8192];
+        let mut b = a.clone();
+        a[4100] = 0x01;
+        b[4100] = 0x02;
+        let pa = d.file("A.bin", &a);
+        let pb = d.file("B.bin", &b);
+        assert!(!verify_duplicate_group(&[&pa, &pb]).unwrap());
+    }
+
+    #[test]
+    fn verify_duplicate_group_is_trivially_true_for_zero_or_one_paths() {
+        let d = TempDir::new("verify-trivial");
+        let a = d.file("A.mkv", &mkv_bytes());
+        assert!(verify_duplicate_group(&[]).unwrap());
+        assert!(verify_duplicate_group(&[&a]).unwrap());
+    }
+
+    #[test]
+    fn verify_duplicate_group_reports_a_read_failure_rather_than_guessing() {
+        let d = TempDir::new("verify-missing");
+        let a = d.file("A.mkv", &mkv_bytes());
+        let missing = d.0.join("does-not-exist.mkv");
+        assert!(verify_duplicate_group(&[&a, &missing]).is_err());
+    }
+
+    #[test]
+    fn subtitles_are_not_sketched() {
+        // Sketching a sidecar costs a read and answers a question nobody asked.
+        let d = TempDir::new("subid");
+        d.file("Film.mkv", &mkv_bytes());
+        d.file("Film.eng.srt", b"1\n00:00:01,000 --> x\n");
+        let s =
+            scan(std::slice::from_ref(&d.0), &ScanOptions { identify: true, ..Default::default() });
+        let sub = s.files.iter().find(|f| f.kind == MediaKind::Subtitle).unwrap();
+        assert!(sub.identity.is_none());
+        assert!(s.playable().all(|f| f.identity.is_some()));
+    }
+
+    #[test]
     fn a_zero_byte_file_is_noted_and_still_listed() {
         let d = TempDir::new("empty");
         d.file("Broken.mkv", b"");
@@ -725,5 +1147,41 @@ mod tests {
         let labels: Vec<String> = s.files.iter().map(ScannedFile::label).collect();
         assert!(labels.iter().any(|l| l.contains("S01E03")), "{labels:?}");
         assert!(labels.iter().any(|l| l.contains("(2016)")), "{labels:?}");
+    }
+
+    #[test]
+    fn candidate_paths_finds_media_and_subtitles_but_not_arbitrary_files() {
+        let d = TempDir::new("candidates");
+        d.file("Film.mkv", &mkv_bytes());
+        d.file("Film.eng.srt", b"1\n00:00:01,000 --> x\n");
+        d.file("cover.jpg", b"not media");
+        d.file("readme.txt", b"not media either");
+        let found = candidate_paths(std::slice::from_ref(&d.0));
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found.iter().any(|p| p.ends_with("Film.mkv")));
+        assert!(found.iter().any(|p| p.ends_with("Film.eng.srt")));
+    }
+
+    #[test]
+    fn candidate_paths_never_reads_file_content_or_descends_into_skip_dirs() {
+        let d = TempDir::new("candidates-skip");
+        d.file(".git/HEAD", b"ref: refs/heads/main");
+        d.file("node_modules/pkg/index.mkv", &mkv_bytes());
+        d.file("Real Movie.mkv", &mkv_bytes());
+        let found = candidate_paths(std::slice::from_ref(&d.0));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("Real Movie.mkv"));
+    }
+
+    #[test]
+    fn candidate_paths_is_sorted_so_two_runs_over_an_unchanged_tree_agree() {
+        let d = TempDir::new("candidates-sorted");
+        d.file("z.mkv", &mkv_bytes());
+        d.file("a.mkv", &mkv_bytes());
+        d.file("m.mkv", &mkv_bytes());
+        let found = candidate_paths(std::slice::from_ref(&d.0));
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(found, sorted);
     }
 }

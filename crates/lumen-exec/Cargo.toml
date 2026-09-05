@@ -1,0 +1,19 @@
+[package]
+name = "lumen-exec"
+description = "Executes a lumen-playback remux plan by shelling out to an LGPL-only ffmpeg build."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lumen-model.workspace = true
+lumen-playback.workspace = true
+# Only for `verify_output`'s post-remux sanity check: confirm the file ffmpeg produced is actually
+# the container it was asked for, using the exact same signature sniffer `lumen scan` already trusts,
+# rather than a second "is this really a Matroska" check invented here.
+lumen-probe.workspace = true
+
+[lints]
+workspace = true

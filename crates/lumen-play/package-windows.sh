@@ -46,6 +46,7 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 cp "$EXE" "$OUT/"
 cp "$ROOT/crates/lumen-play/README.md" "$OUT/README.md"
+cp "$ROOT/scripts/windows/Install-LumenServeTask.ps1" "$OUT/"
 
 cat > "$OUT/START-HERE.txt" <<'TXT'
 lumen — media library player and test harness
@@ -80,6 +81,17 @@ lumen — media library player and test harness
        .\lumen.exe play  "D:\Media"
 
    Playback controls are mpv's own: space, arrows, f for fullscreen, q to quit.
+
+6. To let a phone pair with this machine and control playback over the LAN, either run it in a
+   terminal you leave open:
+
+       .\lumen.exe serve  "D:\Media"
+
+   or install it as a Scheduled Task that starts at sign-in and survives the terminal closing:
+
+       .\Install-LumenServeTask.ps1 -LibraryPath "D:\Media"
+
+   Remove it again with: .\Install-LumenServeTask.ps1 -Uninstall
 
 Exit codes: 0 everything played, 1 at least one file failed, 2 setup problem.
 

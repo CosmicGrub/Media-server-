@@ -36,6 +36,12 @@ pub struct PlayOptions {
     pub extra_args: Vec<String>,
     /// Build the playlist and print it, launching nothing.
     pub dry_run: bool,
+    /// Ask mpv to bitstream HD audio (TrueHD, DTS-HD, E-AC-3, AC-3) via S/PDIF rather than decoding
+    /// it, so `calibration`'s predicted-vs-observed comparison has something real to check. Off by
+    /// default: unlike hardware decode, this changes what actually comes out of the audio device, and
+    /// a sink that cannot accept a bitstream would get silence rather than the PCM fallback mpv
+    /// otherwise provides.
+    pub audio_passthrough: bool,
 }
 
 impl PlayOptions {
@@ -83,15 +89,34 @@ pub struct FileResult {
     pub primaries: Option<String>,
     /// Transfer function. `pq` is HDR10/Dolby Vision, `hlg` is broadcast HDR, anything else is SDR.
     pub gamma: Option<String>,
+    /// YUV-to-RGB matrix coefficients, e.g. `bt.2020-ncl`.
+    pub colormatrix: Option<String>,
     /// Whether mpv can seek in this file. A long video that reports `false` has lost its index —
     /// Matroska Cues or an MP4 `moov` — which plays start-to-finish but cannot be navigated. It is
     /// the defect a play-through test would never notice, because playing forward still works.
     pub seekable: Option<bool>,
     pub audio_channels: Option<String>,
     pub track_counts: TrackCounts,
+    /// Every track the demuxer exposed, not only the selected one. The per-file properties above
+    /// describe what played; this describes what was *there*, which is what a fidelity decision
+    /// needs — a file whose second audio track is TrueHD is a different proposition from one that
+    /// only carries AAC, even when mpv chose the AAC either way.
+    pub tracks: Vec<TrackInfo>,
+    /// Fidelity tiers this file reaches, modelled from what the demuxer reported.
+    pub fidelity: Option<crate::fidelity::Fidelity>,
     /// Frames the video output presented late, over this file.
     pub delayed_frames: Option<u64>,
     pub dropped_frames: Option<u64>,
+    /// Whether this session asked mpv to bitstream HD audio (`PlayOptions::audio_passthrough`).
+    /// Carried per-result, not just per-session, so `calibration::observe` knows whether
+    /// [`Self::audio_out_format`]'s absence means "not bitstreamed" or "never asked" -- claiming a
+    /// passthrough miss on a session that never requested passthrough would blame the model for a
+    /// gap in what this codebase asks mpv to do, not for a wrong prediction.
+    pub audio_spdif_requested: bool,
+    /// mpv's `audio-out-params/format` after playback -- `"spdif-ac3"`/`"spdif-dts-hd"`/... when a
+    /// bitstream reached the sink, a PCM sample format (`"s16"`, `"floatp"`, ...) when mpv decoded it
+    /// instead. Only meaningful when [`Self::audio_spdif_requested`] is true.
+    pub audio_out_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -101,8 +126,39 @@ pub struct TrackCounts {
     pub subtitle: usize,
 }
 
+/// One entry of mpv's `track-list`.
+///
+/// Deliberately stringly-typed at this layer: this is a transcription of what mpv said, and the
+/// translation into the workspace's codec enums happens in `fidelity`, where it can be tested
+/// against known names without a running mpv.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackInfo {
+    /// `video`, `audio` or `sub`.
+    pub kind: String,
+    pub id: u32,
+    /// FFmpeg's short codec name — `h264`, `dts`, `hdmv_pgs_subtitle`.
+    pub codec: Option<String>,
+    /// Codec profile where the build reports one. This is what separates DTS-HD MA from its DTS
+    /// core, and Main 10 from Main — distinctions the tier depends on.
+    pub codec_profile: Option<String>,
+    pub lang: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+    pub forced: bool,
+    pub external: bool,
+    pub selected: bool,
+    pub hearing_impaired: bool,
+    pub visual_impaired: bool,
+    pub channels: Option<u8>,
+    pub sample_rate: Option<u32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f64>,
+    pub bitrate_bps: Option<u64>,
+}
+
 impl FileResult {
-    fn new(f: &ScannedFile) -> Self {
+    fn new(f: &ScannedFile, opts: &PlayOptions) -> Self {
         Self {
             path: f.path.clone(),
             label: f.label(),
@@ -119,11 +175,16 @@ impl FileResult {
             pixel_format: None,
             primaries: None,
             gamma: None,
+            colormatrix: None,
             seekable: None,
             audio_channels: None,
             track_counts: TrackCounts::default(),
+            tracks: Vec::new(),
+            fidelity: None,
             delayed_frames: None,
             dropped_frames: None,
+            audio_spdif_requested: opts.audio_passthrough,
+            audio_out_format: None,
         }
     }
 
@@ -211,12 +272,28 @@ pub fn mpv_args(ipc_path: &str, opts: &PlayOptions) -> Vec<String> {
         "--audio-file-auto=fuzzy".into(),
         // Never stop for a missing codec or a bad stream — try, and report.
         "--audio-fallback-to-null=yes".into(),
+        // Quiet the terminal without going silent. mpv's status line repaints several times a
+        // second and buries this tool's own per-file output — on a ten-file run it produced roughly
+        // eight hundred lines of `V: 00:00:03 / 00:00:05 (61%)` around nine lines that mattered.
+        // Error messages are kept, because they name the codec or container that failed.
+        "--term-status-msg=".into(),
+        "--msg-level=all=error".into(),
+        // mpv must not read the terminal this process is sharing, or it competes for keystrokes.
+        // The playback window still takes its own input.
+        "--no-input-terminal".into(),
     ];
     if opts.fullscreen {
         args.push("--fullscreen=yes".into());
     }
     if opts.start_paused {
         args.push("--pause=yes".into());
+    }
+    if opts.audio_passthrough {
+        // mpv's own accepted codec list for this option, per its manual: ac3, dts, dts-hd, eac3,
+        // truehd. Without this flag mpv decodes every one of them to PCM regardless of what the
+        // sink could actually take, which is exactly the "never asked" gap that made this
+        // uncheckable before.
+        args.push("--audio-spdif=ac3,dts,dts-hd,eac3,truehd".into());
     }
     args.extend(opts.extra_args.iter().cloned());
     args
@@ -279,7 +356,7 @@ pub fn run(
         println!("  (then over IPC: loadlist {} replace)", playlist.display());
         println!("\nplaylist ({} files): {}", files.len(), playlist.display());
         return Ok(SessionReport {
-            results: files.iter().map(|f| FileResult::new(f)).collect(),
+            results: files.iter().map(|f| FileResult::new(f, opts)).collect(),
             ..Default::default()
         });
     }
@@ -316,7 +393,7 @@ pub fn run(
 
     let start = Instant::now();
     let mut report = SessionReport {
-        results: files.iter().map(|f| FileResult::new(f)).collect(),
+        results: files.iter().map(|f| FileResult::new(f, opts)).collect(),
         mpv_version: mpv.get_string("mpv-version"),
         vo_used: mpv.get_string("current-vo"),
         ..Default::default()
@@ -393,6 +470,12 @@ pub fn run(
                     // A file that loaded has, at minimum, opened. If it later errors the reason
                     // overwrites this; if the run is cut short, "played" is still the honest answer.
                     report.results[i].outcome = Outcome::Played;
+                    // Assessed after the outcome is set, because a file that has not played is
+                    // deliberately given no tier — and here, where the scanned file is in hand: the
+                    // ladder wants the sniffed container and the file size, neither of which mpv
+                    // reports.
+                    report.results[i].fidelity =
+                        crate::fidelity::assess(&report.results[i], files[i]);
                     progress(&report.results[i], i + 1, total);
                 }
             }
@@ -455,11 +538,61 @@ fn collect_properties(mpv: &mut Mpv, r: &mut FileResult) {
     r.pixel_format = mpv.get_string("video-params/pixelformat");
     r.primaries = mpv.get_string("video-params/primaries");
     r.gamma = mpv.get_string("video-params/gamma");
+    r.colormatrix = mpv.get_string("video-params/colormatrix");
+    // Only meaningful when this session actually requested passthrough (`--audio-spdif`); queried
+    // unconditionally regardless, since a `None` here is exactly the honest "not requested" signal
+    // `FileResult::audio_spdif_requested` needs a counterpart for.
+    r.audio_out_format = mpv.get_string("audio-out-params/format");
     r.seekable = mpv.get("seekable").and_then(|v| v.as_bool());
     r.audio_channels = mpv.get_string("audio-params/channel-count");
     if let Some(list) = mpv.get("track-list") {
         r.track_counts = count_tracks(&list);
+        r.tracks = parse_tracks(&list);
     }
+}
+
+/// Transcribe mpv's `track-list` into [`TrackInfo`].
+///
+/// Fields older mpv builds do not emit — `codec-profile` arrived in 0.38 — simply come back `None`
+/// rather than failing the entry, because a missing profile string must not cost us the track.
+pub fn parse_tracks(list: &Value) -> Vec<TrackInfo> {
+    fn flag(t: &Value, key: &str) -> bool {
+        t.get(key).and_then(Value::as_bool).unwrap_or(false)
+    }
+    fn text(t: &Value, key: &str) -> Option<String> {
+        t.get(key).and_then(Value::as_str).map(str::to_owned)
+    }
+    fn num(t: &Value, key: &str) -> Option<f64> {
+        t.get(key).and_then(Value::as_f64).filter(|v| v.is_finite() && *v >= 0.0)
+    }
+
+    list.as_array()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|t| {
+            let kind = text(t, "type")?;
+            Some(TrackInfo {
+                kind,
+                id: num(t, "id").unwrap_or(0.0) as u32,
+                codec: text(t, "codec"),
+                codec_profile: text(t, "codec-profile"),
+                lang: text(t, "lang"),
+                title: text(t, "title"),
+                default: flag(t, "default"),
+                forced: flag(t, "forced"),
+                external: flag(t, "external"),
+                selected: flag(t, "selected"),
+                hearing_impaired: flag(t, "hearing-impaired"),
+                visual_impaired: flag(t, "visual-impaired"),
+                channels: num(t, "demux-channel-count").map(|v| v.min(255.0) as u8),
+                sample_rate: num(t, "demux-samplerate").map(|v| v as u32),
+                width: num(t, "demux-w").map(|v| v as u32),
+                height: num(t, "demux-h").map(|v| v as u32),
+                fps: num(t, "demux-fps"),
+                bitrate_bps: num(t, "demux-bitrate").map(|v| v as u64),
+            })
+        })
+        .collect()
 }
 
 /// Map mpv's playlist entry ids onto our own indices.
@@ -522,6 +655,22 @@ mod tests {
         assert!(joined.contains("--keep-open=no"), "must advance past a file it cannot open");
         assert!(joined.contains("--idle=yes"), "must not exit before results are collected");
         assert!(joined.contains("--force-window=yes"), "a failing file must be visibly attempted");
+    }
+
+    #[test]
+    fn the_status_line_is_suppressed_without_silencing_errors() {
+        // Found by running this against real media on Linux: mpv's status line repaints several
+        // times a second, and a ten-file run buried nine lines of report under ~800 lines of
+        // `V: 00:00:03 / 00:00:05 (61%)`. Errors must survive, because they name what failed.
+        let args = mpv_args("/tmp/s.sock", &PlayOptions::new());
+        let joined = args.join(" ");
+        assert!(joined.contains("--term-status-msg="), "the status line must be off");
+        assert!(joined.contains("--msg-level=all=error"), "errors must still be shown");
+        assert!(
+            !joined.contains("--no-terminal"),
+            "--no-terminal would suppress the error text too, which is the useful part"
+        );
+        assert!(joined.contains("--no-input-terminal"), "mpv must not steal our keystrokes");
     }
 
     #[test]
@@ -640,7 +789,7 @@ mod tests {
             label: "a".into(),
             outcome: Outcome::Played,
             hwdec: Some("no".into()),
-            ..FileResult::new(&dummy_file())
+            ..FileResult::new(&dummy_file(), &PlayOptions::default())
         };
         assert!(base.software_decoded());
 
@@ -652,7 +801,7 @@ mod tests {
     }
 
     fn blank() -> FileResult {
-        FileResult::new(&dummy_file())
+        FileResult::new(&dummy_file(), &PlayOptions::default())
     }
 
     fn dummy_file() -> ScannedFile {
@@ -666,6 +815,7 @@ mod tests {
             evidence: None,
             extension_mismatch: false,
             unidentified: false,
+            identity: None,
             parsed: lumen_match::parse("a.mkv"),
         }
     }

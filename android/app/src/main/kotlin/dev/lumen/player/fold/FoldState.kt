@@ -46,28 +46,72 @@ sealed interface Posture {
     data class Book(val hingeLeftPx: Int, val hingeRightPx: Int) : Posture
 }
 
+/** Whether the hinge is flat or bent, independent of the androidx type. */
+enum class HingeState { FLAT, HALF_OPENED }
+
+/** Which way the hinge runs, independent of the androidx type. */
+enum class HingeOrientation { HORIZONTAL, VERTICAL }
+
 /**
- * Derive a [Posture] from the window layout.
+ * The posture decision itself, over plain values.
  *
- * Kept as a pure function of [WindowLayoutInfo] so it can be tested without a device — the posture
- * logic is the part most likely to be wrong, and it is the part hardest to check by hand on real
- * hardware, where reproducing a half-open angle reliably is genuinely awkward.
+ * Deliberately free of Android and androidx types so it runs as an ordinary JVM unit test — no
+ * emulator, no device. This is the part most likely to be wrong and the part hardest to check by
+ * hand, because holding a real device at a reliable half-open angle while reading logs is genuinely
+ * awkward. Everything Android-specific lives in the adapter below.
+ */
+fun posture(
+    state: HingeState,
+    orientation: HingeOrientation,
+    hingeTop: Int,
+    hingeBottom: Int,
+    hingeLeft: Int,
+    hingeRight: Int,
+): Posture {
+    // A FLAT fold is a seamless inner display: there is a hinge, but content may cross it freely.
+    // Only HALF_OPENED changes the layout.
+    if (state != HingeState.HALF_OPENED) return Posture.Flat
+    return when (orientation) {
+        HingeOrientation.HORIZONTAL -> Posture.Tabletop(hingeTop, hingeBottom)
+        HingeOrientation.VERTICAL -> Posture.Book(hingeLeft, hingeRight)
+    }
+}
+
+/**
+ * Adapter from the window layout to [posture].
+ *
+ * Thin on purpose: it translates androidx types and decides nothing, so the logic worth testing is
+ * the part that needs no device.
  */
 fun postureOf(layoutInfo: WindowLayoutInfo): Posture {
     val fold = layoutInfo.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull()
         ?: return Posture.Flat
 
-    // A FLAT fold is a seamless inner display: there is a hinge, but content may cross it freely.
-    // Only HALF_OPENED changes the layout.
-    if (fold.state != FoldingFeature.State.HALF_OPENED) return Posture.Flat
-
-    return when (fold.orientation) {
-        FoldingFeature.Orientation.HORIZONTAL ->
-            Posture.Tabletop(fold.bounds.top, fold.bounds.bottom)
-        FoldingFeature.Orientation.VERTICAL ->
-            Posture.Book(fold.bounds.left, fold.bounds.right)
-        else -> Posture.Flat
+    val state = if (fold.state == FoldingFeature.State.HALF_OPENED) {
+        HingeState.HALF_OPENED
+    } else {
+        HingeState.FLAT
     }
+    // An unrecognised orientation is treated as horizontal only when the bounds say so; a hinge
+    // wider than it is tall runs horizontally. Guessing beats returning Flat, which would draw
+    // controls straight across the crease.
+    val orientation = when (fold.orientation) {
+        FoldingFeature.Orientation.VERTICAL -> HingeOrientation.VERTICAL
+        FoldingFeature.Orientation.HORIZONTAL -> HingeOrientation.HORIZONTAL
+        else -> if (fold.bounds.width() >= fold.bounds.height()) {
+            HingeOrientation.HORIZONTAL
+        } else {
+            HingeOrientation.VERTICAL
+        }
+    }
+    return posture(
+        state,
+        orientation,
+        fold.bounds.top,
+        fold.bounds.bottom,
+        fold.bounds.left,
+        fold.bounds.right,
+    )
 }
 
 /**

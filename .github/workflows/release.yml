@@ -1,0 +1,553 @@
+name: Desktop release
+
+# Builds the desktop player for Windows and Linux -- primarily a Windows-targeted player, with
+# Linux kept for the distros it actually ships to (Steam Deck/SteamOS-style handhelds, Arch- and
+# Ubuntu-derived desktops). Every push that touches the player publishes a rolling `desktop-latest`
+# release with both platform bundles attached — the same pattern `android.yml` uses for the phone
+# build (`android-latest`), so there is one stable URL for whatever this repository currently
+# builds, on every platform, rather than having to know which Actions run is current. `v*` tags and
+# `workflow_dispatch` still work too, for a pinned build.
+#
+# Built natively on each runner rather than cross-compiled from one. Cross-compiling to Windows
+# works — `crates/lumen-play/package-windows.sh` does it — but it silently skips the Windows-only
+# code paths, and the named-pipe IPC transport is exactly the kind of thing that compiles under
+# `#[cfg(windows)]` on a Linux host and fails to link on a real one.
+#
+# Verified end to end via PR #2 (device/windows-pc → main), opened specifically to get this running
+# on real windows-latest/ubuntu-latest runners rather than staying theoretical: both platform legs
+# green, including the CRT-static and codec-coverage checks below.
+
+on:
+  push:
+    # `branches: ['**']` is load-bearing, not decorative: GitHub Actions' own rule is that defining
+    # `tags` without `branches` makes a push trigger fire on tag pushes *only* — a plain branch push
+    # would never reach this workflow at all, silently, which is exactly the kind of thing that looks
+    # fine until the day someone expects `desktop-latest` to have updated and it hasn't.
+    branches: ['**']
+    tags: ['v*']
+    # The whole workspace, not just `crates/lumen-play/**`: `lumen-play`'s own Cargo.toml depends on
+    # lumen-model, lumen-caps, lumen-playback, lumen-probe, lumen-match, lumen-identity, lumen-index
+    # and lumen-discovery, so a fix landing in any of *those* changes what actually gets compiled into
+    # lumen.exe just as much as a change inside lumen-play's own src/ does -- and with the narrower
+    # filter, such a fix would silently never trigger a rebuild here at all. This is exactly the gap
+    # `rust.yml`'s own paths list (which already watches the whole workspace) never had; mirroring it
+    # here is what closes it, rather than trying to keep an explicit, easily-stale list of which
+    # crates lumen-play currently happens to depend on in sync by hand.
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+    inputs:
+      bundle_mpv:
+        description: 'Bundle mpv into every platform archive (adds ~30 MB on Windows, ~150 MB on Linux)'
+        type: boolean
+        default: true
+
+  # No `pull_request` trigger here on purpose. This workflow's PRs are same-repo branch -> main
+  # (device/windows-pc -> main, the device forks' own pattern), never a fork, so a `pull_request` run
+  # would build and verify the *exact same commit* the `push` trigger above already does for that
+  # branch — a second full Windows/Linux matrix, on a paid-tier runner, for zero new information.
+  # `publish`'s own gate (`github.ref == 'refs/heads/device/windows-pc'`) never even matches a
+  # `pull_request` event's ref (`refs/pull/N/merge`), so that half of the job was always a no-op on a
+  # PR run too. `push` alone covers every commit that matters; a fork PR wanting this workflow's
+  # checks can still trigger it by hand via `workflow_dispatch`.
+
+permissions:
+  contents: read
+
+# Cancel a still-running or still-queued run for the same branch the moment a newer push arrives.
+# Without this, pushing three fixes in the five minutes it takes windows-latest to build lets all
+# three burn a full paid-tier Windows matrix to completion — only the last one's result was ever
+# going to matter, and the other two were purely wasted minutes. Scoped to the ref, not the
+# workflow, so device/windows-pc and device/galaxy-tab-s9-fe pushing at the same moment don't cancel
+# each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    # `matrix.os` stays the logical platform id (steps below key off it); `matrix.runner` is the
+    # actual label. See rust.yml's `on:` block comment and `.github/SELF_HOSTED_RUNNERS.md` for why
+    # this exists and how to point it at a real machine.
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            runner: ${{ vars.LUMEN_RUNNER_WINDOWS || 'windows-latest' }}
+            target: x86_64-pc-windows-msvc
+            bin: lumen.exe
+          - name: linux-x86_64
+            os: ubuntu-latest
+            runner: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
+            target: x86_64-unknown-linux-gnu
+            bin: lumen
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p lumen-play --target ${{ matrix.target }}
+
+      # A release binary that was never run is a release binary nobody has tested. `--version` is
+      # the cheapest possible proof that it links and starts on this platform. Every leg here builds
+      # natively for its own runner, so there is no cross-target case to skip.
+      - name: Verify the binary runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          ls -l "$BIN"
+          "$BIN" --version
+
+      # `.cargo/config.toml` statically links the MSVC CRT for this target specifically, so
+      # lumen.exe needs no Visual C++ Redistributable on the machine that runs it — checked here
+      # rather than assumed, the same evidence-over-assumption approach `package-windows.sh` already
+      # uses (it objdumps the mingw-gnu build for exactly this class of missing dependency).
+      - name: Set up MSVC dev tools (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Verify lumen.exe needs no VC++ Redistributable (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          $deps = (dumpbin /dependents $bin | Out-String)
+          Write-Host $deps
+          # If either of these shows up, target-feature=+crt-static silently stopped applying and
+          # the binary is back to needing the redistributable installed on the target machine —
+          # which would surface as a "VCRUNTIME140.dll was not found" dialog on a bare Windows
+          # install, a worse first impression than any error this program prints itself.
+          if ($deps -match 'VCRUNTIME|MSVCP\d') {
+            throw "lumen.exe still imports a VC++ runtime DLL -- target-feature=+crt-static is not taking effect. See dumpbin output above."
+          }
+          Write-Host 'OK -- no VCRUNTIME/MSVCP dependency; the Visual C++ Redistributable is not required'
+
+      - name: Stage the bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="dist/lumen-${{ matrix.name }}"
+          mkdir -p "$OUT"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$OUT/"
+          cp crates/lumen-play/README.md "$OUT/README.md"
+          cp LICENSE "$OUT/LICENSE" 2>/dev/null || true
+
+      - name: Bundle mpv (Windows)
+        # Bundles on every push this workflow runs for; only an explicit dispatch can turn it off.
+        # The download and 7z extraction are the most fragile steps here, so skipping them by default
+        # would leave the part most likely to break unexercised.
+        if: matrix.os == 'windows-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $out = "dist/lumen-${{ matrix.name }}"
+          $tmp = Join-Path $env:RUNNER_TEMP "mpv"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          # SourceForge has been observed serving a small mirror-selection/rate-limit page instead of
+          # the archive to requests that look scripted; a plain browser-like UA avoids it in
+          # practice, and the GitHub fallback below covers the rest.
+          $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) lumen-release'
+
+          Write-Host 'Locating the latest mpv build...'
+          $candidates = @()
+          try {
+            $listing = Invoke-WebRequest -UseBasicParsing -UserAgent $ua -Uri 'https://sourceforge.net/projects/mpv-player-windows/files/release/'
+            $vers = [regex]::Matches($listing.Content, 'mpv-(\d+\.\d+\.\d+)-x86_64\.7z') |
+                    ForEach-Object { $_.Groups[1].Value } | Sort-Object { [version]$_ } -Unique
+            if ($vers) {
+              $v = $vers[-1]
+              Write-Host "  mpv $v (sourceforge)"
+              $candidates += "https://sourceforge.net/projects/mpv-player-windows/files/release/mpv-$v-x86_64.7z/download"
+            }
+          } catch { Write-Host '  sourceforge lookup failed' }
+          try {
+            $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest' -Headers @{ 'User-Agent' = 'lumen' }
+            $a = $rel.assets | Where-Object { $_.name -like 'mpv-x86_64-2*' -and $_.name -like '*.7z' -and $_.name -notlike '*v3*' } | Select-Object -First 1
+            if ($a) { Write-Host "  $($a.name) (github)"; $candidates += $a.browser_download_url }
+          } catch { }
+          if (-not $candidates) { throw 'no mpv download source found' }
+
+          # A 7-Zip archive always opens with this six-byte signature. Checking that, rather than a
+          # size threshold, is what actually tells "the real archive" apart from some other small
+          # response that happened to clear an arbitrary byte count — a rate-limit page is not
+          # guaranteed to land under any particular size.
+          function Test-SevenZipSignature($path) {
+            $sig = [byte[]](0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C)
+            $bytes = [System.IO.File]::ReadAllBytes($path)
+            if ($bytes.Length -lt $sig.Length) { return $false }
+            for ($i = 0; $i -lt $sig.Length; $i++) { if ($bytes[$i] -ne $sig[$i]) { return $false } }
+            return $true
+          }
+
+          $archive = Join-Path $tmp 'mpv.7z'
+          $downloaded = $false
+          foreach ($url in $candidates) {
+            try {
+              Write-Host "Downloading from $url ..."
+              Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -UserAgent $ua
+              if (Test-SevenZipSignature $archive) { $downloaded = $true; break }
+              Write-Host '  not a real 7-Zip archive (likely a mirror-selection or rate-limit page) -- trying the next source'
+            } catch {
+              Write-Host "  download failed: $($_.Exception.Message) -- trying the next source"
+            }
+          }
+          if (-not $downloaded) { throw 'every mpv download source returned something that was not a real archive' }
+
+          & 7z x $archive ("-o" + $tmp) -y | Out-Null
+          $mpv = Get-ChildItem -Path $tmp -Filter mpv.exe -Recurse | Select-Object -First 1
+          if (-not $mpv) { throw 'no mpv.exe in the archive' }
+          Copy-Item $mpv.FullName $out -Force
+          $d3d = Get-ChildItem -Path $tmp -Filter 'd3dcompiler_*.dll' -Recurse | Select-Object -First 1
+          if ($d3d) { Copy-Item $d3d.FullName $out -Force }
+
+          # Proof the pair works together, which is the only thing that makes this a bundle rather
+          # than two files in a folder.
+          & "$out/lumen.exe" doctor
+          Write-Host "mpv bundled: $((Get-Item "$out/mpv.exe").Length / 1MB) MB"
+
+      # "All dependencies and appropriate codecs included" checked, not assumed. This is the bundle's
+      # real advantage over the Android build: TrueHD, DTS-HD MA, DTS and DTS:X don't decode there
+      # because that's gated on an OEM licensing a hardware or software decoder that mostly does not
+      # exist on a phone, but this mpv's statically linked FFmpeg carries its own software decoder for
+      # every one of them — nothing here is limited by what Windows itself ships. Same
+      # evidence-over-assumption approach as the DLL-import check above and `package-windows.sh`'s
+      # own objdump check: read what mpv actually reports it can decode, rather than trust that the
+      # build fetched still has what an earlier release verified.
+      - name: Verify codec coverage (Windows)
+        if: matrix.os == 'windows-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = "dist/lumen-${{ matrix.name }}"
+          $mpv = "$out/mpv.exe"
+
+          $video = (& $mpv --vd=help 2>&1 | Out-String)
+          $audio = (& $mpv --ad=help 2>&1 | Out-String)
+          Write-Host "== video decoders =="
+          Write-Host $video
+          Write-Host "== audio decoders =="
+          Write-Host $audio
+
+          # dca is FFmpeg's decoder name for DTS (Digital Theater Systems, historical), and covers
+          # the DTS-HD MA and DTS:X extensions losslessly, not just the DTS core.
+          $requiredVideo = 'h264', 'hevc', 'vp9', 'av1', 'mpeg2video', 'vc1'
+          $requiredAudio = 'ac3', 'eac3', 'dca', 'truehd', 'flac', 'aac', 'opus', 'mp3'
+
+          $missing = @()
+          foreach ($c in $requiredVideo) { if ($video -notmatch [regex]::Escape($c)) { $missing += "video:$c" } }
+          foreach ($c in $requiredAudio) { if ($audio -notmatch [regex]::Escape($c)) { $missing += "audio:$c" } }
+
+          if ($missing.Count -gt 0) {
+            throw "bundled mpv is missing expected decoders: $($missing -join ', ')"
+          }
+          Write-Host 'OK -- full video and audio codec set present, including TrueHD and DTS-HD MA (dca)'
+
+      # Linux gets the same self-containment guarantee Windows already has, by the same
+      # evidence-over-assumption standard as everything above: vendor mpv and the libraries a bare
+      # install of this OS does not already have (the codec/format/subtitle layer), leave the ones
+      # that must track the host alone (GL/Vulkan/VA-API, the display server, the audio server, the
+      # security/identity stack -- see `vendor-mpv-linux.sh` for the full reasoning), and prove it
+      # by actually decoding a file with the dynamic loader's own search path variable unset, so
+      # only what was just vendored can possibly have answered.
+      - name: Bundle mpv (Linux)
+        if: matrix.os == 'ubuntu-latest' && (github.event_name != 'workflow_dispatch' || inputs.bundle_mpv)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mpv patchelf
+          ./crates/lumen-play/vendor-mpv-linux.sh "dist/lumen-${{ matrix.name }}"
+
+      # Everything above proves the binary starts and the codec list mpv reports looks right.
+      # Neither proves a file actually plays -- android.yml's `emulator` job boots a real device and
+      # runs the built APK for exactly this reason: a build that compiles and a build that works are
+      # different claims, and only running it tells them apart. This is the same proof for the
+      # desktop artifact.
+      #
+      # mpv renders its own test clip (real H.264/AAC, synthesized from a signal generator via its
+      # built-in lavfi support, not a fixture checked into the repo) and the exact `lumen`/`lumen.exe`
+      # this job just built plays it back through the exact mpv this job just bundled --
+      # `--vo=null --ao=null` because a CI runner has neither a display nor an audio device, and
+      # `--hwdec=no` so the proof is this build's own software decode path, not a driver's.
+      - name: Verify real playback
+        if: github.event_name != 'workflow_dispatch' || inputs.bundle_mpv
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="dist/lumen-${{ matrix.name }}"
+          BIN="$OUT/${{ matrix.bin }}"
+          PROBE="${RUNNER_TEMP:-/tmp}/lumen-probe.mkv"
+
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            MPV="$OUT/mpv.exe"
+          else
+            MPV="$OUT/mpv"
+          fi
+
+          "$MPV" "av://lavfi:testsrc2=size=160x90:rate=8:duration=3" \
+            --audio-file="av://lavfi:sine=frequency=440:duration=3" \
+            --o="$PROBE" --ovc=libx264 --ovcopts=preset=ultrafast --oac=aac --msg-level=all=error
+          ls -lh "$PROBE"
+
+          "$BIN" test "$PROBE" --seconds 2 --vo null --hwdec no -- --ao=null
+          echo "OK -- lumen actually played a real file through its own bundled mpv, not just started"
+
+      - name: Add the quick-start note
+        shell: bash
+        run: |
+          OUT="dist/lumen-${{ matrix.name }}"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cat > "$OUT/START-HERE.txt" <<'TXT'
+          lumen - media library player and test harness
+
+          Nothing to install. lumen.exe's C runtime is statically linked (no Visual C++
+          Redistributable needed) and mpv.exe's FFmpeg is statically linked with its own software
+          decoders for every codec this product supports, TrueHD and DTS-HD MA included -- CI checks
+          both of those on every build rather than assuming they still hold.
+
+          1. Open PowerShell in this folder (Shift+right-click > "Open PowerShell window here").
+
+          2. Check the machine:
+                 .\lumen.exe doctor
+
+             If mpv is missing, run:
+                 .\lumen.exe setup
+
+          3. Look at your library without playing anything:
+                 .\lumen.exe scan "D:\Media"
+
+          4. Test it - opens every file briefly and reports which ones fail:
+                 .\lumen.exe test "D:\Media" --limit 5
+                 .\lumen.exe test "D:\Media" --json report.json
+
+          5. Watch:
+                 .\lumen.exe play "D:\Media"
+
+          6. Or run it as a LAN server a phone pairs with and controls:
+                 .\lumen.exe serve "D:\Media"
+                 .\lumen.exe serve "D:\Media" --dlna     (also visible to smart TVs; no pairing,
+                                                          so anything on your network can browse it)
+             The terminal shows a six-digit pairing code (ten minutes, one device per start) and a
+             TLS fingerprint the phone pins the first time it pairs. Keep the port on your own LAN;
+             do not forward it through your router. HLS/DASH streaming needs ffmpeg.exe beside
+             lumen.exe or on PATH -- it is not in this folder; plain streaming works without it.
+
+          Playback controls are mpv's own: space, arrows, f, q.
+          Exit codes: 0 all played, 1 something failed, 2 setup problem.
+          TXT
+          else
+            cat > "$OUT/START-HERE.txt" <<'TXT'
+          lumen - media library player and test harness
+
+          Nothing to install. mpv is bundled beside this binary, with its own copy of the
+          codec/format/subtitle layer (FFmpeg, libx264/x265, dav1d, libass and the rest) -- CI
+          proves this exact pair actually decodes a real file on every build, not just that
+          `--version` runs. It still uses this machine's own GPU driver, display server and audio,
+          the same as any other app; only the part that a bare OS install does not already have is
+          bundled.
+
+          ./lumen doctor
+          ./lumen scan  ~/Media
+          ./lumen test  ~/Media --limit 5 --json report.json
+          ./lumen play  ~/Media
+
+          Or run it as a LAN server a phone pairs with and controls:
+              ./lumen serve ~/Media
+              ./lumen serve ~/Media --dlna     (also visible to smart TVs; no pairing, so anything
+                                                on your network can browse it)
+          The terminal shows a six-digit pairing code (ten minutes, one device per start) and a TLS
+          fingerprint the phone pins the first time it pairs. Keep the port on your own LAN; do not
+          forward it through your router. HLS/DASH streaming needs ffmpeg beside this binary or on
+          PATH -- it is not bundled here; plain streaming works without it.
+
+          If mpv is somewhere unusual, point at it instead of moving it:
+              export LUMEN_MPV=/path/to/mpv
+
+          Playback controls are mpv's own: space, arrows, f, q.
+          Exit codes: 0 all played, 1 something failed, 2 setup problem.
+          TXT
+            chmod +x "$OUT/lumen"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a -tzip "lumen-${{ matrix.name }}.zip" "lumen-${{ matrix.name }}" > /dev/null
+          else
+            tar czf "lumen-${{ matrix.name }}.tar.gz" "lumen-${{ matrix.name }}"
+          fi
+          ls -lh lumen-${{ matrix.name }}.*
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-${{ matrix.name }}
+          path: |
+            dist/lumen-${{ matrix.name }}.zip
+            dist/lumen-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  # Publishes wherever the build job's four artifacts are. Two distinct outcomes share this one job
+  # because they share everything else (the same artifacts, the same asset-presence check, the same
+  # "both platforms or none" guarantee) and diverging them into two near-identical jobs would be the
+  # kind of duplication that drifts the moment one copy gets a fix the other doesn't:
+  #   - A branch push updates the rolling `desktop-latest` release in place — one link that always
+  #     points at the newest build, the same pattern `android.yml` already uses (`android-latest`)
+  #     for the phone side.
+  #   - A `v*` tag push instead publishes a new, permanent, numbered release at that tag -- created
+  #     once and never moved or overwritten again, because the whole point of a version tag is that
+  #     it means the same thing every time someone downloads it.
+  # `needs: build` on a matrix job only succeeds once every leg does, so neither path ever publishes
+  # with one platform silently missing because its own build broke.
+  #
+  # Gated to this branch (for the rolling release) or a version tag (for a pinned one), not also main
+  # or the shared development branch: this file's own Windows-specific verification steps above (the
+  # CRT-static check, the codec-coverage check) do not exist on those branches yet, and publishing
+  # from a branch that cannot itself produce what the release notes claim would be worse than not
+  # publishing at all. A `v*` tag is exempt from that reasoning -- it is only ever cut from a commit
+  # that already passed those checks as a branch push first.
+  publish:
+    name: publish release
+    needs: build
+    if: github.ref == 'refs/heads/device/windows-pc' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `name:` filter: pulls every platform's artifact from the matrix build into its own
+      # subdirectory. The release should carry both bundles or none — a partial rolling release
+      # would look complete while quietly missing whichever platform's asset never made it in.
+      - name: Download every platform's build
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+
+          # Flatten out of the per-artifact subdirectories actions/download-artifact created.
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} . \;
+          ASSETS=(lumen-windows-x86_64.zip lumen-linux-x86_64.tar.gz)
+          for a in "${ASSETS[@]}"; do
+            [ -f "$a" ] || { echo "expected asset $a is missing from the build; refusing to publish a partial release" >&2; exit 1; }
+          done
+          ls -lh "${ASSETS[@]}"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # A pinned, numbered release -- published once, at the version the tag itself already
+            # names, and never touched again. No stale-asset sweep and no `--clobber` here: those
+            # exist for the rolling release below, which is expected to change under the same name
+            # release after release; a version tag republishing its own assets out from under
+            # someone who already downloaded it is the failure this guards against, not a feature.
+            TAG="${GITHUB_REF_NAME}"
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "release $TAG already exists -- refusing to overwrite a pinned version's assets" >&2
+              exit 1
+            fi
+
+            NOTES="Lumen Desktop ${TAG}, built from \`${SHORT}\`.
+
+          Two platform bundles from the same commit: Windows and Linux — both self-contained,
+          nothing to install. \`lumen.exe\`'s C runtime is statically linked (no Visual C++
+          Redistributable needed); every platform's mpv ships beside its \`lumen\`, full codec set
+          included (TrueHD and DTS-HD MA covered). On Linux that means the codec/format/subtitle
+          layer is vendored while GL/Vulkan, the display server, the audio server and the security
+          stack still come from this machine, the same as any other app — see each bundle's
+          \`START-HERE.txt\`. All of it checked on this exact build by actually decoding a file, not
+          assumed to still hold from an earlier release."
+
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Lumen Desktop ${TAG}" \
+              --notes "$NOTES"
+            gh release upload "$TAG" "${ASSETS[@]}"
+            echo "### Desktop release ${TAG} published" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}>" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Drop anything already attached to the release that this run did not just build. Without
+            # this, an asset from a platform later removed from the matrix (macOS, here, on
+            # 2026-08-31) sits on the "latest" release forever: `--clobber` below only ever overwrites
+            # or adds, never removes, so `desktop-latest` would keep offering a macOS bundle years
+            # after the workflow stopped building one -- silently wrong in exactly the way a rolling
+            # release is supposed to never be. `gh release view --json` and `gh release delete-asset`
+            # no-op cleanly when the release doesn't exist yet or carries no extra assets.
+            if gh release view desktop-latest >/dev/null 2>&1; then
+              while IFS= read -r stale; do
+                [ -z "$stale" ] && continue
+                echo "removing stale asset from a previous platform matrix: $stale"
+                gh release delete-asset desktop-latest "$stale" --yes
+              done < <(
+                gh release view desktop-latest --json assets --jq '.assets[].name' \
+                  | grep -vxF -f <(printf '%s\n' "${ASSETS[@]}")
+              )
+            fi
+
+            NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
+
+          Two platform bundles from the same commit: Windows and Linux — both self-contained,
+          nothing to install. \`lumen.exe\`'s C runtime is statically linked (no Visual C++
+          Redistributable needed); every platform's mpv ships beside its \`lumen\`, full codec set
+          included (TrueHD and DTS-HD MA covered). On Linux that means the codec/format/subtitle
+          layer is vendored while GL/Vulkan, the display server, the audio server and the security
+          stack still come from this machine, the same as any other app — see each bundle's
+          \`START-HERE.txt\`. All of it checked on this exact build by actually decoding a file, not
+          assumed to still hold from an earlier release.
+
+          This is a development build, not a versioned release."
+
+            if gh release view desktop-latest >/dev/null 2>&1; then
+              # `gh release edit --target` cannot move the tag of a published release — the API
+              # ignores target_commitish once a release is out of draft — so the tag is moved
+              # directly. Without this the release would keep pointing at whichever commit first
+              # created it while serving assets from a much later one.
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/desktop-latest" \
+                -f sha="$GITHUB_SHA" -F force=true > /dev/null
+              gh release edit desktop-latest \
+                --title "Lumen Desktop — build ${SHORT}" --notes "$NOTES" --prerelease
+            else
+              gh release create desktop-latest \
+                --target "$GITHUB_SHA" \
+                --title "Lumen Desktop — build ${SHORT}" \
+                --notes "$NOTES" \
+                --prerelease
+            fi
+            # `--clobber` rather than deleting the release: deleting it would break every link already
+            # shared, which is the one thing a rolling "latest" URL exists to avoid.
+            gh release upload desktop-latest "${ASSETS[@]}" --clobber
+            echo "### Desktop builds published" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/desktop-latest>" >> "$GITHUB_STEP_SUMMARY"
+          fi

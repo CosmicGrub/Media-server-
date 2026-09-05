@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ backup/transfer rules — the modern replacement for full-backup-content, covering both
+  cloud backup and device-to-device transfer. Same exclusion, same reasoning: RemoteConnectionStore.kt
+  encrypts the token at rest, this just keeps its file out of any copy of app data in the first place.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="lumen.remote.enc.xml" />
+        <exclude domain="sharedpref" path="lumen.remote.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="lumen.remote.enc.xml" />
+        <exclude domain="sharedpref" path="lumen.remote.xml" />
+    </device-transfer>
+</data-extraction-rules>

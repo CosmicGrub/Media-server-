@@ -7,7 +7,9 @@
 //! Consequently `explain()` is a product surface with the same status as a UI string, and the
 //! conformance corpus asserts on these variants directly via `reasons_absent` / `reasons_present`.
 
-use lumen_model::{AudioCodec, Container, HdrFormat, SubtitleCodec, VideoCodec};
+use lumen_model::{
+    AudioCodec, ChromaSubsampling, ColorPrimaries, Container, HdrFormat, SubtitleCodec, VideoCodec,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitrateCause {
@@ -46,6 +48,12 @@ pub enum RejectReason {
         have: u8,
         max: u8,
     },
+    /// The decoder cannot handle this chroma layout — 4:2:2/4:4:4 profiles hardware decoders most
+    /// often lack entirely (`docs/11` §8), distinct from bit depth or profile.
+    ChromaSubsamplingUnsupported {
+        have: ChromaSubsampling,
+        max: ChromaSubsampling,
+    },
     BitrateCeiling {
         have_bps: u64,
         max_bps: u64,
@@ -72,6 +80,12 @@ pub enum RejectReason {
     },
     HdrUnsupportedByDisplay {
         format: HdrFormat,
+    },
+    /// The display's physical gamut does not cover the stream's mastering primaries -- a separate
+    /// question from `HdrUnsupportedByDisplay`, since a display can support the HDR10 *format*
+    /// outright while still being unable to show every colour BT.2020 content specifies.
+    GamutUnsupportedByDisplay {
+        primaries: ColorPrimaries,
     },
     /// Reproduction is incomplete even on fully capable hardware — currently only Dolby Vision
     /// Profile 7 FEL, whose enhancement layer no open-source renderer can reconstruct.
@@ -118,6 +132,9 @@ impl RejectReason {
             Self::BitDepthUnsupported { have, max } => {
                 format!("The video is {have}-bit; this device decodes up to {max}-bit.")
             }
+            Self::ChromaSubsamplingUnsupported { have, max } => {
+                format!("The video is {have:?}; this device decodes up to {max:?}.",)
+            }
             Self::BitrateCeiling { have_bps, max_bps, cause } => {
                 let why = match cause {
                     BitrateCause::ClientCeiling => "the playback quality limit you set",
@@ -158,6 +175,10 @@ impl RejectReason {
             Self::HdrUnsupportedByDisplay { format } => {
                 format!("This display does not support {format:?}, so the picture was tone mapped.")
             }
+            Self::GamutUnsupportedByDisplay { primaries } => format!(
+                "This display's colour gamut does not cover the source's {primaries:?} primaries, \
+                 so the picture was gamut mapped."
+            ),
             Self::EnhancementLayerUnsupported { format } => format!(
                 "{format:?} carries an enhancement layer that cannot be reconstructed. \
                  Playing the HDR10 base layer, which is the full picture minus the extra \
@@ -196,12 +217,14 @@ impl RejectReason {
             Self::VideoCodecUnsupported { .. } => "VideoCodecUnsupported",
             Self::VideoTooLarge { .. } => "VideoTooLarge",
             Self::BitDepthUnsupported { .. } => "BitDepthUnsupported",
+            Self::ChromaSubsamplingUnsupported { .. } => "ChromaSubsamplingUnsupported",
             Self::BitrateCeiling { .. } => "BitrateCeiling",
             Self::NoHardwareDecoder { .. } => "NoHardwareDecoder",
             Self::SinkLacksEncoding { .. } => "SinkLacksEncoding",
             Self::ChannelCountUnsupported { .. } => "ChannelCountUnsupported",
             Self::SampleRateUnsupported { .. } => "SampleRateUnsupported",
             Self::HdrUnsupportedByDisplay { .. } => "HdrUnsupportedByDisplay",
+            Self::GamutUnsupportedByDisplay { .. } => "GamutUnsupportedByDisplay",
             Self::EnhancementLayerUnsupported { .. } => "EnhancementLayerUnsupported",
             Self::SubtitleBurnInRequired { .. } => "SubtitleBurnInRequired",
             Self::NetworkHeadroom { .. } => "NetworkHeadroom",
@@ -261,6 +284,10 @@ mod tests {
             },
             RejectReason::VideoTooLarge { have: (7680, 4320), max: (3840, 2160) },
             RejectReason::BitDepthUnsupported { have: 10, max: 8 },
+            RejectReason::ChromaSubsamplingUnsupported {
+                have: ChromaSubsampling::Yuv444,
+                max: ChromaSubsampling::Yuv420,
+            },
             RejectReason::BitrateCeiling {
                 have_bps: 92_000_000,
                 max_bps: 20_000_000,
@@ -275,6 +302,7 @@ mod tests {
             RejectReason::ChannelCountUnsupported { have: 8, max: 2 },
             RejectReason::SampleRateUnsupported { have: 192_000, sink: "x".into() },
             RejectReason::HdrUnsupportedByDisplay { format: HdrFormat::Hdr10 },
+            RejectReason::GamutUnsupportedByDisplay { primaries: ColorPrimaries::Bt2020 },
             RejectReason::EnhancementLayerUnsupported { format: HdrFormat::DolbyVisionP7Fel },
             RejectReason::SubtitleBurnInRequired {
                 format: SubtitleCodec::Pgs,

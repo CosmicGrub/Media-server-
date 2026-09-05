@@ -1,0 +1,15 @@
+[package]
+name = "lumen-index"
+description = "Persistent, incremental library index -- what changed since the last pass, and why."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lumen-identity.workspace = true
+lumen-meta.workspace = true
+
+[lints]
+workspace = true

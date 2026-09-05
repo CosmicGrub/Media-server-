@@ -13,8 +13,58 @@ path = "src/main.rs"
 
 [dependencies]
 lumen-model.workspace = true
+lumen-caps.workspace = true
+lumen-playback.workspace = true
 lumen-probe.workspace = true
 lumen-match.workspace = true
+lumen-identity.workspace = true
+lumen-index.workspace = true
+lumen-discovery.workspace = true
+lumen-segment.workspace = true
+# Only for `lumen serve`'s pairing codes and tokens. `unsafe_code` is denied workspace-wide, which
+# rules out reading a platform random source by hand, and std has no CSPRNG of its own to reach for.
+getrandom = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
+sha2 = "0.10"
+# `rcgen`'s own `not_before`/`not_after` fields are typed `time::OffsetDateTime`, and `time` is
+# already in the dependency graph as one of rcgen's own dependencies -- naming it directly here adds
+# nothing new to the license gate or the build matrix, same reasoning as reusing `xxhash-rust` for
+# Engine B's digest. Only `from_unix_timestamp`, a `const fn` needing no feature at all, is used.
+time = { version = "0.3", default-features = false }
+# `lumen serve health`'s free-disk-space check (docs/15 §D): `unsafe_code` is denied workspace-wide,
+# which rules out a hand-rolled `statvfs`/`GetDiskFreeSpaceExW` call the same way `getrandom` above
+# was needed for the OS random source. Every platform backend this pulls in (`rustix`, `windows-sys`)
+# is already in the dependency graph via `rustls`/`getrandom`, so this adds no new transitive crate.
+fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
+# `lumen serve`'s automatic-rescan watcher (`docs/15` §A's "honest phase-2 item"): a real, cross-
+# platform filesystem-event source (inotify on Linux, `ReadDirectoryChangesW` on Windows, FSEvents on
+# macOS) with no `unsafe_code` of our own needed to drive any of them, the same reason `getrandom` and
+# `fs4` above were reached for instead of a hand-rolled platform call. `notify-debouncer-mini` is not
+# pulled in alongside it -- the debounce this watcher needs (coalesce a burst of events into one
+# rescan) is ~20 lines against primitives (`mpsc`, a `recv_timeout` loop) this file already leans on
+# everywhere else, so a second small crate would buy nothing a few lines here don't already cover.
+notify = "8"
+
+[dev-dependencies]
+# Backdating a file's or directory's own mtime in `hls.rs`'s eviction/sweep tests. `std::fs::File`
+# opened read-only (or, for a directory, opened without `FILE_FLAG_BACKUP_SEMANTICS` at all) cannot
+# have its own timestamps written on Windows -- `File::set_modified` needs `FILE_WRITE_ATTRIBUTES`
+# access a plain `File::open` never requests, and `File::open` on a directory fails outright on
+# Windows without that same flag. `filetime` is the standard, minimal answer to exactly this (used by
+# cargo itself for reproducible-timestamp tests); test-only, so it never reaches the shipped binary.
+filetime = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `ipc.rs`'s Windows named-pipe transport: two `File`s duplicated from one `CreateFileW` handle (via
+# `try_clone`) deadlocked the moment a real command was sent, because Windows serializes synchronous
+# (non-overlapped) I/O per file object -- a pending read on one duplicated handle blocks a write on
+# the other, and mpv was never going to reply until it received that write. `unsafe_code` is denied
+# workspace-wide, which rules out driving Windows' overlapped I/O by hand the same way `getrandom`
+# above was needed for the OS random source; this crate's named-pipe support gives each split half
+# its own overlapped I/O state so a read and a write on the same connection genuinely don't contend.
+# `default-features = false` keeps it to plain synchronous named pipes -- no tokio, no async runtime.
+interprocess = { version = "2.4.3", default-features = false }
 
 [lints]
 workspace = true

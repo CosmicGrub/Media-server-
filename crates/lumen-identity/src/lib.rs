@@ -153,6 +153,48 @@ pub fn sketch_read_cost(size: u64) -> u64 {
     if size <= FULL_READ_THRESHOLD { size } else { 3 * CHUNK }
 }
 
+/// A whole-file content digest — unlike [`ContentSketch`], which samples three ~1 MiB regions plus
+/// length (fast, "is this probably the same file"), this hashes every byte. It answers a stronger,
+/// different question: "have these exact bytes changed since I last checked?" — the question the
+/// Integrity Engine (`docs/15` §B) needs a real answer to, not an implausible-collision guess. A
+/// corrupted byte anywhere, including the vast majority of a large file the sketch never reads at
+/// all, changes this digest; only a byte inside one of the sketch's three sampled regions is
+/// guaranteed to change that one.
+///
+/// Not a cryptographic hash, for the same reason `ContentSketch` is not one: this defends against
+/// ordinary corruption — bit rot, a failed write, a bad sector — not against an adversary
+/// constructing a collision on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileDigest(pub u128);
+
+impl FileDigest {
+    /// Lowercase hex, for storage and logs.
+    pub fn to_hex(self) -> String {
+        format!("{:032x}", self.0)
+    }
+
+    pub fn from_hex(s: &str) -> Option<Self> {
+        u128::from_str_radix(s.trim(), 16).ok().map(Self)
+    }
+}
+
+/// Hash every byte of `reader`, start to end, in bounded chunks so this never needs the whole file
+/// in memory at once. Unlike [`sketch_reader`], there is no size-based shortcut and no seeking — that
+/// full read is the entire point of this function existing alongside the sampled one, so it takes a
+/// plain `Read` rather than `Read + Seek`, and a size the caller does not even need to know up front.
+pub fn digest_reader<R: Read>(reader: &mut R) -> std::io::Result<FileDigest> {
+    let mut hasher = Xxh3::new();
+    let mut buf = vec![0u8; CHUNK as usize];
+    loop {
+        let n = read_up_to(reader, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(FileDigest(hasher.digest128()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +282,29 @@ mod tests {
     }
 
     #[test]
+    fn the_smallest_file_that_enters_sampling_does_not_underflow_its_offsets() {
+        // sketch_reader's sampling branch computes `size / 2 - CHUNK / 2` and `size - CHUNK` as plain
+        // u64 subtraction -- either going negative would underflow-panic in a debug build and wrap to
+        // a huge, wrong seek offset in a release one (overflow checks are off there by construction).
+        // Both stay safely positive only because `FULL_READ_THRESHOLD` (the smallest size that takes
+        // this branch at all, at `threshold + 1`) is fixed at exactly `3 * CHUNK`: worked through by
+        // hand, `size > 3*CHUNK` guarantees `size - CHUNK > 2*CHUNK` and `size/2 - CHUNK/2 > CHUNK`,
+        // both comfortably positive -- but that guarantee lives entirely in the relationship between
+        // two constants, nothing enforces it if either one is ever tuned independently later. Proven
+        // here at the tightest possible case (`threshold + 1`, the smallest input that ever reaches
+        // this code) rather than trusted from the constants' current values alone.
+        let size = FULL_READ_THRESHOLD + 1;
+        let data = bytes(size as usize, 42);
+        let sketch = sketch_of(&data); // must not panic
+        // And it must still be a real sketch, not an artifact of a seek gone to the wrong place:
+        // changing a byte in the tail sample (the region `size - CHUNK` reads from) must move it.
+        let mut tail_flipped = data.clone();
+        let tail_start = (size - CHUNK) as usize;
+        tail_flipped[tail_start] ^= 1;
+        assert_ne!(sketch_of(&tail_flipped), sketch, "a change in the tail sample went undetected");
+    }
+
+    #[test]
     fn hex_round_trips() {
         let s = ContentSketch(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
         assert_eq!(s.to_hex().len(), 32);
@@ -247,6 +312,71 @@ mod tests {
         assert_eq!(ContentSketch::from_hex("not hex"), None);
         // Leading zeros must survive, or short sketches fail to match on reload.
         assert_eq!(ContentSketch::from_hex(&ContentSketch(1).to_hex()), Some(ContentSketch(1)));
+    }
+
+    fn digest_of(data: &[u8]) -> FileDigest {
+        let mut c = Cursor::new(data);
+        digest_reader(&mut c).expect("in-memory read cannot fail")
+    }
+
+    #[test]
+    fn digest_is_stable_for_the_same_bytes_across_chunk_boundaries() {
+        // A length that is not a whole multiple of CHUNK, so the loop's last iteration is a short
+        // read — exactly the boundary condition most likely to silently drop or duplicate bytes.
+        let data = bytes(5 * CHUNK as usize + 137, 3);
+        assert_eq!(digest_of(&data), digest_of(&data));
+    }
+
+    #[test]
+    fn digest_catches_a_flip_anywhere_the_sampled_sketch_would_miss() {
+        // Nine megabytes: comfortably past FULL_READ_THRESHOLD, so the sketch only samples three
+        // 1 MiB regions out of nine — this picks positions in the six MiB the sketch never reads.
+        let len = 9 * CHUNK as usize;
+        let base = bytes(len, 11);
+        let baseline_digest = digest_of(&base);
+        let baseline_sketch = sketch_of(&base);
+
+        // Roughly 25% and 75% through the file: past the head sample, short of the middle sample,
+        // and short of the tail sample -- squarely in territory the sketch never touches.
+        for pos in [len / 4, 3 * len / 4] {
+            let mut mutated = base.clone();
+            mutated[pos] ^= 0xff;
+            assert_eq!(
+                sketch_of(&mutated),
+                baseline_sketch,
+                "test setup invariant broken: position {pos} was supposed to be outside every sampled region"
+            );
+            assert_ne!(
+                digest_of(&mutated),
+                baseline_digest,
+                "a full-file digest must catch a flip anywhere, unlike the sampled sketch"
+            );
+        }
+    }
+
+    #[test]
+    fn digest_of_an_empty_reader_is_deterministic() {
+        assert_eq!(digest_of(&[]), digest_of(&[]));
+    }
+
+    #[test]
+    fn digest_hex_round_trips() {
+        let d = FileDigest(0x0123_4567_89ab_cdef_fedc_ba98_7654_3210);
+        assert_eq!(d.to_hex().len(), 32);
+        assert_eq!(FileDigest::from_hex(&d.to_hex()), Some(d));
+        assert_eq!(FileDigest::from_hex("not hex"), None);
+        assert_eq!(FileDigest::from_hex(&FileDigest(1).to_hex()), Some(FileDigest(1)));
+    }
+
+    #[test]
+    fn digest_and_sketch_are_distinct_types_that_do_not_coincidentally_agree() {
+        // Not a security property, just a sanity check that two different algorithms over the same
+        // small (fully-sampled) input do not somehow collide in a way that would make a future
+        // refactor accidentally conflate them.
+        let data = bytes(1024, 4);
+        let d = digest_of(&data);
+        let s = sketch_of(&data);
+        assert_ne!(d.0, s.0);
     }
 
     fn ident(size: u64, mtime: i128, sketch: u128) -> FileIdentity {

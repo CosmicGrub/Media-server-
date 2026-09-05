@@ -181,10 +181,31 @@ fn decide_video(
                 );
                 must_transcode = true;
             }
+            if !dc.accepts_level(v.level) {
+                ctx.reject(
+                    Tier::T1FullFidelity,
+                    RejectReason::VideoCodecUnsupported {
+                        codec: v.codec.clone(),
+                        profile: v.profile.clone(),
+                        level: v.level,
+                    },
+                );
+                must_transcode = true;
+            }
             if v.bit_depth > dc.max_bit_depth {
                 ctx.reject(
                     Tier::T1FullFidelity,
                     RejectReason::BitDepthUnsupported { have: v.bit_depth, max: dc.max_bit_depth },
+                );
+                must_transcode = true;
+            }
+            if !dc.accepts_chroma(v.chroma) {
+                ctx.reject(
+                    Tier::T1FullFidelity,
+                    RejectReason::ChromaSubsamplingUnsupported {
+                        have: v.chroma,
+                        max: dc.max_chroma,
+                    },
                 );
                 must_transcode = true;
             }
@@ -251,6 +272,18 @@ fn decide_video(
     if hdr.is_lossy_to_reproduce() {
         // Dolby Vision Profile 7 FEL: honest labelling, never a support claim (`docs/11` §7).
         ctx.reject(Tier::T0BitExact, RejectReason::EnhancementLayerUnsupported { format: hdr });
+    }
+
+    // Gamut coverage is a separate question from HDR *format* support: a display can support the
+    // HDR10 format outright while its physical gamut still cannot show every colour a BT.2020-
+    // mastered file specifies. Checked independently of HDR-ness, since wide-gamut SDR content is a
+    // real (if rare) case too.
+    let primaries = v.color.primaries;
+    if !caps.display.handles_gamut(primaries) {
+        ctx.reject(Tier::T1FullFidelity, RejectReason::GamutUnsupportedByDisplay { primaries });
+        if !caps.can_tone_map {
+            must_transcode = true;
+        }
     }
 
     if !must_transcode {

@@ -12,6 +12,7 @@
 //! | `ContentEncryption`? | Must produce a specific message, never a mysterious decode failure (§2.7) |
 //! | Attached fonts? | Without them ASS renders in the wrong font — a top "broken subtitles" report (§2.7) |
 //! | Segment linking? | Ordered chapters and linked segments need resolving *before* playback (§2.4) |
+//! | Declared video codec, geometry, colour? | Answerable from `TrackEntry` alone -- no bitstream parsing, no launching a decoder just to ask "how big is this?" |
 //!
 //! Every parse is bounded and total: malformed input yields partial findings, never a panic and
 //! never an error that stops playback. Per §1 Rule 2, unknown is not fatal.
@@ -29,6 +30,18 @@ const ID_PREV_UID: u64 = 0x3C_B923;
 const ID_NEXT_UID: u64 = 0x3E_B923;
 const ID_TRACKS: u64 = 0x1654_AE6B;
 const ID_TRACK_ENTRY: u64 = 0xAE;
+const ID_TRACK_TYPE: u64 = 0x83;
+/// Matroska value for a video track. Audio is 2, subtitle is 17 -- neither is relevant here.
+const TRACK_TYPE_VIDEO: u64 = 1;
+const ID_CODEC_ID: u64 = 0x86;
+const ID_VIDEO: u64 = 0xE0;
+const ID_PIXEL_WIDTH: u64 = 0xB0;
+const ID_PIXEL_HEIGHT: u64 = 0xBA;
+const ID_COLOUR: u64 = 0x55B0;
+const ID_MATRIX_COEFFICIENTS: u64 = 0x55B1;
+const ID_RANGE: u64 = 0x55B9;
+const ID_TRANSFER_CHARACTERISTICS: u64 = 0x55BA;
+const ID_PRIMARIES: u64 = 0x55BB;
 const ID_CONTENT_ENCODINGS: u64 = 0x6D80;
 const ID_CONTENT_ENCODING: u64 = 0x6240;
 const ID_CONTENT_COMPRESSION: u64 = 0x5034;
@@ -92,6 +105,24 @@ pub enum CuesPlacement {
     Tail,
 }
 
+/// Codec, geometry and colour read directly from one video `TrackEntry`'s declared properties.
+///
+/// No bitstream parsing: everything here is what the container itself states, the same "structural,
+/// not a demuxer" boundary the rest of this module keeps. In particular `codec` names the container
+/// codec (from `CodecID`), not a profile/level -- those live inside the bitstream this reader never
+/// touches.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoTrackInfo {
+    pub codec: lumen_model::VideoCodec,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Populated from the track's `Colour` element when present, `hdr` derived from `transfer` the
+    /// same way `fidelity::color_info` derives it from mpv's live properties. `Unspecified`/`Sdr`
+    /// fields are the honest default for the (common) case where a muxer wrote no `Colour` element at
+    /// all -- absence here is "not stated", never a claim of SDR BT.709.
+    pub color: lumen_model::ColorInfo,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MatroskaLayout {
     pub doctype: Option<String>,
@@ -106,6 +137,8 @@ pub struct MatroskaLayout {
     pub cues: CuesPlacement,
     pub cluster_count_seen: usize,
     pub track_count: usize,
+    /// One entry per video `TrackEntry` found, in file order.
+    pub video_tracks: Vec<VideoTrackInfo>,
     /// Compression declared on any track. Header stripping *must* be handled.
     pub compression: Vec<CompressionAlgo>,
     /// Any track declares `ContentEncryption`. Playback is T5 with a specific message (§2.7).
@@ -114,6 +147,13 @@ pub struct MatroskaLayout {
     /// bytes, never by MIME, because muxers emit wrong MIME types constantly.
     pub attachments: Vec<String>,
     pub font_attachment_count: usize,
+    /// Attachments recognised as images by extension -- a Matroska cover is carried exactly like a
+    /// font attachment, just under `cover.jpg`/`folder.png` instead of a font filename. Same "never
+    /// trust the declared MIME" stance as fonts (§2.7).
+    pub image_attachment_count: usize,
+    /// The codec of the first recognised image attachment, if any -- enough to know a cover exists
+    /// and what format it is without reading `FileData`, which this structural reader never does.
+    pub cover_art_codec: Option<lumen_model::ImageCodec>,
     /// Ordered-chapter edition present: a virtual timeline must be built before playback (§2.4).
     pub has_ordered_edition: bool,
     /// Hard linking via `ChapterSegmentUUID`, or an entire linked edition via
@@ -256,6 +296,193 @@ fn looks_like_font(name: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// The Matroska `CodecID` string to a [`lumen_model::VideoCodec`]. Values are the standardised
+/// Matroska codec IDs (matroska.org/technical/codec_specs.html), a fixed, distinct vocabulary from
+/// FFmpeg's short names that `fidelity::video_codec` maps elsewhere.
+fn video_codec_from_matroska_id(id: &str) -> lumen_model::VideoCodec {
+    use lumen_model::VideoCodec;
+    match id {
+        "V_MPEG4/ISO/AVC" => VideoCodec::H264,
+        "V_MPEGH/ISO/HEVC" => VideoCodec::Hevc,
+        // The VVC codec ID has not settled on one vendor prefix across muxers yet; both are seen.
+        "V_MPEGI/ISO/VVC" | "V_MPEGH/ISO/VVC" => VideoCodec::Vvc,
+        "V_AV1" => VideoCodec::Av1,
+        "V_VP8" => VideoCodec::Vp8,
+        "V_VP9" => VideoCodec::Vp9,
+        "V_MPEG1" => VideoCodec::Mpeg1,
+        "V_MPEG2" => VideoCodec::Mpeg2,
+        "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/SP" | "V_MPEG4/MS/V3" => VideoCodec::Mpeg4Part2,
+        "V_THEORA" => VideoCodec::Theora,
+        "V_UNCOMPRESSED" => VideoCodec::Uncompressed,
+        "V_PRORES" => VideoCodec::ProRes,
+        "V_MJPEG" => VideoCodec::Mjpeg,
+        other => VideoCodec::Other(other.to_string()),
+    }
+}
+
+/// ITU-T H.273 (CICP) colour primaries code points -- the same numbering Matroska's `Primaries`
+/// element, ISOBMFF's `colr` box, and H.264/HEVC VUI all share.
+fn primaries_from_cicp(v: u64) -> lumen_model::ColorPrimaries {
+    use lumen_model::ColorPrimaries as P;
+    match v {
+        1 => P::Bt709,
+        5 => P::Bt601_625,
+        6 => P::Bt601_525,
+        7 => P::Smpte240M,
+        9 => P::Bt2020,
+        11 => P::DciP3,
+        12 => P::DisplayP3,
+        _ => P::Unspecified,
+    }
+}
+
+/// ITU-T H.273 transfer characteristics code points.
+fn transfer_from_cicp(v: u64) -> lumen_model::ColorTransfer {
+    use lumen_model::ColorTransfer as T;
+    match v {
+        1 => T::Bt709,
+        6 => T::Smpte170M,
+        7 => T::Smpte240M,
+        8 => T::Linear,
+        13 => T::Srgb,
+        14 => T::Bt2020_10,
+        15 => T::Bt2020_12,
+        16 => T::Pq,
+        18 => T::Hlg,
+        _ => T::Unspecified,
+    }
+}
+
+/// ITU-T H.273 matrix coefficients code points.
+fn matrix_from_cicp(v: u64) -> lumen_model::ColorMatrix {
+    use lumen_model::ColorMatrix as M;
+    match v {
+        1 => M::Bt709,
+        5 | 6 => M::Bt601,
+        8 => M::YCgCo,
+        9 => M::Bt2020Ncl,
+        10 => M::Bt2020Cl,
+        14 => M::IcTcP,
+        _ => M::Unspecified,
+    }
+}
+
+/// Matroska's own `Range` element values -- distinct from the CICP tables above, and not the same
+/// numbering.
+fn range_from_matroska(v: u64) -> lumen_model::ColorRange {
+    use lumen_model::ColorRange as R;
+    match v {
+        1 => R::Limited,
+        2 => R::Full,
+        // 0 = unspecified, 3 = "defined by MatrixCoefficients/TransferCharacteristics" -- resolving
+        // that would need logic this structural reader does not have; both are honestly Unspecified.
+        _ => R::Unspecified,
+    }
+}
+
+/// Parse one `TrackEntry`'s body in isolation, returning its declared codec/geometry/colour if (and
+/// only if) it is a video track. A separate, bounded pass from [`walk`]'s shared accumulator, since a
+/// `TrackEntry`'s several colour/geometry sub-elements need correlating to *one* track and `walk`'s
+/// flat structure has no notion of "the track currently being visited".
+fn parse_track_entry(buf: &[u8]) -> Option<VideoTrackInfo> {
+    #[derive(Default)]
+    struct Acc {
+        is_video: bool,
+        codec_id: Option<String>,
+        width: Option<u32>,
+        height: Option<u32>,
+        primaries: lumen_model::ColorPrimaries,
+        transfer: lumen_model::ColorTransfer,
+        matrix: lumen_model::ColorMatrix,
+        range: lumen_model::ColorRange,
+    }
+
+    fn walk_track(r: &mut Reader<'_>, acc: &mut Acc, depth: u8) {
+        if depth > MAX_DEPTH {
+            return;
+        }
+        while r.remaining() > 0 {
+            let start = r.pos;
+            let Some(id) = r.read_id() else {
+                r.pos = start + 1;
+                continue;
+            };
+            let Some(size) = r.read_size() else { return };
+            let body_len = if size == UNKNOWN_SIZE {
+                r.remaining()
+            } else {
+                (size as usize).min(r.remaining())
+            };
+            let body_start = r.pos;
+
+            match id {
+                ID_TRACK_TYPE => {
+                    if r.read_uint(body_len) == Some(TRACK_TYPE_VIDEO) {
+                        acc.is_video = true;
+                    }
+                }
+                ID_CODEC_ID => acc.codec_id = r.read_string(body_len),
+                ID_PIXEL_WIDTH => acc.width = r.read_uint(body_len).map(|v| v as u32),
+                ID_PIXEL_HEIGHT => acc.height = r.read_uint(body_len).map(|v| v as u32),
+                ID_MATRIX_COEFFICIENTS => {
+                    if let Some(v) = r.read_uint(body_len) {
+                        acc.matrix = matrix_from_cicp(v);
+                    }
+                }
+                ID_RANGE => {
+                    if let Some(v) = r.read_uint(body_len) {
+                        acc.range = range_from_matroska(v);
+                    }
+                }
+                ID_TRANSFER_CHARACTERISTICS => {
+                    if let Some(v) = r.read_uint(body_len) {
+                        acc.transfer = transfer_from_cicp(v);
+                    }
+                }
+                ID_PRIMARIES => {
+                    if let Some(v) = r.read_uint(body_len) {
+                        acc.primaries = primaries_from_cicp(v);
+                    }
+                }
+                ID_VIDEO | ID_COLOUR => {
+                    let end = (body_start + body_len).min(r.buf.len());
+                    walk_track(&mut Reader::new(&r.buf[body_start..end]), acc, depth + 1);
+                }
+                _ => {}
+            }
+
+            r.pos = (body_start + body_len).min(r.buf.len());
+            if r.pos <= start {
+                return;
+            }
+        }
+    }
+
+    let mut acc = Acc::default();
+    walk_track(&mut Reader::new(buf), &mut acc, 0);
+    if !acc.is_video {
+        return None;
+    }
+    let hdr = match acc.transfer {
+        lumen_model::ColorTransfer::Pq => lumen_model::HdrFormat::Hdr10,
+        lumen_model::ColorTransfer::Hlg => lumen_model::HdrFormat::Hlg,
+        _ => lumen_model::HdrFormat::Sdr,
+    };
+    Some(VideoTrackInfo {
+        codec: video_codec_from_matroska_id(acc.codec_id.as_deref().unwrap_or("")),
+        width: acc.width,
+        height: acc.height,
+        color: lumen_model::ColorInfo {
+            primaries: acc.primaries,
+            transfer: acc.transfer,
+            matrix: acc.matrix,
+            range: acc.range,
+            hdr,
+            mastering: None,
+        },
+    })
+}
+
 /// Maximum nesting depth. Bounds work on hostile or corrupt input.
 const MAX_DEPTH: u8 = 12;
 
@@ -363,12 +590,20 @@ fn walk(r: &mut Reader<'_>, layout: &mut MatroskaLayout, depth: u8) {
             ID_TRACK_ENTRY => {
                 layout.track_count += 1;
                 let end = (body_start + body_len).min(r.buf.len());
-                walk(&mut Reader::new(&r.buf[body_start..end]), layout, depth + 1);
+                let entry_buf = &r.buf[body_start..end];
+                if let Some(v) = parse_track_entry(entry_buf) {
+                    layout.video_tracks.push(v);
+                }
+                walk(&mut Reader::new(entry_buf), layout, depth + 1);
             }
             ID_FILE_NAME => {
                 if let Some(name) = r.read_string(body_len) {
                     if looks_like_font(&name) {
                         layout.font_attachment_count += 1;
+                    }
+                    if let Some(codec) = lumen_model::ImageCodec::from_extension(&name) {
+                        layout.image_attachment_count += 1;
+                        layout.cover_art_codec.get_or_insert(codec);
                     }
                     layout.attachments.push(name);
                 }
@@ -575,6 +810,28 @@ mod tests {
         let l = analyze(&file(&matroska_header(), &elem(ID_ATTACHMENTS, &attachments))).unwrap();
         assert_eq!(l.attachments.len(), 4);
         assert_eq!(l.font_attachment_count, 2, "both fonts found despite wrong MIME types");
+        assert_eq!(l.image_attachment_count, 1, "the cover, despite the readme and two fonts");
+        assert_eq!(l.cover_art_codec, Some(lumen_model::ImageCodec::Jpeg));
+    }
+
+    #[test]
+    fn a_wrongly_mimed_cover_is_still_found_by_extension() {
+        // Same principle as fonts: a muxer's declared MIME is not trusted.
+        let mut body = str_elem(ID_FILE_NAME, "folder.png");
+        body.extend(str_elem(ID_FILE_MIME_TYPE, "application/octet-stream"));
+        let attachments = elem(ID_ATTACHED_FILE, &body);
+        let l = analyze(&file(&matroska_header(), &elem(ID_ATTACHMENTS, &attachments))).unwrap();
+        assert_eq!(l.image_attachment_count, 1);
+        assert_eq!(l.cover_art_codec, Some(lumen_model::ImageCodec::Png));
+    }
+
+    #[test]
+    fn no_image_attachments_means_no_cover_art_claim() {
+        let body = str_elem(ID_FILE_NAME, "Roboto-Bold.ttf");
+        let attachments = elem(ID_ATTACHED_FILE, &body);
+        let l = analyze(&file(&matroska_header(), &elem(ID_ATTACHMENTS, &attachments))).unwrap();
+        assert_eq!(l.image_attachment_count, 0);
+        assert_eq!(l.cover_art_codec, None);
     }
 
     #[test]
@@ -679,5 +936,84 @@ mod tests {
         }
         let l = analyze(&file(&matroska_header(), &body));
         assert!(l.is_some(), "must return rather than recurse without bound");
+    }
+
+    fn colour_elem(matrix: u64, range: u64, transfer: u64, primaries: u64) -> Vec<u8> {
+        let mut body = uint_elem(ID_MATRIX_COEFFICIENTS, matrix);
+        body.extend(uint_elem(ID_RANGE, range));
+        body.extend(uint_elem(ID_TRANSFER_CHARACTERISTICS, transfer));
+        body.extend(uint_elem(ID_PRIMARIES, primaries));
+        elem(ID_COLOUR, &body)
+    }
+
+    fn video_track(codec_id: &str, width: u64, height: u64, colour: Option<Vec<u8>>) -> Vec<u8> {
+        let mut video_body = uint_elem(ID_PIXEL_WIDTH, width);
+        video_body.extend(uint_elem(ID_PIXEL_HEIGHT, height));
+        if let Some(c) = colour {
+            video_body.extend(c);
+        }
+        let mut body = uint_elem(ID_TRACK_TYPE, TRACK_TYPE_VIDEO);
+        body.extend(str_elem(ID_CODEC_ID, codec_id));
+        body.extend(elem(ID_VIDEO, &video_body));
+        elem(ID_TRACK_ENTRY, &body)
+    }
+
+    #[test]
+    fn a_video_tracks_codec_geometry_and_hdr_colour_are_read_from_the_container() {
+        // The UHD HDR10 remux case: HEVC Main 10, BT.2020 NCL, PQ transfer, PQ signals HDR10.
+        let colour = colour_elem(9, 1, 16, 9);
+        let track = video_track("V_MPEGH/ISO/HEVC", 3840, 2160, Some(colour));
+        let l = analyze(&file(&matroska_header(), &elem(ID_TRACKS, &track))).unwrap();
+
+        assert_eq!(l.video_tracks.len(), 1);
+        let v = &l.video_tracks[0];
+        assert_eq!(v.codec, lumen_model::VideoCodec::Hevc);
+        assert_eq!(v.width, Some(3840));
+        assert_eq!(v.height, Some(2160));
+        assert_eq!(v.color.matrix, lumen_model::ColorMatrix::Bt2020Ncl);
+        assert_eq!(v.color.range, lumen_model::ColorRange::Limited);
+        assert_eq!(v.color.transfer, lumen_model::ColorTransfer::Pq);
+        assert_eq!(v.color.primaries, lumen_model::ColorPrimaries::Bt2020);
+        assert_eq!(v.color.hdr, lumen_model::HdrFormat::Hdr10, "PQ transfer implies HDR10");
+    }
+
+    #[test]
+    fn a_video_track_with_no_colour_element_is_reported_as_unspecified_not_sdr_bt709() {
+        let track = video_track("V_MPEG4/ISO/AVC", 1920, 1080, None);
+        let l = analyze(&file(&matroska_header(), &elem(ID_TRACKS, &track))).unwrap();
+
+        let v = &l.video_tracks[0];
+        assert_eq!(v.codec, lumen_model::VideoCodec::H264);
+        assert_eq!(v.color.primaries, lumen_model::ColorPrimaries::Unspecified);
+        assert_eq!(v.color.hdr, lumen_model::HdrFormat::Sdr, "no PQ/HLG transfer means SDR");
+    }
+
+    #[test]
+    fn an_audio_track_never_produces_a_video_track_entry() {
+        let body = uint_elem(ID_TRACK_TYPE, 2); // audio
+        let track = elem(ID_TRACK_ENTRY, &body);
+        let l = analyze(&file(&matroska_header(), &elem(ID_TRACKS, &track))).unwrap();
+        assert!(l.video_tracks.is_empty());
+        assert_eq!(l.track_count, 1, "still counted as a track, just not a video one");
+    }
+
+    #[test]
+    fn multiple_video_tracks_are_all_reported_in_order() {
+        let mut tracks = video_track("V_VP9", 1280, 720, None);
+        tracks.extend(video_track("V_AV1", 3840, 2160, None));
+        let l = analyze(&file(&matroska_header(), &elem(ID_TRACKS, &tracks))).unwrap();
+        assert_eq!(l.video_tracks.len(), 2);
+        assert_eq!(l.video_tracks[0].codec, lumen_model::VideoCodec::Vp9);
+        assert_eq!(l.video_tracks[1].codec, lumen_model::VideoCodec::Av1);
+    }
+
+    #[test]
+    fn an_unrecognised_codec_id_is_representable_not_an_error() {
+        let track = video_track("V_SOME_FUTURE_CODEC", 640, 480, None);
+        let l = analyze(&file(&matroska_header(), &elem(ID_TRACKS, &track))).unwrap();
+        assert_eq!(
+            l.video_tracks[0].codec,
+            lumen_model::VideoCodec::Other("V_SOME_FUTURE_CODEC".into())
+        );
     }
 }
