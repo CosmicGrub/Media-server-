@@ -328,17 +328,26 @@ the original pitch was not built at all this session — all recorded honestly b
   connection and decremented by an RAII guard on every path out of `handle_connection`**, rather than
   derived from the token store (which counts tokens ever issued, not sockets connected *right now* —
   the pitch's own distinction, made precise in the implementation).
-- **Not shipped this session: the Android "Server" card.** The design's own test strategy calls for
-  reusing `RemoteClient`/`RemoteProtocol` in `RemoteScreen.kt` — straightforward in principle, but
-  this session's sandboxed build environment blocks `dl.google.com` (Google's own Maven repository) at
-  the network policy level, so the Android Gradle Plugin itself cannot be resolved here: there is no
-  way to compile, let alone test, a single line of Kotlin in this environment. Writing the client
-  changes blind, with no way to verify they even build, would contradict the same bar this document
-  holds every other engine to — a real end-to-end test, not just code that reads correctly. The wire
-  protocol side is complete and covered by a real end-to-end test (`remote_serve.rs`'s integration
-  test now makes a genuine `health` request over a real TLS connection to a real `lumen serve`
-  process and asserts on the real reply), so the Android card is a clean, already-compatible follow-on
-  needing no further server-side work — not a partially-built feature.
+- **The Android "Server" card — shipped in a later round of this session, not the first.** It reuses
+  `RemoteClient`/`RemoteProtocol` in `RemoteScreen.kt` exactly as this design's test strategy calls
+  for: `ClientMessage.Rescan`/`Health`, `RescanResult`/`HealthReport` mirroring the Rust structs
+  field-for-field (a JSON `null` stays a Kotlin `null`, never a `0` that would read as "expires now"
+  or "disk full"), a "Server" card inside the existing Connected layout rather than a new screen, and
+  a listing that re-fetches itself whenever a `state` push's `library_version` differs from the one
+  the listing was last requested under. Verified by JVM unit tests that mirror `protocol.rs`'s own
+  tests by name and intent (the exact request lines, every reply shape including nulls and a negative
+  certificate expiry, the stale-version decision, and a wire-line serialisation test that catches two
+  concurrent requests sharing a line) and by `.github/workflows/android.yml` (`testDebugUnitTest`,
+  `assembleDebug`, and the emulator install-and-launch job), which as of this round actually runs —
+  every earlier run of that workflow had died in seconds to a runner-allocation outage, which is why
+  a malformed-XML resource that would have failed its first real build was only caught now. The bar
+  this document holds every engine to is a real end-to-end test, and the honest accounting is: the
+  wire protocol side has one (`remote_serve.rs` makes genuine `health` and `rescan` requests over a
+  real TLS connection to a real `lumen serve` and asserts on the real replies); the Android side has
+  real compilation and unit execution (in this sandbox via the Kotlin compiler bundled with the
+  Gradle distribution for everything Android-free, then for real in CI), but no run in this
+  repository has yet driven the built app against a live `lumen serve` on a device — `dl.google.com`
+  is still unreachable from here, so that remains the one gap.
 
 ### The gap, precisely
 

@@ -103,10 +103,14 @@ fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// What to tell someone whose `lumen serve` has no ffmpeg — surfaced in an HLS request's error
-/// response and this crate's own logs, never a silent 500 with nothing to act on. Unlike mpv, there
-/// is no `lumen setup` fetch path for ffmpeg (yet): this is honest about that rather than pointing at
-/// a command that does not do what it would imply.
+/// What to tell someone whose `lumen serve` has no ffmpeg — printed once to the server's own log
+/// at startup (`server.rs` is its only caller), never a silent start with nothing to act on. It is
+/// *not* the body of the HLS/DASH `503`: that reply is the one-line
+/// `ffmpeg is not installed on this server` (`hls.rs`/`dash.rs`'s `write_gen_error`). The steps
+/// below are operator-facing — a file to drop beside `lumen.exe`, a `winget` line — so nothing in
+/// them is something a phone that fetched a playlist could act on anyway. Unlike mpv, there is no
+/// `lumen setup` fetch path for ffmpeg (yet): this is honest about that rather than pointing at a
+/// command that does not do what it would imply.
 pub fn install_hint() -> &'static str {
     if cfg!(windows) {
         r"ffmpeg was not found, so HLS segmenting is unavailable (direct playback via /stream/ is

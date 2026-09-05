@@ -85,7 +85,7 @@ on hard files. If resources are limited, stopping at Phase 2 or 3 and being exce
 
 | Path | Contents |
 |---|---|
-| [`docs/`](docs/) | Architecture, research, and the compatibility specification (00–13 + ADRs) |
+| [`docs/`](docs/) | Architecture, research, and the compatibility specification (00–15 + ADRs) |
 | [`crates/`](crates/) | The shared Rust core — see below |
 | [`conformance/`](conformance/) | The machine-readable corpus proving docs 11–13 |
 | [`native/`](native/) | LGPL-only build recipes for FFmpeg / mpv / libplacebo (ADR-0002) |
@@ -97,21 +97,34 @@ on hard files. If resources are limited, stopping at Phase 2 or 3 and being exce
 depends on is implemented and tested.
 
 ```bash
-cargo test --workspace     # 319 tests, incl. 29 property tests
+cargo test --workspace     # 831 tests (doc-tests aside), 51 of them in the *_props property suites
 ci/license-gate.sh         # ADR-0002 licence posture
 python3 conformance/runner/coverage.py
 ```
 
 | Crate | What it is | Tests |
 |---|---|---|
-| [`lumen-model`](crates/lumen-model) | Containers, codecs, streams, colour/HDR, remux carriage rules | 24 |
-| [`lumen-caps`](crates/lumen-caps) | Client and **sink-level** capability model | 5 |
-| [`lumen-playback`](crates/lumen-playback) | **The playback decision ladder** and track auto-selection | 21 + 15 |
-| [`lumen-identity`](crates/lumen-identity) | Move-surviving content sketch | 12 |
-| [`lumen-probe`](crates/lumen-probe) | Content sniffing, MKV/MP4 structural analysis, the recovery ladder | 71 + 10 |
-| [`lumen-match`](crates/lumen-match) | Filename parsing and candidate ranking (research R8) | 41 + 19 |
-| [`lumen-meta`](crates/lumen-meta) | Provider abstraction, artwork selection, field merge with provenance | 38 |
+| [`lumen-model`](crates/lumen-model) | Containers, codecs, streams, colour/HDR, remux carriage rules | 38 |
+| [`lumen-caps`](crates/lumen-caps) | Client and **sink-level** capability model | 9 |
+| [`lumen-playback`](crates/lumen-playback) | **The playback decision ladder** and track auto-selection | 21 + 22 |
+| [`lumen-identity`](crates/lumen-identity) | Move-surviving content sketch | 18 |
+| [`lumen-probe`](crates/lumen-probe) | Content sniffing, MKV/MP4 structural analysis, the recovery ladder | 85 + 10 |
+| [`lumen-match`](crates/lumen-match) | Filename parsing and candidate ranking (research R8) | 41 + 18 |
+| [`lumen-meta`](crates/lumen-meta) | Provider abstraction, artwork selection, field merge with provenance | 38 + 8 |
 | [`lumen-subs`](crates/lumen-subs) | Subtitle acquisition ladder, ASR/translation gating, sync correction | 62 |
+| [`lumen-index`](crates/lumen-index) | Persisted incremental library index and byte-level verification | 43 |
+| [`lumen-exec`](crates/lumen-exec) | Remux execution engine | 20 |
+| [`lumen-segment`](crates/lumen-segment) | HLS/DASH playlist and segment planning | 34 |
+| [`lumen-discovery`](crates/lumen-discovery) | SSDP responder, DLNA `ContentDirectory`, DIDL-Lite | 37 |
+| [`lumen-play`](crates/lumen-play) | **The runnable thing**: `lumen` CLI, and `lumen serve` — paired TLS remote control, HLS/DASH/VR delivery, DLNA | 262 + 7 |
+
+Where a row reads `a + b`, `a` is the crate's unit tests and `b` its `tests/` suites — the property
+suites (`parse_props` 11, `meta_props` 8, `ladder_props` 22, `probe_props` 10) plus `lumen-match`'s
+corpus and `lumen-play`'s two live-server suites. The rows sum to 773; the other 58 of the 831 belong
+to [`spikes/s1-compositing`](spikes/s1-compositing), a workspace member but not a crate of the core.
+
+The runnable player and server is [`crates/lumen-play`](crates/lumen-play) — its README covers the
+commands, `lumen serve`, pairing, and what has and has not been verified on real hardware.
 
 Two deliberate choices about order. The **ladder** came first because ADR-0004 makes it the one piece
 that must never diverge across clients. The **probe layer** came second because guarantees G0 and G2

@@ -344,6 +344,15 @@ jobs:
           5. Watch:
                  .\lumen.exe play "D:\Media"
 
+          6. Or run it as a LAN server a phone pairs with and controls:
+                 .\lumen.exe serve "D:\Media"
+                 .\lumen.exe serve "D:\Media" --dlna     (also visible to smart TVs; no pairing,
+                                                          so anything on your network can browse it)
+             The terminal shows a six-digit pairing code (ten minutes, one device per start) and a
+             TLS fingerprint the phone pins the first time it pairs. Keep the port on your own LAN;
+             do not forward it through your router. HLS/DASH streaming needs ffmpeg.exe beside
+             lumen.exe or on PATH -- it is not in this folder; plain streaming works without it.
+
           Playback controls are mpv's own: space, arrows, f, q.
           Exit codes: 0 all played, 1 something failed, 2 setup problem.
           TXT
@@ -362,6 +371,15 @@ jobs:
           ./lumen scan  ~/Media
           ./lumen test  ~/Media --limit 5 --json report.json
           ./lumen play  ~/Media
+
+          Or run it as a LAN server a phone pairs with and controls:
+              ./lumen serve ~/Media
+              ./lumen serve ~/Media --dlna     (also visible to smart TVs; no pairing, so anything
+                                                on your network can browse it)
+          The terminal shows a six-digit pairing code (ten minutes, one device per start) and a TLS
+          fingerprint the phone pins the first time it pairs. Keep the port on your own LAN; do not
+          forward it through your router. HLS/DASH streaming needs ffmpeg beside this binary or on
+          PATH -- it is not bundled here; plain streaming works without it.
 
           If mpv is somewhere unusual, point at it instead of moving it:
               export LUMEN_MPV=/path/to/mpv
