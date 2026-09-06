@@ -105,6 +105,42 @@ mod tests {
     use super::*;
     use crate::job::AudioAdaptation;
 
+    /// Guards every test below that writes an executable fake-`ffmpeg` script and then runs it.
+    ///
+    /// `cargo test`'s default runner puts each `#[test]` function on its own OS thread and runs
+    /// several at once, and this file has more than one of them writing a script file to disk and
+    /// then `exec`ing it via `std::process::Command` -- in the same process. That shape is exactly
+    /// what a real `cargo test --workspace` run on this codebase once hit as `ExecutableFileBusy`
+    /// ("Text file busy"): Linux refuses to `exec` a file while any write file descriptor referencing
+    /// it is still open anywhere in the process, and `Command::spawn`'s underlying `fork` inherits the
+    /// whole process's file-descriptor table, not just the calling thread's -- so one thread's
+    /// still-open write handle on its own script can make another thread's unrelated `exec` fail.
+    /// Holding this lock for the full write-script-then-run-it span of each test below removes that
+    /// overlap outright. It deliberately does **not** retry a spawn that still races: a retry would
+    /// hide a real regression in this ordering behind a silent, occasionally-slow pass instead of
+    /// failing loudly, and it touches no production code -- `execute` itself is never retried.
+    #[cfg(unix)]
+    static SCRIPT_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Writes `contents` to `path` and marks it executable, safe for an immediate `exec`.
+    ///
+    /// Calls `File::sync_all` and drops the `File` before `set_permissions` runs, so the write is
+    /// fully flushed to disk and the write handle is closed before anything -- including the caller's
+    /// own subsequent spawn -- tries to run the file. Callers must still hold [`SCRIPT_WRITE`] for the
+    /// full span from calling this through spawning the script; see that lock's own doc comment for
+    /// why a closed handle here is not, by itself, enough.
+    #[cfg(unix)]
+    fn write_executable_script(path: &Path, contents: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     fn write_matroska_stub(path: &Path) {
         // Just enough of the real EBML+Matroska DocType signature for `lumen_probe::sniff` to
         // recognise it -- a full stub, not a real playable file, is all `verify_output` needs.
@@ -171,7 +207,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_subprocess_that_succeeds_produces_a_verified_outcome() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir =
             std::env::temp_dir().join(format!("lumen-exec-fake-ffmpeg-ok-{}", std::process::id()));
@@ -181,7 +217,7 @@ mod tests {
         // Ignores its real arguments and just writes a Matroska-signature stub to whatever `-y -i
         // <in> ... <out>` named as the last argument -- enough to prove `execute` really spawns,
         // waits, and then verifies the file that lands on disk, not a mocked-out shortcut.
-        std::fs::write(
+        write_executable_script(
             &fake_ffmpeg,
             // POSIX `sh`, not bash: no `${@: -1}` array slicing, so the last argument is found by
             // walking every argument and keeping whichever one is seen last. `dash`'s builtin
@@ -190,9 +226,7 @@ mod tests {
             // 0x45 is printable ASCII 'E'.
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n\
              printf '\\032E\\337\\243matroska' > \"$last\"\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let job = RemuxJob {
             source: dir.join("in.mkv"),
@@ -209,15 +243,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_subprocess_that_fails_reports_its_stderr() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir()
             .join(format!("lumen-exec-fake-ffmpeg-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake_ffmpeg = dir.join("ffmpeg");
-        std::fs::write(&fake_ffmpeg, "#!/bin/sh\necho 'Unknown encoder specified' 1>&2\nexit 1\n")
-            .unwrap();
-        std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_script(
+            &fake_ffmpeg,
+            "#!/bin/sh\necho 'Unknown encoder specified' 1>&2\nexit 1\n",
+        );
 
         let job = RemuxJob {
             source: dir.join("in.mkv"),

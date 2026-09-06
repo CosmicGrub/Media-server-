@@ -227,7 +227,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_subprocess_that_succeeds_reports_every_segment_it_wrote() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir()
             .join(format!("lumen-segment-fake-ffmpeg-ok-{}", std::process::id()));
@@ -237,7 +237,7 @@ mod tests {
         let fake_ffmpeg = dir.join("ffmpeg");
         // Ignores its real arguments and writes a playlist plus three fake segments -- enough to
         // prove `execute` really spawns, waits, and then counts what actually landed on disk.
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake_ffmpeg,
             "#!/bin/sh\n\
              for a in \"$@\"; do last=\"$a\"; done\n\
@@ -247,9 +247,7 @@ mod tests {
              : > \"$dir/seg_00002.ts\"\n\
              echo '#EXTM3U' > \"$last\"\n\
              exit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let job = HlsSegmentJob {
             source: dir.join("in.mkv"),
@@ -267,7 +265,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_subprocess_that_writes_no_segments_is_reported_as_such() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir()
             .join(format!("lumen-segment-fake-ffmpeg-empty-{}", std::process::id()));
@@ -275,12 +273,10 @@ mod tests {
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
         let fake_ffmpeg = dir.join("ffmpeg");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake_ffmpeg,
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\necho '#EXTM3U' > \"$last\"\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let job = HlsSegmentJob {
             source: dir.join("in.mkv"),

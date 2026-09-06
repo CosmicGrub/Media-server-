@@ -22,6 +22,8 @@ pub mod command;
 pub mod dash;
 pub mod plan;
 pub mod playlist;
+#[cfg(test)]
+mod test_support;
 
 pub use command::{
     HlsExecError, HlsExecOutcome, HlsSegmentJob, SegmentFormat, build_command, execute,

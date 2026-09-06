@@ -347,7 +347,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_subprocess_that_succeeds_reports_every_representation_it_wrote() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir()
             .join(format!("lumen-segment-fake-ffmpeg-dash-ok-{}", std::process::id()));
@@ -363,7 +363,7 @@ mod tests {
         // Ignores its real arguments and writes a two-representation manifest plus real init/chunk
         // files -- enough to prove `execute` really spawns, waits, parses the manifest it wrote, and
         // then verifies what actually landed on disk against it.
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake_ffmpeg,
             "#!/bin/sh\n\
              for a in \"$@\"; do last=\"$a\"; done\n\
@@ -380,9 +380,7 @@ mod tests {
              >> \"$last\"\n\
              printf '</Period></MPD>' >> \"$last\"\n\
              exit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let job = DashSegmentJob {
             source: dir.join("in.mkv"),
@@ -399,7 +397,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_representation_missing_its_chunk_files_is_reported_as_incomplete() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir()
             .join(format!("lumen-segment-fake-ffmpeg-dash-incomplete-{}", std::process::id()));
@@ -410,7 +408,7 @@ mod tests {
         let fake_ffmpeg = dir.join("ffmpeg");
         // Declares representation "0" in the manifest but never writes its chunk file -- the exact
         // "manifest says it exists, disk disagrees" case `execute`'s own verification exists to catch.
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake_ffmpeg,
             "#!/bin/sh\n\
              for a in \"$@\"; do last=\"$a\"; done\n\
@@ -419,9 +417,7 @@ mod tests {
              printf '<MPD><Period><AdaptationSet><Representation id=\"0\">' > \"$last\"\n\
              printf '</Representation></AdaptationSet></Period></MPD>' >> \"$last\"\n\
              exit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let job = DashSegmentJob {
             source: dir.join("in.mkv"),
@@ -437,7 +433,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_subprocess_that_writes_no_representations_is_reported_as_such() {
-        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
 
         let dir = std::env::temp_dir()
             .join(format!("lumen-segment-fake-ffmpeg-dash-empty-{}", std::process::id()));
@@ -446,12 +442,10 @@ mod tests {
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
         let fake_ffmpeg = dir.join("ffmpeg");
-        std::fs::write(
+        crate::test_support::write_executable_script(
             &fake_ffmpeg,
             "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '<MPD></MPD>' > \"$last\"\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let job = DashSegmentJob {
             source: dir.join("in.mkv"),
