@@ -26,8 +26,8 @@ pub mod select;
 
 pub use ladder::{Selection, plan};
 pub use plan::{
-    AudioPath, ContainerPlan, PlaybackPlan, Rejection, SubtitleDelivery, Tier, VideoPath,
-    VideoTranscodeSpec,
+    AudioPath, ContainerPlan, PlaybackPlan, Rejection, SubtitleDelivery, Tier, ToneMapRolloff,
+    VideoPath, VideoTranscodeSpec,
 };
 pub use reason::{BitrateCause, BurnInCause, RejectReason};
 pub use select::{TrackPreferences, select};
