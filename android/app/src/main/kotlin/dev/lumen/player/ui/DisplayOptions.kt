@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import androidx.media3.ui.AspectRatioFrameLayout
+import dev.lumen.player.fold.Posture
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -197,6 +198,9 @@ enum class Arrangement {
     /** Half open on a surface: video above the crease, everything else below. */
     Tabletop,
 
+    /** Standing open like a book, on a vertical hinge: video on one side of the crease, the rest on the other. */
+    Book,
+
     /** Two panes across. Only where the window is big enough for a list to be worth reading. */
     SideBySide,
 
@@ -218,17 +222,44 @@ enum class Arrangement {
  */
 fun arrangementFor(
     isTabletop: Boolean,
+    isBook: Boolean,
     widthDp: Int,
     heightDp: Int,
     mode: ViewMode,
 ): Arrangement = when {
-    // Tabletop keeps its shape in every mode: the top screen is the video whether or not a library
-    // is shown below it. That is the posture's entire reason for existing.
+    // Both hinge postures are checked before the mode/size rules below and neither one varies by
+    // mode: a real hinge fixes where the video sits (above the crease for Tabletop, beside it for
+    // Book) regardless of whether a library pane is showing on the other side, so there is no
+    // width/height case where either should fall through to VideoOnly/SideBySide/Stacked instead.
+    // `FoldState.postureOf` only ever reports one hinge orientation at a time, so `isTabletop` and
+    // `isBook` being true together cannot happen on a device -- but the order below still has to
+    // pick one, so Tabletop wins.
     isTabletop -> Arrangement.Tabletop
+    isBook -> Arrangement.Book
     !mode.showsLibrary -> Arrangement.VideoOnly
     widthDp >= 600 && heightDp >= 480 -> Arrangement.SideBySide
     else -> Arrangement.Stacked
 }
+
+/**
+ * How Book posture splits the window around its vertical hinge, in the same pixel units
+ * `WindowInfoTracker` reports the hinge bounds in.
+ *
+ * A pure function over [Posture.Book] for the same reason `arrangementFor` is one: the hinge is not
+ * guaranteed to sit at the window's horizontal midpoint (camera cutouts and sensor housings can push
+ * it either way), so a layout that assumes an even split is wrong on exactly the device it exists
+ * for. [BookSplit.videoWidthPx] is the pane before the crease — Book always gives the video that
+ * side, the same way Tabletop always gives it the top — and [BookSplit.hingeWidthPx] is the crease
+ * itself, drawn as empty space for the reason [Posture.Book] documents. The pane after the crease is
+ * left implicit: it fills whatever width is left over, the same way every other arrangement's list
+ * pane already does.
+ */
+data class BookSplit(val videoWidthPx: Int, val hingeWidthPx: Int)
+
+fun bookSplit(hinge: Posture.Book): BookSplit = BookSplit(
+    videoWidthPx = hinge.hingeLeftPx,
+    hingeWidthPx = hinge.hingeRightPx - hinge.hingeLeftPx,
+)
 
 /**
  * Persisted display settings.
