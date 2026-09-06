@@ -37,7 +37,7 @@ use crate::remote::protocol::{
     ClientMessage, HealthReport, LibraryEntry, NowPlaying, PlaybackState, ReplyBody, ServerMessage,
 };
 use crate::remote::tls::{self, ServerCert};
-use crate::scan::{self, Scan, ScanOptions};
+use crate::scan::{self, Scan, ScanOptions, ScannedFile};
 
 /// Doubles as this connection's TCP read timeout and its "check for new state to push" tick. Short
 /// enough that a seek feels immediate on the client, long enough that idle connections cost nothing
@@ -178,6 +178,35 @@ impl Drop for ActiveClientGuard<'_> {
     }
 }
 
+/// Kills the mpv child process on drop — the backstop for every error path in [`run`] taken after
+/// mpv has already been spawned (a `TcpListener::bind` failure, concretely, since everything else
+/// between mpv connecting and the accept loop starting is not itself fallible). Wraps the exact same
+/// `Arc<Mutex<Option<Child>>>` the SIGTERM handler `run` installs and `drive_mpv`'s own respawn logic
+/// share, so whichever of the three actually needs to kill mpv finds whatever child is currently
+/// there — the original one, or a respawned replacement — rather than a stale handle to a process
+/// already gone. See [`kill_mpv_child`].
+struct MpvChildGuard(Arc<Mutex<Option<std::process::Child>>>);
+
+impl Drop for MpvChildGuard {
+    fn drop(&mut self) {
+        kill_mpv_child(&self.0);
+    }
+}
+
+/// Kill and reap whatever mpv child is currently held, if any — shared by [`MpvChildGuard`]'s own
+/// `Drop` and the SIGTERM handler `run` installs, so a process ending either way (an error path
+/// unwinding through the guard, or a signal reaching the handler directly) leaves nothing running.
+/// `take()`, not just a read: whichever caller gets here first is the one that actually kills it, and
+/// the other's later call is a safe no-op against `None`. `wait()` after `kill()` so mpv does not
+/// linger as a zombie on Unix once its parent (this process) is about to exit — not needed on
+/// Windows, where `Child::kill` already reaps the handle, but harmless there either way.
+fn kill_mpv_child(child: &Mutex<Option<std::process::Child>>) {
+    if let Some(mut child) = child.lock().unwrap().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// Everything the accept loop hands each connection.
 struct ServerContext {
     commands: Sender<Command>,
@@ -283,11 +312,50 @@ pub fn run(
 
     let ipc_path = ipc::default_ipc_path("serve");
     let _ = std::fs::remove_file(&ipc_path);
-    let mut child = spawn_idle_mpv(&ipc_path, extra_mpv_args)
+    let child = spawn_idle_mpv(&ipc_path, extra_mpv_args)
         .map_err(|e| format!("cannot launch mpv: {e}\n\n{}", crate::mpvbin::install_hint()))?;
+
+    // From here on, a real mpv process is running and this function owns it. Held behind one
+    // `Arc<Mutex<Option<Child>>>` -- and stored here, the instant the child exists, rather than only
+    // once `Mpv::connect` below returns `Ok` -- so three independent things that can each need to end
+    // it -- `drive_mpv`'s own respawn logic replacing a dead instance, the SIGTERM handler installed
+    // just below, and `MpvChildGuard`'s `Drop` covering every error path in this function taken from
+    // here on (a `TcpListener::bind` failure, or `Mpv::connect` itself timing out, both a few lines
+    // down) -- all reach whichever child is currently there, the original one or a respawned
+    // replacement, and kill it exactly once regardless of which of the three gets there first.
+    // Storing the child only after a successful `connect`, as an earlier version of this code did,
+    // left the entire connect handshake -- up to the full 20-second retry timeout on a slow or loaded
+    // host -- as a window where a SIGTERM fell through to the OS's default disposition instead of the
+    // handler below, orphaning an mpv process that had already been spawned.
+    let mpv_child = Arc::new(Mutex::new(Some(child)));
+    let _mpv_child_guard = MpvChildGuard(Arc::clone(&mpv_child));
+
+    // SIGTERM is what the deployment model `DEVICE.md` documents actually sends: a Windows Scheduled
+    // Task configured to restart the service stops the old process before starting a fresh one, and
+    // the systemd/Docker deployment `docs/05` describes stops the same way. Without a handler, mpv --
+    // already spawned above -- outlives `lumen serve` itself, since nothing else left running ever
+    // reaps it. Only a warning, not a fatal error, if a handler cannot be installed (this process
+    // already has one, most likely, from an earlier call in the same test binary): a `lumen serve`
+    // that cannot catch its own termination signal should still run, the same "left open, not
+    // silently broken" posture `spawn_library_watcher`'s own doc already takes for a watcher that
+    // fails to start. Installed here, before `Mpv::connect` below, for the same reason `mpv_child` is
+    // stored above before connecting: a SIGTERM arriving during the connect retry loop must already
+    // find a live handler.
+    {
+        let mpv_child_for_signal = Arc::clone(&mpv_child);
+        let signal_log = Arc::clone(&log);
+        if let Err(e) = ctrlc::set_handler(move || {
+            signal_log("received a termination signal; stopping mpv before exiting");
+            kill_mpv_child(&mpv_child_for_signal);
+            std::process::exit(143); // 128 + SIGTERM(15), the conventional shell-visible exit code
+        }) {
+            log(&format!("warning: could not install a termination signal handler: {e}"));
+        }
+    }
+
     let connect_start = std::time::Instant::now();
     let mpv = Mpv::connect(&ipc_path, Duration::from_secs(20)).map_err(|e| {
-        let _ = child.kill();
+        kill_mpv_child(&mpv_child);
         format!("mpv started but its IPC socket never appeared ({e})")
     })?;
     log(&format!("mpv IPC connected after {:?}", connect_start.elapsed()));
@@ -298,8 +366,16 @@ pub fn run(
     let driver_shared = Arc::clone(&shared);
     let driver_library_version = Arc::clone(&library_version);
     let driver_log = Arc::clone(&log);
+    let driver_mpv_child = Arc::clone(&mpv_child);
+    let driver_ipc_path = ipc_path.clone();
+    let driver_extra_mpv_args = extra_mpv_args.to_vec();
     std::thread::spawn(move || {
-        drive_mpv(mpv, rx, &driver_shared, &driver_library_version, &*driver_log)
+        let respawn = MpvRespawnConfig {
+            ipc_path: &driver_ipc_path,
+            extra_mpv_args: &driver_extra_mpv_args,
+            child: &driver_mpv_child,
+        };
+        drive_mpv(mpv, rx, &driver_shared, &driver_library_version, &*driver_log, &respawn)
     });
 
     let token_path = TokenStore::default_path();
@@ -419,23 +495,66 @@ fn spawn_idle_mpv(ipc_path: &str, extra_args: &[String]) -> std::io::Result<std:
     .spawn()
 }
 
+/// How many times [`respawn_mpv`] will try to relaunch a dead mpv before giving up and letting
+/// `drive_mpv` exit for good. A crash-loop -- mpv dying again the instant it is relaunched, a broken
+/// driver on the host, say -- has to have a floor, or a `lumen serve` process left running for weeks
+/// could spin here forever, burning CPU on nothing but repeated process spawns while never actually
+/// serving anything.
+const MAX_MPV_RESPAWN_ATTEMPTS: u32 = 5;
+
+/// Backoff between respawn attempts, doubled after every failure up to this cap. A crash-loop must
+/// not spin tight, but the very first retry after a one-off mpv crash should not make a paired
+/// client wait long for playback to come back.
+const MPV_RESPAWN_BACKOFF_BASE: Duration = Duration::from_millis(500);
+const MPV_RESPAWN_BACKOFF_CAP: Duration = Duration::from_secs(8);
+
+/// Everything [`drive_mpv`] needs on hand only to relaunch a dead mpv via [`respawn_mpv`] — bundled
+/// into one borrow rather than three separate parameters so `drive_mpv` itself does not grow an
+/// argument per thing a respawn happens to need.
+struct MpvRespawnConfig<'a> {
+    ipc_path: &'a str,
+    extra_mpv_args: &'a [String],
+    child: &'a Mutex<Option<std::process::Child>>,
+}
+
 /// The one thread that ever touches the mpv connection: executes queued commands, then polls mpv's
 /// properties into `shared`. Interleaved in a loop rather than two threads for the same reason
 /// `session.rs`'s run loop interleaves control and events — a command and a property read can never
 /// race each other if the same loop iteration is the only place either happens.
+///
+/// `respawn` exists only for [`respawn_mpv`]: everything else about this loop is unchanged from
+/// before mpv could die mid-session.
 fn drive_mpv(
     mut mpv: Mpv,
     commands: Receiver<Command>,
     shared: &SharedState,
     library_version: &AtomicU64,
     log: &(dyn Fn(&str) + Send + Sync),
+    respawn: &MpvRespawnConfig<'_>,
 ) {
     log("driver: command loop starting");
     let mut last_poll = std::time::Instant::now() - MPV_POLL_INTERVAL;
     loop {
         if mpv.is_closed() {
-            log("driver: mpv's socket closed; command loop exiting");
-            return;
+            // Without a respawn, this used to be where the command loop returned for good: the
+            // thread simply exited, and every command sent afterward answered "the player is not
+            // responding" until a human noticed and restarted the whole `lumen serve` process by
+            // hand. Relaunching here is what makes mpv dying mid-session a brief interruption
+            // instead of the end of the session.
+            log(
+                "driver: mpv's socket closed; attempting to respawn it rather than exiting the command loop",
+            );
+            match respawn_mpv(respawn.ipc_path, respawn.extra_mpv_args, respawn.child, log) {
+                Some(fresh) => {
+                    mpv = fresh;
+                    // The old instance's last poll has nothing to do with the new one's readiness --
+                    // reset the clock so the fresh mpv gets its first `State` publish promptly rather
+                    // than waiting out whatever was left of the dead instance's interval.
+                    last_poll = std::time::Instant::now() - MPV_POLL_INTERVAL;
+                    continue;
+                }
+                None => return,
+            }
         }
         // Drain whatever commands arrived since the last pass without blocking the poll behind them.
         while let Ok(cmd) = commands.try_recv() {
@@ -474,6 +593,60 @@ fn drive_mpv(
         // is not a busy spin between polls.
         mpv.next_event(Duration::from_millis(100));
     }
+}
+
+/// Relaunch a fresh idle mpv and reconnect over its IPC socket after `drive_mpv` notices the previous
+/// instance's socket has closed. Retries with a short, doubling backoff up to
+/// [`MPV_RESPAWN_BACKOFF_CAP`], bounded at [`MAX_MPV_RESPAWN_ATTEMPTS`] attempts -- a crash-loop must
+/// have a floor, not spin this thread forever. `None` once that bound is hit, which is `drive_mpv`'s
+/// own signal to give up and let the command loop actually exit, the same terminal outcome it always
+/// had for a dead mpv, just no longer the *first* thing tried.
+fn respawn_mpv(
+    ipc_path: &str,
+    extra_mpv_args: &[String],
+    mpv_child: &Mutex<Option<std::process::Child>>,
+    log: &(dyn Fn(&str) + Send + Sync),
+) -> Option<Mpv> {
+    // Reap whatever the dead instance left behind before launching its replacement -- on Unix an
+    // exited child stays a zombie until something calls `wait` on it, and the crash that got us here
+    // is exactly the case nothing else was ever going to.
+    kill_mpv_child(mpv_child);
+
+    let mut backoff = MPV_RESPAWN_BACKOFF_BASE;
+    for attempt in 1..=MAX_MPV_RESPAWN_ATTEMPTS {
+        log(&format!("driver: mpv died; respawn attempt {attempt}/{MAX_MPV_RESPAWN_ATTEMPTS}"));
+        let _ = std::fs::remove_file(ipc_path); // a stale socket/pipe left by the dead instance
+        match spawn_idle_mpv(ipc_path, extra_mpv_args) {
+            Ok(child) => {
+                // Stored the moment it exists, not only once `connect` below succeeds: `connect`
+                // itself can wait up to 20 seconds for a stuck launch, and a SIGTERM or a
+                // `TcpListener::bind` failure's `MpvChildGuard` arriving during that window must
+                // still be able to find and kill this process, not a stale `None` that makes it
+                // look like nothing is running yet.
+                *mpv_child.lock().unwrap() = Some(child);
+                match Mpv::connect(ipc_path, Duration::from_secs(20)) {
+                    Ok(mpv) => {
+                        log("driver: respawned mpv is back up; resuming the command loop");
+                        return Some(mpv);
+                    }
+                    Err(e) => {
+                        log(&format!("driver: respawned mpv's IPC socket never appeared ({e})"));
+                        kill_mpv_child(mpv_child);
+                    }
+                }
+            }
+            Err(e) => log(&format!("driver: could not relaunch mpv ({e})")),
+        }
+        if attempt < MAX_MPV_RESPAWN_ATTEMPTS {
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(MPV_RESPAWN_BACKOFF_CAP);
+        }
+    }
+    log(&format!(
+        "driver: mpv would not stay up after {MAX_MPV_RESPAWN_ATTEMPTS} respawn attempts; command \
+         loop exiting for good"
+    ));
+    None
 }
 
 fn execute(mpv: &mut Mpv, body: CommandBody) -> Result<ReplyBody, String> {
@@ -706,19 +879,7 @@ fn dispatch(msg: ClientMessage, ctx: &ServerContext, authed: &mut bool) -> Serve
         }
         ClientMessage::Library { .. } => {
             let scan = ctx.library.lock().unwrap();
-            let entries = scan
-                .playable()
-                .map(|f| LibraryEntry {
-                    path: f.path.to_string_lossy().into_owned(),
-                    title: f.label(),
-                    // Not probed here: a library listing has to stay as cheap as `lumen scan` is
-                    // today, and opening every file to learn its length would make listing a large
-                    // collection minutes slower than playing anything in it. 0 means "not yet known";
-                    // the real duration arrives the moment the file is actually played, in the next
-                    // `State` push.
-                    duration_ms: 0,
-                })
-                .collect();
+            let entries = scan.playable().map(to_library_entry).collect();
             ServerMessage::Reply { id, result: ReplyBody::Library(entries) }
         }
         ClientMessage::Play { path, .. } => match resolve_playable_path(ctx, &path) {
@@ -762,22 +923,82 @@ fn dispatch(msg: ClientMessage, ctx: &ServerContext, authed: &mut bool) -> Serve
             let (file_count, library_version) = rescan_library(ctx);
             ServerMessage::Reply { id, result: ReplyBody::Rescan { file_count, library_version } }
         }
+        // `docs/15` §A's own sketch of this exact message: a substring search over the library as it
+        // currently stands. See `library_entry_matches_query`'s own doc for what "matched" means.
+        ClientMessage::Search { query, .. } => {
+            let scan = ctx.library.lock().unwrap();
+            let entries = scan
+                .playable()
+                .filter(|f| {
+                    library_entry_matches_query(&f.label(), &f.path.to_string_lossy(), &query)
+                })
+                .map(to_library_entry)
+                .collect();
+            ServerMessage::Reply { id, result: ReplyBody::SearchResults(entries) }
+        }
     }
 }
 
+/// Build the [`LibraryEntry`] a paired client sees for one scanned file — shared by `Library`'s and
+/// `Search`'s dispatch arms above so a listing entry and a search result are built exactly the same
+/// way, never two independently-drifting shapes of the same thing.
+fn to_library_entry(f: &ScannedFile) -> LibraryEntry {
+    LibraryEntry {
+        path: f.path.to_string_lossy().into_owned(),
+        title: f.label(),
+        // Not probed here: a library listing has to stay as cheap as `lumen scan` is today, and
+        // opening every file to learn its length would make listing a large collection minutes
+        // slower than playing anything in it. 0 means "not yet known"; the real duration arrives the
+        // moment the file is actually played, in the next `State` push.
+        duration_ms: 0,
+    }
+}
+
+/// The pure predicate behind [`ClientMessage::Search`]'s dispatch arm, split out so the matching
+/// logic can be tested without a whole `ServerContext` — the same "test the pure check on its own"
+/// shape `resolve_playable_path`/`contain_within_library` below already use. Mirrors `dlna.rs`'s own
+/// `SearchCriteria::TitleContains` case (`handle_search`'s `ContentDirectory` `Search` action):
+/// a case-insensitive substring match. Extended to the path as well as the title — a remote client
+/// searching "the office" by folder name is exactly as legitimate a search as one by title, and this
+/// protocol's own wire format owes DLNA's criteria grammar nothing beyond the matching idea itself.
+/// An empty query matches everything, the same "no criteria narrows it" behaviour `MatchAll` gives
+/// DLNA's own browse-shaped search.
+fn library_entry_matches_query(title: &str, path: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let needle = query.to_ascii_lowercase();
+    title.to_ascii_lowercase().contains(&needle) || path.to_ascii_lowercase().contains(&needle)
+}
+
 /// Re-walk `ctx.library_root`, replace the in-memory `Scan` every `Library`/`Play` request reads
-/// from, and bump `ctx.library_version` — the one place either actually happens. Both
-/// [`ClientMessage::Rescan`]'s dispatch arm above and the background filesystem watcher
-/// (`spawn_library_watcher`) call this rather than each doing their own walk-and-bump, so a manual
-/// rescan and an automatic one can never drift into two different definitions of what a rescan does.
-/// Returns `(file_count, library_version)` — the same pair `ReplyBody::Rescan` already carries back
-/// to a client that asked directly, and what a watcher-triggered rescan logs for an operator watching
-/// the terminal.
+/// from, and bump `ctx.library_version` -- but only when the fresh walk actually found something
+/// different. Both [`ClientMessage::Rescan`]'s dispatch arm above and the background filesystem
+/// watcher (`spawn_library_watcher`) call this rather than each doing their own walk-and-bump, so a
+/// manual rescan and an automatic one can never drift into two different definitions of what a
+/// rescan does. Returns `(file_count, library_version)` — the same pair `ReplyBody::Rescan` already
+/// carries back to a client that asked directly, and what a watcher-triggered rescan logs for an
+/// operator watching the terminal.
+///
+/// The `changed` check compares the fresh `Scan` against the one it is about to replace by content
+/// (`Scan` and `ScannedFile` both derive `PartialEq` for exactly this), the same "compare, then only
+/// bump the version if it actually differs" shape `SharedState::publish` already uses for
+/// `PlaybackState`. Without it, every rescan — a client hitting the button out of habit, or the
+/// watcher settling after an edit that touched a file's mtime but not its content — bumped
+/// `library_version` regardless, which told every paired client's cached library listing it was
+/// stale even when a fresh fetch would have shown the exact same list.
 fn rescan_library(ctx: &ServerContext) -> (u64, u64) {
     let fresh = scan::scan(std::slice::from_ref(&ctx.library_root), &ScanOptions::default());
     let file_count = fresh.playable().count() as u64;
-    *ctx.library.lock().unwrap() = fresh;
-    let library_version = ctx.library_version.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut library = ctx.library.lock().unwrap();
+    let changed = *library != fresh;
+    *library = fresh;
+    drop(library);
+    let library_version = if changed {
+        ctx.library_version.fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        ctx.library_version.load(Ordering::Acquire)
+    };
     (file_count, library_version)
 }
 
@@ -896,6 +1117,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn a_search_matches_the_title_case_insensitively() {
+        assert!(library_entry_matches_query("Interstellar (2014)", "/movies/x.mkv", "stellar"));
+        assert!(library_entry_matches_query("Interstellar (2014)", "/movies/x.mkv", "STELLAR"));
+        assert!(!library_entry_matches_query("Interstellar (2014)", "/movies/x.mkv", "arrival"));
+    }
+
+    #[test]
+    fn a_search_also_matches_the_path_when_the_title_does_not() {
+        // A remote client searching by folder name -- "the office", say -- is exactly as legitimate
+        // a search as one by parsed title, and the title alone would miss it here.
+        assert!(library_entry_matches_query(
+            "S01E01",
+            "/media/The Office/S01E01.mkv",
+            "the office"
+        ));
+    }
+
+    #[test]
+    fn an_empty_query_matches_everything() {
+        assert!(library_entry_matches_query("Anything", "/a/b.mkv", ""));
+    }
+
+    #[test]
+    fn a_search_query_with_no_match_anywhere_matches_nothing() {
+        assert!(!library_entry_matches_query(
+            "Interstellar",
+            "/movies/interstellar.mkv",
+            "arrival"
+        ));
     }
 
     #[test]
