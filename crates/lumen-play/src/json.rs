@@ -414,6 +414,45 @@ mod tests {
         assert!(parse(&deep).is_err());
     }
 
+    /// A tiny xorshift PRNG, deterministic from a seed. No `rand` dependency: this file's whole
+    /// reason to exist is staying dependency-free (see the module doc), and a fuzz-style test is not
+    /// worth breaking that for.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    #[test]
+    fn no_random_byte_sequence_ever_panics_the_parser_only_errors() {
+        // mpv's own replies are machine-generated and well-formed, but a truncated socket read (this
+        // parser's actual adversary, per every other test above) can hand it any prefix of any byte
+        // sequence -- not just the hand-picked malformed cases above. A real fuzzer would be the
+        // rigorous version of this; a seeded PRNG hammering the entry point for a few hundred
+        // thousand iterations, entirely within one fast unit test, is the version that costs nothing
+        // extra to keep running on every `cargo test`.
+        let mut state = 0x2545F4914F6CDD1Du64; // any nonzero seed
+        // A byte alphabet biased toward JSON's own punctuation and a few multi-byte UTF-8 lead bytes,
+        // rather than uniform-random bytes: uniform noise almost always fails on the very first
+        // character and never reaches the deeper code paths (escapes, surrogate pairs, nesting) this
+        // exists to stress.
+        const ALPHABET: &[u8] = b"{}[]\":,.-+0123456789tfnul\\ru\xC3\xA9\xF0\x9F\x8E\xAC \t\n";
+        for _ in 0..200_000 {
+            let len = (xorshift(&mut state) % 24) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                let idx = (xorshift(&mut state) as usize) % ALPHABET.len();
+                buf.push(ALPHABET[idx]);
+            }
+            // Not every random byte sequence is valid UTF-8 (the parser's own contract, `&str` in);
+            // that is `String::from_utf8`'s job to reject, not this parser's.
+            if let Ok(s) = String::from_utf8(buf) {
+                let _ = parse(&s); // must not panic, whatever it returns
+            }
+        }
+    }
+
     #[test]
     fn numbers_cover_the_forms_mpv_emits() {
         assert_eq!(parse("-0.004").unwrap().as_f64(), Some(-0.004));

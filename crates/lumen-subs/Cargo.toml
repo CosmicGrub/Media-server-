@@ -8,7 +8,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-lumen-model.workspace = true
 
 [dev-dependencies]
 proptest = "1"

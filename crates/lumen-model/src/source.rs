@@ -88,7 +88,14 @@ impl MediaSource {
         const MIN: u64 = 8 * 1024 * 1024;
         let bps = measured_bps.or(self.bitrate_bps).unwrap_or(0);
         let target = u64::from(self.transport.readahead_target_seconds());
-        let want = bps / 8 * target;
+        // `saturating_mul`, not `*`: `bitrate_bps` is not always the size/duration-derived figure
+        // this crate computes carefully -- `lumen-play`'s session.rs also populates it straight from
+        // mpv's own `demux-bitrate` JSON property via a saturating `as u64` cast, which means a
+        // corrupted or extreme source file that makes mpv misreport its bitrate can hand this
+        // function a `bps` near `u64::MAX` with nothing upstream having sanity-checked it. The exact
+        // "panics outright on overflow in a debug build, silently wraps in release" failure mode
+        // `display_size`'s own crop-arithmetic fix above already documents and defends against.
+        let want = (bps / 8).saturating_mul(target);
         want.clamp(MIN, cap_bytes.max(MIN))
     }
 
@@ -151,6 +158,24 @@ mod tests {
         // Live streams and recovered files have no declared bitrate; must not panic or return 0.
         let s = MediaSource::new(Container::Matroska, Transport::Http);
         assert_eq!(s.readahead_bytes(None, 1 << 30), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn readahead_survives_a_saturated_bitrate_rather_than_overflowing() {
+        // `bitrate_bps` is not always this crate's own size/duration-derived figure -- `lumen-play`'s
+        // session.rs also populates it straight from mpv's `demux-bitrate` JSON property via a
+        // saturating `as u64` cast, so a source whose file mpv misreports the bitrate for can hand
+        // this function a `bps` at or near u64::MAX with nothing upstream having sanity-checked it.
+        // `bps / 8 * target` used to panic outright on overflow here in a debug build (`cargo test`'s
+        // own default profile) for exactly this input.
+        let mut s = MediaSource::new(Container::Matroska, Transport::NetworkShare);
+        s.bitrate_bps = Some(u64::MAX);
+        let cap = 1 << 30;
+        assert_eq!(
+            s.readahead_bytes(None, cap),
+            cap,
+            "an absurd bitrate should saturate to the cap, not panic or wrap to something smaller"
+        );
     }
 
     #[test]

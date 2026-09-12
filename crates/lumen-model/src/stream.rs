@@ -67,6 +67,59 @@ pub enum StereoMode {
     Mvc,
 }
 
+/// Chroma sample density relative to luma, in ascending order of what a decoder must support.
+///
+/// Ordered deliberately: hardware decoders that handle a given level almost always handle every
+/// level below it too (a 4:4:4-capable decoder decodes 4:2:0 trivially), so a single `max_chroma`
+/// ceiling on [`crate::VideoDecodeCaps`]-shaped types can be compared with `<=` rather than needing
+/// an exhaustive support list. `docs/11` §8 notes 4:2:2/4:4:4 profiles (H.264 High 4:2:2/4:4:4
+/// Predictive, HEVC Rext) as the case hardware decoders most often lack entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[non_exhaustive]
+pub enum ChromaSubsampling {
+    /// Quarter chroma resolution — the overwhelming majority of consumer video.
+    #[default]
+    Yuv420,
+    /// Half-horizontal chroma resolution — broadcast and professional mezzanine formats.
+    Yuv422,
+    /// Full chroma resolution — screen recordings, professional masters, rarely hardware-decoded.
+    Yuv444,
+}
+
+/// Pixels to discard from each edge before display, in decoded-frame coordinates. Distinct from
+/// [`Rational`] sample-aspect scaling: crop removes rows/columns the encoder padded in (macroblock
+/// alignment padding, cropped-for-broadcast masters), while SAR reshapes the pixels that remain.
+/// Applying SAR before crop -- or not applying crop at all -- misreports the displayed geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CropRect {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl CropRect {
+    pub fn is_zero(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// Cadence used to store a different native frame rate inside a fixed-rate container. Detecting
+/// this matters because naively deinterlacing or frame-rate-converting pulled-down content
+/// re-derives frames that were never independently captured, producing visible judder or ghosting
+/// that careful handling of the original cadence would avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TelecinePattern {
+    #[default]
+    None,
+    /// NTSC 3:2 pulldown -- 24fps film stored as 60 fields/29.97fps video.
+    Pulldown32,
+    /// PAL speedup -- 24fps film played at 25fps with no field repetition, a matching ~4% audio
+    /// pitch shift.
+    PalSpeedup,
+}
+
 /// Track flags. Matroska carries all of these; MP4 and TS carry a subset.
 ///
 /// `docs/12` §4 — these drive automatic track selection, and getting selection wrong reads to users
@@ -105,18 +158,37 @@ pub struct VideoStream {
     pub stereo_mode: StereoMode,
     pub bitrate_bps: Option<u64>,
     pub flags: StreamFlags,
+    /// Edge pixels to discard before display. Zero (the default) means the full decoded frame is
+    /// shown -- most streams carry no crop.
+    pub crop: CropRect,
+    /// Film cadence hidden inside a fixed-rate container, if detected.
+    pub telecine: TelecinePattern,
+    pub chroma: ChromaSubsampling,
 }
 
 impl VideoStream {
-    /// Display dimensions after applying sample aspect. Ignoring this shows anamorphic DVD content
-    /// at 3:2 instead of 16:9 (`docs/11` §6.1).
+    /// Display dimensions after applying crop and sample aspect, in that order: crop removes
+    /// encoder padding from the decoded frame, and only then does SAR reshape what remains.
+    /// Ignoring SAR shows anamorphic DVD content at 3:2 instead of 16:9 (`docs/11` §6.1); ignoring
+    /// crop shows the padding the encoder never meant to display.
     pub fn display_size(&self) -> (u32, u32) {
+        // `saturating_add`, not `+`: crop values are meant to come from a probed container's own
+        // crop atoms eventually (`PixelCropLeft`/`PixelCropRight` and friends), the same kind of
+        // attacker-controlled numeric field this codebase never trusts to be sane on its own --
+        // `left + right` panics outright on overflow in a debug build (`cargo test`'s own default
+        // profile) the moment two crop values sum past `u32::MAX`, and silently wraps to a small
+        // number in release instead. `saturating_sub` right after this already treats the *width*
+        // side defensively; the crop-value addition feeding it deserves the same treatment.
+        let cropped_w =
+            self.width.saturating_sub(self.crop.left.saturating_add(self.crop.right)).max(1);
+        let cropped_h =
+            self.height.saturating_sub(self.crop.top.saturating_add(self.crop.bottom)).max(1);
         if !self.sample_aspect.is_valid() || self.sample_aspect.num == self.sample_aspect.den {
-            return (self.width, self.height);
+            return (cropped_w, cropped_h);
         }
-        let w = (u64::from(self.width) * u64::from(self.sample_aspect.num))
+        let w = (u64::from(cropped_w) * u64::from(self.sample_aspect.num))
             / u64::from(self.sample_aspect.den);
-        (w.max(1) as u32, self.height)
+        (w.max(1) as u32, cropped_h)
     }
 
     pub fn pixels(&self) -> u64 {
@@ -202,6 +274,9 @@ mod tests {
             stereo_mode: StereoMode::Mono,
             bitrate_bps: None,
             flags: StreamFlags::enabled(),
+            crop: CropRect::default(),
+            telecine: TelecinePattern::default(),
+            chroma: ChromaSubsampling::default(),
         }
     }
 
@@ -242,5 +317,55 @@ mod tests {
         assert!(s.is_variable_frame_rate());
         s.frame_rate = Some(Rational::new(0, 1));
         assert!(s.is_variable_frame_rate());
+    }
+
+    #[test]
+    fn zero_crop_is_a_no_op() {
+        let s = video(1920, 1080, Rational::new(1, 1));
+        assert!(s.crop.is_zero());
+        assert_eq!(s.display_size(), (1920, 1080));
+    }
+
+    #[test]
+    fn crop_is_applied_before_sample_aspect() {
+        // 1920x1080 with 8px letterboxing top and bottom cropped away, then scaled by a 4:3 SAR --
+        // crop must land on the pre-scale width/height, not the display width/height.
+        let mut s = video(1920, 1080, Rational::new(4, 3));
+        s.crop = CropRect { left: 0, top: 8, right: 0, bottom: 8 };
+        let (w, h) = s.display_size();
+        assert_eq!(h, 1064, "vertical crop must reduce the cropped height, not the scaled width");
+        assert_eq!(w, (1920u64 * 4 / 3) as u32);
+    }
+
+    #[test]
+    fn crop_wider_than_the_frame_clamps_to_one_pixel_instead_of_underflowing() {
+        let mut s = video(100, 100, Rational::new(1, 1));
+        s.crop = CropRect { left: 60, top: 0, right: 60, bottom: 0 };
+        assert_eq!(s.display_size(), (1, 100));
+    }
+
+    #[test]
+    fn crop_values_that_would_overflow_u32_clamp_rather_than_panicking() {
+        // Crop values are meant to eventually come from a probed container's own crop atoms --
+        // exactly the kind of attacker/corruption-controlled numeric field this codebase never
+        // trusts to be sane. `left + right` used to be a plain addition, which panicked outright
+        // in a debug build (`cargo test`'s own default profile) the moment two crop values summed
+        // past `u32::MAX`, rather than degrading the same way an over-wide crop already does above.
+        let mut s = video(100, 100, Rational::new(1, 1));
+        s.crop = CropRect { left: u32::MAX, top: u32::MAX, right: u32::MAX, bottom: u32::MAX };
+        assert_eq!(s.display_size(), (1, 1));
+    }
+
+    #[test]
+    fn telecine_defaults_to_none() {
+        let s = video(1920, 1080, Rational::new(1, 1));
+        assert_eq!(s.telecine, TelecinePattern::None);
+    }
+
+    #[test]
+    fn chroma_subsampling_orders_from_least_to_most_demanding() {
+        assert!(ChromaSubsampling::Yuv420 < ChromaSubsampling::Yuv422);
+        assert!(ChromaSubsampling::Yuv422 < ChromaSubsampling::Yuv444);
+        assert_eq!(ChromaSubsampling::default(), ChromaSubsampling::Yuv420);
     }
 }

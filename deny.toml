@@ -19,6 +19,10 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "BSL-1.0",
+    "0BSD",             # doctest-file/recvmsg (via interprocess, the Windows named-pipe IPC
+                         # transport) -- BSD Zero Clause, OSI-approved and more permissive than MIT,
+                         # not previously caught because cargo-deny is opt-in locally (see
+                         # ci/license-gate.sh) and had never actually been run against this graph.
 ]
 # Anything not on the allow list fails, including unknown/unlicensed crates.
 confidence-threshold = 0.9

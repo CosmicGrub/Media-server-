@@ -19,7 +19,7 @@ pub mod isobmff;
 pub mod magic;
 pub mod recovery;
 
-pub use ebml::{CompressionAlgo, CuesPlacement, MatroskaLayout};
+pub use ebml::{CompressionAlgo, CuesPlacement, MatroskaLayout, VideoTrackInfo};
 pub use isobmff::{EncryptionScheme, IsobmffLayout, MoovPlacement};
 pub use magic::{Candidate, Confidence, sniff};
 pub use recovery::{OpenFailure, RecoveryLadder, Rung};

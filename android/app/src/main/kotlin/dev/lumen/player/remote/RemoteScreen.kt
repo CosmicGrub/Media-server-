@@ -167,6 +167,8 @@ private fun PairingForm(onSubmit: (String) -> Unit) {
 private fun ConnectedContent(state: RemoteUiState, playback: RemoteProtocol.PlaybackState, vm: RemoteViewModel) {
     Column(Modifier.fillMaxSize()) {
         NowPlayingCard(playback, vm)
+        Spacer(Modifier.height(12.dp))
+        ServerCard(state.health, state.loadingHealth, onRefresh = vm::refreshHealth)
         Spacer(Modifier.height(16.dp))
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -174,14 +176,18 @@ private fun ConnectedContent(state: RemoteUiState, playback: RemoteProtocol.Play
                 style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.weight(1f),
             )
-            TextButton(onClick = vm::refreshLibrary) { Text("Refresh") }
+            // Two different things, labelled so the difference is visible: "Refresh list" re-fetches
+            // what the server already knows; "Rescan server" asks it to re-walk its disk first
+            // (the listing then refreshes on its own, off the version bump that produces).
+            TextButton(onClick = vm::refreshLibrary) { Text("Refresh list") }
+            TextButton(onClick = vm::rescan) { Text("Rescan server") }
         }
         when {
             state.loadingLibrary -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
             state.library.isEmpty() -> Text(
-                "No files reported. Try Refresh.",
+                "No files reported. Try “Rescan server”.",
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(top = 8.dp),
             )
@@ -255,6 +261,94 @@ private fun NowPlayingCard(playback: RemoteProtocol.PlaybackState, vm: RemoteVie
         }
     }
 }
+
+/**
+ * The "Server" card of `docs/15-next-generation-engines.md` §D: the five things a headless
+ * `lumen serve` cannot otherwise tell this phone about itself, in units a person reads. A card
+ * inside the connected layout, as that document specifies, not a screen of its own — it is glanced
+ * at on the way to the library list, not visited.
+ */
+@Composable
+private fun ServerCard(health: RemoteProtocol.HealthReport?, loading: Boolean, onRefresh: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Server", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                TextButton(onClick = onRefresh, enabled = !loading) { Text("Refresh") }
+            }
+            when {
+                health != null -> {
+                    val nowUnixSecs = System.currentTimeMillis() / 1000
+                    val lines = listOf(
+                        "Player responds in ${formatRoundtrip(health.mpvRoundtripMs)}",
+                        "Certificate ${formatCertExpiry(health.tlsCertExpiresInSecs)}",
+                        "Library ${formatLastIndexed(health.libraryLastIndexedUnixSecs, nowUnixSecs)}",
+                        "Free space ${formatFreeDisk(health.freeDiskBytes)}",
+                        formatClientCount(health.pairedClientCount),
+                    )
+                    for (line in lines) Text(line, style = MaterialTheme.typography.bodySmall)
+                }
+                loading -> Text("Checking...", style = MaterialTheme.typography.bodySmall)
+                else -> Text("No health report yet.", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+/** Seconds in one day, for the day-granularity wording below. Days, not hours or minutes, because
+ * the two things this card counts in days — a certificate's remaining life and how long ago the
+ * library was indexed — are only actionable at that scale: nobody re-pairs over a cert expiring
+ * "in 3 hours 12 minutes" any differently than one expiring "today". */
+private const val SECS_PER_DAY = 86_400L
+
+internal fun formatRoundtrip(ms: Long): String = "$ms ms"
+
+/** "expires in N days", "expired N days ago", or "expiry unknown" for the `null` the server sends
+ * for a certificate persisted before expiry was tracked. The two directions are worded differently
+ * on purpose: a lapsed certificate and one with days left are different situations, which is why
+ * the server sends a signed number instead of clamping at zero. */
+internal fun formatCertExpiry(secs: Long?): String {
+    if (secs == null) return "expiry unknown"
+    val days = kotlin.math.abs(secs) / SECS_PER_DAY
+    return when {
+        secs < 0 && days == 0L -> "expired less than a day ago"
+        secs < 0 -> "expired ${plural(days, "day")} ago"
+        days == 0L -> "expires within a day"
+        else -> "expires in ${plural(days, "day")}"
+    }
+}
+
+/** "never reindexed" for the `null` the server sends when no index has ever been written for this
+ * library — `lumen serve` only ever scans in memory, so this is the honest state for most servers,
+ * not an error. Otherwise the age in days, against [nowUnixSecs] passed in rather than read here so
+ * the wording is checkable without depending on the clock. */
+internal fun formatLastIndexed(unixSecs: Long?, nowUnixSecs: Long): String {
+    if (unixSecs == null) return "never reindexed"
+    // A timestamp from the future (clock skew between the two machines) is clamped to "today"
+    // rather than shown as a negative age nobody could read.
+    val days = ((nowUnixSecs - unixSecs).coerceAtLeast(0)) / SECS_PER_DAY
+    return if (days == 0L) "reindexed today" else "reindexed ${plural(days, "day")} ago"
+}
+
+/** GiB with one decimal — not the library list's `formatSize`, which picks a unit to fit. A media
+ * library volume is gigabytes or more by definition, and a fixed unit means the number reads
+ * the same way on every visit instead of switching units as space fills up. `null` is the server
+ * reporting that the platform call itself failed.
+ *
+ * Formatted under `Locale.US` explicitly, the same way `ui/DisplayControls.kt` formats its zoom
+ * and subtitle scale: Kotlin's bare `String.format` uses the JVM's default locale, so on a device
+ * — or a self-hosted CI runner — set to a comma-decimal locale the figure would come out as
+ * "1,0 GiB", and the test pinning this wording would fail there and nowhere else. A fixed-format
+ * figure a test asserts on has to be formatted the same way everywhere. */
+internal fun formatFreeDisk(bytes: Long?): String {
+    if (bytes == null) return "unknown"
+    return String.format(java.util.Locale.US, "%.1f GiB", bytes / (1024.0 * 1024 * 1024))
+}
+
+internal fun formatClientCount(count: Long): String =
+    "${plural(count, "client")} connected"
+
+private fun plural(n: Long, unit: String): String = if (n == 1L) "1 $unit" else "$n ${unit}s"
 
 /** `h:mm:ss`, or `m:ss` under an hour — the same convention the local player's duration text uses,
  * so a number on this screen reads the same way as one on the other. */

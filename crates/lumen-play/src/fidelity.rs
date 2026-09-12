@@ -17,9 +17,10 @@
 
 use lumen_caps::ClientCapabilities;
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, ColorInfo, ColorPrimaries, ColorRange, ColorTransfer,
-    Container, HdrFormat, Integrity, Language, MediaSource, Rational, StreamFlags, SubtitleCodec,
-    SubtitleStream, Transport, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, ChromaSubsampling, ColorInfo, ColorMatrix,
+    ColorPrimaries, ColorRange, ColorTransfer, Container, HdrFormat, Integrity, Language,
+    MediaSource, Rational, StreamFlags, SubtitleCodec, SubtitleStream, Transport, VideoCodec,
+    VideoStream,
 };
 use lumen_playback::{Selection, Tier, TrackPreferences, plan, select};
 
@@ -72,7 +73,10 @@ pub fn assess(r: &FileResult, scanned: &ScannedFile) -> Option<Fidelity> {
 /// `reference_native` as published, with the network link removed: the bytes are on this machine, so
 /// a 100 Mbps remux has no link to exceed, and the ladder's own rule is that an unmeasured link must
 /// never trigger rejection.
-fn native_profile() -> ClientCapabilities {
+///
+/// `pub(crate)` so `calibration.rs` can ask the same declared capabilities what they claim about a
+/// codec's hardware-decode support, without a second, drifting copy of "what the native profile is".
+pub(crate) fn native_profile() -> ClientCapabilities {
     ClientCapabilities { network_bps: None, ..ClientCapabilities::reference_native() }
 }
 
@@ -146,6 +150,11 @@ pub fn media_source(r: &FileResult, scanned: &ScannedFile) -> Option<MediaSource
                 stereo_mode: lumen_model::StereoMode::default(),
                 bitrate_bps: t.bitrate_bps,
                 flags: flags_of(t),
+                // mpv exposes no per-track crop or telecine detection; both stay at their honest
+                // defaults rather than being guessed.
+                crop: lumen_model::CropRect::default(),
+                telecine: lumen_model::TelecinePattern::default(),
+                chroma: chroma_from_pixel_format(r.pixel_format.as_deref()),
             }),
             "audio" => source.audio.push(AudioStream {
                 index: t.id,
@@ -224,6 +233,20 @@ fn bit_depth_from_pixel_format(pf: Option<&str>) -> u8 {
     }
 }
 
+/// `yuv444p10le` -> 4:4:4, `yuv422p` -> 4:2:2, everything else (including no report at all) -> the
+/// 4:2:0 default, which is both the overwhelming common case and the honest floor: nothing here
+/// claims wider chroma support than what mpv actually reported.
+fn chroma_from_pixel_format(pf: Option<&str>) -> ChromaSubsampling {
+    let Some(pf) = pf else { return ChromaSubsampling::default() };
+    if pf.starts_with("yuv444") || pf.starts_with("yuva444") || pf.starts_with("gbr") {
+        ChromaSubsampling::Yuv444
+    } else if pf.starts_with("yuv422") || pf.starts_with("yuva422") {
+        ChromaSubsampling::Yuv422
+    } else {
+        ChromaSubsampling::default()
+    }
+}
+
 fn color_info(r: &FileResult) -> ColorInfo {
     let transfer = match r.gamma.as_deref() {
         Some("pq") => ColorTransfer::Pq,
@@ -242,6 +265,16 @@ fn color_info(r: &FileResult) -> ColorInfo {
         Some("display-p3") => ColorPrimaries::DisplayP3,
         _ => ColorPrimaries::Unspecified,
     };
+    // mpv's `video-params/colormatrix` uses the same naming family as `primaries`/`gamma`.
+    let matrix = match r.colormatrix.as_deref() {
+        Some("bt.709") => ColorMatrix::Bt709,
+        Some("bt.601") => ColorMatrix::Bt601,
+        Some("bt.2020-ncl") => ColorMatrix::Bt2020Ncl,
+        Some("bt.2020-cl") => ColorMatrix::Bt2020Cl,
+        Some("ycgco") => ColorMatrix::YCgCo,
+        Some("ictcp") => ColorMatrix::IcTcP,
+        _ => ColorMatrix::Unspecified,
+    };
     // The transfer function decides HDR, not the primaries: BT.2020 with a conventional gamma curve
     // is wide-gamut SDR, and conflating the two would misreport a distinction this product exists to
     // get right. Dolby Vision is not detectable from these properties, so PQ is reported as HDR10 —
@@ -251,7 +284,7 @@ fn color_info(r: &FileResult) -> ColorInfo {
         ColorTransfer::Hlg => HdrFormat::Hlg,
         _ => HdrFormat::Sdr,
     };
-    ColorInfo { primaries, transfer, range: ColorRange::Unspecified, hdr, mastering: None }
+    ColorInfo { primaries, transfer, matrix, range: ColorRange::Unspecified, hdr, mastering: None }
 }
 
 /// mpv's `file-format` is FFmpeg's demuxer name, which is often a comma-separated family.
@@ -319,6 +352,12 @@ pub fn video_codec(name: Option<&str>) -> VideoCodec {
         "mjpeg" => VideoCodec::Mjpeg,
         "dvvideo" => VideoCodec::Dv,
         "rawvideo" | "v210" | "yuv4" => VideoCodec::Uncompressed,
+        "h263" | "h263p" | "h263i" => VideoCodec::H263,
+        "cinepak" => VideoCodec::Cinepak,
+        "indeo2" | "indeo3" | "indeo4" | "indeo5" => VideoCodec::Indeo,
+        "svq3" => VideoCodec::Svq3,
+        "qtrle" => VideoCodec::QtRle,
+        "utvideo" => VideoCodec::UtVideo,
         other => VideoCodec::Other(other.to_string()),
     }
 }
@@ -336,6 +375,9 @@ pub fn audio_codec(name: Option<&str>, profile: Option<&str>) -> AudioCodec {
     }
     if name.starts_with("dsd_") {
         return AudioCodec::Dsd;
+    }
+    if name.starts_with("adpcm_") {
+        return AudioCodec::Adpcm;
     }
     match name.as_str() {
         "truehd" | "mlp" => AudioCodec::TrueHd,
@@ -365,7 +407,8 @@ pub fn audio_codec(name: Option<&str>, profile: Option<&str>) -> AudioCodec {
         "vorbis" => AudioCodec::Vorbis,
         "mp3" | "mp3float" => AudioCodec::Mp3,
         "mp2" | "mp2float" => AudioCodec::Mp2,
-        "wmav1" | "wmav2" | "wmapro" | "wmalossless" => AudioCodec::Wma,
+        "wmav1" | "wmav2" | "wmapro" => AudioCodec::Wma,
+        "wmalossless" => AudioCodec::WmaLossless,
         other => AudioCodec::Other(other.to_string()),
     }
 }
@@ -379,6 +422,7 @@ pub fn subtitle_codec(name: Option<&str>) -> SubtitleCodec {
         "ttml" | "stl" => SubtitleCodec::Ttml,
         "microdvd" => SubtitleCodec::MicroDvd,
         "subviewer" | "subviewer1" => SubtitleCodec::SubViewer,
+        "mov_text" | "tx3g" => SubtitleCodec::MovText,
         "hdmv_pgs_subtitle" | "pgssub" => SubtitleCodec::Pgs,
         "dvd_subtitle" | "dvdsub" => SubtitleCodec::VobSub,
         "dvb_subtitle" | "dvbsub" => SubtitleCodec::DvbSub,
@@ -447,6 +491,7 @@ mod tests {
             pixel_format: Some("yuv420p10le".into()),
             primaries: Some("bt.2020".into()),
             gamma: Some("pq".into()),
+            colormatrix: Some("bt.2020-ncl".into()),
             seekable: Some(true),
             audio_channels: Some("8".into()),
             track_counts: Default::default(),
@@ -454,6 +499,8 @@ mod tests {
             fidelity: None,
             delayed_frames: None,
             dropped_frames: None,
+            audio_spdif_requested: false,
+            audio_out_format: None,
         };
         r.tracks = tracks;
         r
@@ -556,6 +603,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_and_previously_uncatalogued_codecs_now_map_to_a_real_variant() {
+        // Proposal 4: these previously fell through to `Other`, which is correct for a codec this
+        // product has never heard of but wrong for ones it now recognises by name.
+        assert_eq!(video_codec(Some("cinepak")), VideoCodec::Cinepak);
+        assert_eq!(video_codec(Some("indeo5")), VideoCodec::Indeo);
+        assert_eq!(video_codec(Some("h263p")), VideoCodec::H263);
+        assert_eq!(video_codec(Some("svq3")), VideoCodec::Svq3);
+        assert_eq!(video_codec(Some("qtrle")), VideoCodec::QtRle);
+        assert_eq!(video_codec(Some("utvideo")), VideoCodec::UtVideo);
+
+        assert_eq!(audio_codec(Some("adpcm_ms"), None), AudioCodec::Adpcm);
+        assert_eq!(audio_codec(Some("adpcm_ima_wav"), None), AudioCodec::Adpcm);
+        assert_eq!(audio_codec(Some("wmalossless"), None), AudioCodec::WmaLossless);
+        assert_eq!(audio_codec(Some("wmapro"), None), AudioCodec::Wma, "lossy WMA stays lossy");
+
+        assert_eq!(subtitle_codec(Some("mov_text")), SubtitleCodec::MovText);
+    }
+
+    #[test]
     fn bit_depth_comes_out_of_the_pixel_format() {
         assert_eq!(bit_depth_from_pixel_format(Some("yuv420p")), 8);
         assert_eq!(bit_depth_from_pixel_format(Some("yuv420p10le")), 10);
@@ -595,6 +661,32 @@ mod tests {
         assert_eq!(color_info(&r).hdr, HdrFormat::Hdr10);
         r.gamma = Some("hlg".into());
         assert_eq!(color_info(&r).hdr, HdrFormat::Hlg);
+    }
+
+    #[test]
+    fn chroma_is_read_from_the_pixel_format_and_defaults_honestly() {
+        assert_eq!(chroma_from_pixel_format(Some("yuv420p")), ChromaSubsampling::Yuv420);
+        assert_eq!(chroma_from_pixel_format(Some("yuv420p10le")), ChromaSubsampling::Yuv420);
+        assert_eq!(chroma_from_pixel_format(Some("yuv422p")), ChromaSubsampling::Yuv422);
+        assert_eq!(chroma_from_pixel_format(Some("yuv444p10le")), ChromaSubsampling::Yuv444);
+        assert_eq!(chroma_from_pixel_format(Some("gbrp")), ChromaSubsampling::Yuv444);
+        assert_eq!(
+            chroma_from_pixel_format(None),
+            ChromaSubsampling::default(),
+            "unreported chroma is not a claim of anything wider than the honest floor"
+        );
+        assert_eq!(chroma_from_pixel_format(Some("nv12")), ChromaSubsampling::Yuv420);
+    }
+
+    #[test]
+    fn colormatrix_is_read_the_same_way_as_primaries_and_gamma() {
+        let mut r = result(Vec::new());
+        r.colormatrix = Some("bt.2020-ncl".into());
+        assert_eq!(color_info(&r).matrix, ColorMatrix::Bt2020Ncl);
+        r.colormatrix = Some("bt.709".into());
+        assert_eq!(color_info(&r).matrix, ColorMatrix::Bt709);
+        r.colormatrix = None;
+        assert_eq!(color_info(&r).matrix, ColorMatrix::Unspecified, "unknown is not a guess");
     }
 
     #[test]

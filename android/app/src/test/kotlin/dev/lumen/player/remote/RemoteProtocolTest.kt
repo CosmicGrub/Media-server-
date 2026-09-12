@@ -42,6 +42,17 @@ class RemoteProtocolTest {
     }
 
     @Test
+    fun `a rescan request parses and carries its id`() {
+        // Mirrors the Rust test of the same name: the server's parser is what accepts this shape.
+        assertEquals("""{"type":"rescan","id":"11"}""", RemoteProtocol.ClientMessage.Rescan.toLine("11"))
+    }
+
+    @Test
+    fun `a health request parses and carries its id`() {
+        assertEquals("""{"type":"health","id":"9"}""", RemoteProtocol.ClientMessage.Health.toLine("9"))
+    }
+
+    @Test
     fun `every client message line is itself valid json`() {
         // Built by hand-written string templates rather than the parser's writer, so this is the
         // one check that the templates in toLine() have not drifted into something malformed.
@@ -53,6 +64,8 @@ class RemoteProtocolTest {
             RemoteProtocol.ClientMessage.Pause,
             RemoteProtocol.ClientMessage.Seek(1),
             RemoteProtocol.ClientMessage.SetVolume(1),
+            RemoteProtocol.ClientMessage.Rescan,
+            RemoteProtocol.ClientMessage.Health,
         )
         for (m in messages) {
             val line = m.toLine("id")
@@ -139,6 +152,103 @@ class RemoteProtocolTest {
             ),
             msg,
         )
+    }
+
+    @Test
+    fun `a rescan reply carries the fresh count and version`() {
+        // The same numbers the Rust test of this name writes, read back here.
+        val msg = RemoteProtocol.parseServerMessage(
+            """{"type":"reply","id":"4","ok":true,"result":{"file_count":137,"library_version":3}}"""
+        )
+        assertEquals(
+            RemoteProtocol.ServerMessage.ReplyOk("4", null, rescan = RemoteProtocol.RescanResult(137, 3)),
+            msg,
+        )
+    }
+
+    @Test
+    fun `a health reply carries every known field`() {
+        val line = """{"type":"reply","id":"7","ok":true,"result":{"mpv_roundtrip_ms":12,""" +
+            """"tls_cert_expires_in_secs":1000000,"library_last_indexed_unix_secs":1700000000,""" +
+            """"free_disk_bytes":999999999,"paired_client_count":2}}"""
+        val msg = RemoteProtocol.parseServerMessage(line)
+        assertEquals(
+            RemoteProtocol.ServerMessage.ReplyOk(
+                "7",
+                null,
+                health = RemoteProtocol.HealthReport(
+                    mpvRoundtripMs = 12,
+                    tlsCertExpiresInSecs = 1_000_000,
+                    libraryLastIndexedUnixSecs = 1_700_000_000,
+                    freeDiskBytes = 999_999_999,
+                    pairedClientCount = 2,
+                ),
+            ),
+            msg,
+        )
+    }
+
+    @Test
+    fun `a health reply reports unknown fields as null rather than a fabricated value`() {
+        // The server sends JSON null for a certificate persisted before expiry tracking existed,
+        // a library never reindexed, and a failed disk-space call. Each must land as a Kotlin null:
+        // a zero here would read as "expires now", "indexed in 1970" and "disk full".
+        val line = """{"type":"reply","id":"8","ok":true,"result":{"mpv_roundtrip_ms":5,""" +
+            """"tls_cert_expires_in_secs":null,"library_last_indexed_unix_secs":null,""" +
+            """"free_disk_bytes":null,"paired_client_count":0}}"""
+        val msg = RemoteProtocol.parseServerMessage(line) as RemoteProtocol.ServerMessage.ReplyOk
+        val health = msg.health!!
+        assertEquals(5L, health.mpvRoundtripMs)
+        assertNull(health.tlsCertExpiresInSecs)
+        assertNull(health.libraryLastIndexedUnixSecs)
+        assertNull(health.freeDiskBytes)
+        assertEquals(0L, health.pairedClientCount)
+        assertNull(msg.rescan)
+        assertNull(msg.library)
+    }
+
+    @Test
+    fun `a negative cert expiry survives the wire for an already lapsed certificate`() {
+        // Negative, not clamped to zero: "expired 3 days ago" and "expires in 3 days" have to stay
+        // distinguishable all the way to the card that shows them.
+        val line = """{"type":"reply","id":"9","ok":true,"result":{"mpv_roundtrip_ms":1,""" +
+            """"tls_cert_expires_in_secs":-259200,"library_last_indexed_unix_secs":null,""" +
+            """"free_disk_bytes":null,"paired_client_count":0}}"""
+        val msg = RemoteProtocol.parseServerMessage(line) as RemoteProtocol.ServerMessage.ReplyOk
+        assertEquals(-259_200L, msg.health?.tlsCertExpiresInSecs)
+    }
+
+    @Test
+    fun `an ok reply whose result object is not a shape this client knows is still an ok reply`() {
+        // A newer server answering with a result type this build has never heard of must be an
+        // ordinary ok reply with nothing attached — not an exception, and not a report with
+        // invented values. Includes the half-recognised case: one key of a rescan result present
+        // without the other must not parse as a rescan of zero files.
+        assertEquals(
+            RemoteProtocol.ServerMessage.ReplyOk("1", null),
+            RemoteProtocol.parseServerMessage("""{"type":"reply","id":"1","ok":true,"result":{"novel":true}}"""),
+        )
+        assertEquals(
+            RemoteProtocol.ServerMessage.ReplyOk("2", null),
+            RemoteProtocol.parseServerMessage("""{"type":"reply","id":"2","ok":true,"result":{}}"""),
+        )
+        assertEquals(
+            RemoteProtocol.ServerMessage.ReplyOk("3", null),
+            RemoteProtocol.parseServerMessage(
+                """{"type":"reply","id":"3","ok":true,"result":{"library_version":9}}"""
+            ),
+        )
+    }
+
+    @Test
+    fun `a library reply is not mistaken for a rescan or health reply`() {
+        // The array-shaped result and the object-shaped ones share one `result` key; the listing
+        // must still come through as a listing, with the two object fields left null.
+        val line = """{"type":"reply","id":"3","ok":true,"result":[{"path":"/a.mkv","title":"A","duration_ms":1000}]}"""
+        val msg = RemoteProtocol.parseServerMessage(line) as RemoteProtocol.ServerMessage.ReplyOk
+        assertEquals(listOf(RemoteProtocol.LibraryEntry("/a.mkv", "A", 1000)), msg.library)
+        assertNull(msg.rescan)
+        assertNull(msg.health)
     }
 
     @Test

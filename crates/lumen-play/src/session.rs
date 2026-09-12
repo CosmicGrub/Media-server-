@@ -36,6 +36,12 @@ pub struct PlayOptions {
     pub extra_args: Vec<String>,
     /// Build the playlist and print it, launching nothing.
     pub dry_run: bool,
+    /// Ask mpv to bitstream HD audio (TrueHD, DTS-HD, E-AC-3, AC-3) via S/PDIF rather than decoding
+    /// it, so `calibration`'s predicted-vs-observed comparison has something real to check. Off by
+    /// default: unlike hardware decode, this changes what actually comes out of the audio device, and
+    /// a sink that cannot accept a bitstream would get silence rather than the PCM fallback mpv
+    /// otherwise provides.
+    pub audio_passthrough: bool,
 }
 
 impl PlayOptions {
@@ -83,6 +89,8 @@ pub struct FileResult {
     pub primaries: Option<String>,
     /// Transfer function. `pq` is HDR10/Dolby Vision, `hlg` is broadcast HDR, anything else is SDR.
     pub gamma: Option<String>,
+    /// YUV-to-RGB matrix coefficients, e.g. `bt.2020-ncl`.
+    pub colormatrix: Option<String>,
     /// Whether mpv can seek in this file. A long video that reports `false` has lost its index —
     /// Matroska Cues or an MP4 `moov` — which plays start-to-finish but cannot be navigated. It is
     /// the defect a play-through test would never notice, because playing forward still works.
@@ -99,6 +107,16 @@ pub struct FileResult {
     /// Frames the video output presented late, over this file.
     pub delayed_frames: Option<u64>,
     pub dropped_frames: Option<u64>,
+    /// Whether this session asked mpv to bitstream HD audio (`PlayOptions::audio_passthrough`).
+    /// Carried per-result, not just per-session, so `calibration::observe` knows whether
+    /// [`Self::audio_out_format`]'s absence means "not bitstreamed" or "never asked" -- claiming a
+    /// passthrough miss on a session that never requested passthrough would blame the model for a
+    /// gap in what this codebase asks mpv to do, not for a wrong prediction.
+    pub audio_spdif_requested: bool,
+    /// mpv's `audio-out-params/format` after playback -- `"spdif-ac3"`/`"spdif-dts-hd"`/... when a
+    /// bitstream reached the sink, a PCM sample format (`"s16"`, `"floatp"`, ...) when mpv decoded it
+    /// instead. Only meaningful when [`Self::audio_spdif_requested`] is true.
+    pub audio_out_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,7 +158,7 @@ pub struct TrackInfo {
 }
 
 impl FileResult {
-    fn new(f: &ScannedFile) -> Self {
+    fn new(f: &ScannedFile, opts: &PlayOptions) -> Self {
         Self {
             path: f.path.clone(),
             label: f.label(),
@@ -157,6 +175,7 @@ impl FileResult {
             pixel_format: None,
             primaries: None,
             gamma: None,
+            colormatrix: None,
             seekable: None,
             audio_channels: None,
             track_counts: TrackCounts::default(),
@@ -164,6 +183,8 @@ impl FileResult {
             fidelity: None,
             delayed_frames: None,
             dropped_frames: None,
+            audio_spdif_requested: opts.audio_passthrough,
+            audio_out_format: None,
         }
     }
 
@@ -267,6 +288,13 @@ pub fn mpv_args(ipc_path: &str, opts: &PlayOptions) -> Vec<String> {
     if opts.start_paused {
         args.push("--pause=yes".into());
     }
+    if opts.audio_passthrough {
+        // mpv's own accepted codec list for this option, per its manual: ac3, dts, dts-hd, eac3,
+        // truehd. Without this flag mpv decodes every one of them to PCM regardless of what the
+        // sink could actually take, which is exactly the "never asked" gap that made this
+        // uncheckable before.
+        args.push("--audio-spdif=ac3,dts,dts-hd,eac3,truehd".into());
+    }
     args.extend(opts.extra_args.iter().cloned());
     args
 }
@@ -328,7 +356,7 @@ pub fn run(
         println!("  (then over IPC: loadlist {} replace)", playlist.display());
         println!("\nplaylist ({} files): {}", files.len(), playlist.display());
         return Ok(SessionReport {
-            results: files.iter().map(|f| FileResult::new(f)).collect(),
+            results: files.iter().map(|f| FileResult::new(f, opts)).collect(),
             ..Default::default()
         });
     }
@@ -365,7 +393,7 @@ pub fn run(
 
     let start = Instant::now();
     let mut report = SessionReport {
-        results: files.iter().map(|f| FileResult::new(f)).collect(),
+        results: files.iter().map(|f| FileResult::new(f, opts)).collect(),
         mpv_version: mpv.get_string("mpv-version"),
         vo_used: mpv.get_string("current-vo"),
         ..Default::default()
@@ -510,6 +538,11 @@ fn collect_properties(mpv: &mut Mpv, r: &mut FileResult) {
     r.pixel_format = mpv.get_string("video-params/pixelformat");
     r.primaries = mpv.get_string("video-params/primaries");
     r.gamma = mpv.get_string("video-params/gamma");
+    r.colormatrix = mpv.get_string("video-params/colormatrix");
+    // Only meaningful when this session actually requested passthrough (`--audio-spdif`); queried
+    // unconditionally regardless, since a `None` here is exactly the honest "not requested" signal
+    // `FileResult::audio_spdif_requested` needs a counterpart for.
+    r.audio_out_format = mpv.get_string("audio-out-params/format");
     r.seekable = mpv.get("seekable").and_then(|v| v.as_bool());
     r.audio_channels = mpv.get_string("audio-params/channel-count");
     if let Some(list) = mpv.get("track-list") {
@@ -756,7 +789,7 @@ mod tests {
             label: "a".into(),
             outcome: Outcome::Played,
             hwdec: Some("no".into()),
-            ..FileResult::new(&dummy_file())
+            ..FileResult::new(&dummy_file(), &PlayOptions::default())
         };
         assert!(base.software_decoded());
 
@@ -768,7 +801,7 @@ mod tests {
     }
 
     fn blank() -> FileResult {
-        FileResult::new(&dummy_file())
+        FileResult::new(&dummy_file(), &PlayOptions::default())
     }
 
     fn dummy_file() -> ScannedFile {

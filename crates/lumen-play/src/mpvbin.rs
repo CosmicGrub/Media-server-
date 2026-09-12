@@ -58,7 +58,7 @@ pub fn candidates(
         }
         out.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin").join(MPV_EXE));
     } else {
-        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/snap/bin"] {
+        for dir in ["/usr/local/bin", "/usr/bin", "/snap/bin"] {
             out.push(Path::new(dir).join(MPV_EXE));
         }
         // The flatpak is a wrapper rather than a binary, so it is not listed: launching it would
@@ -157,12 +157,6 @@ Or install it system-wide:
 
 Or point at a copy you already have, without moving anything:
     set LUMEN_MPV=D:\path\to\mpv.exe"
-    } else if cfg!(target_os = "macos") {
-        r"mpv was not found. Install it with:
-    brew install mpv
-
-Or point at a copy you already have:
-    export LUMEN_MPV=/path/to/mpv"
     } else {
         r"mpv was not found. Install it with one of:
     apt install mpv      dnf install mpv      pacman -S mpv      zypper install mpv
@@ -186,9 +180,7 @@ mod tests {
         let beside = list.iter().position(|p| p == &exe_dir.join(MPV_EXE)).expect("beside-exe");
         let system = list
             .iter()
-            .position(|p| {
-                p.starts_with("/usr") || p.starts_with("/opt/homebrew") || p.starts_with("C:")
-            })
+            .position(|p| p.starts_with("/usr") || p.starts_with("C:"))
             .unwrap_or(usize::MAX);
         assert!(beside < system, "bundled must come first: {list:?}");
     }

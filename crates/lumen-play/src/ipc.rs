@@ -77,11 +77,23 @@ impl Mpv {
         Ok(Self::spawn_reader(Box::new(stream), Box::new(reader)))
     }
 
+    // `std::fs::OpenOptions`/`File::try_clone` used to be used here, the same pattern as the Unix
+    // branch above: open once, `DuplicateHandle` a second handle for the reader thread. It compiled
+    // and connected fine, and then deadlocked the instant a real command was sent -- every write
+    // blocked forever, and so did the reader thread's very next read. The two duplicated handles are
+    // still the *same* underlying kernel pipe object, and Windows serializes synchronous (i.e.
+    // non-overlapped, which `File` always is) I/O per file object: a pending blocking `ReadFile` on
+    // one handle holds up a `WriteFile` on the other, and since mpv was never going to reply until it
+    // received that write, the two sides waited on each other forever. `interprocess`'s named-pipe
+    // support exists specifically to give each half its own overlapped I/O state instead of sharing
+    // one synchronous handle across threads, which is what actually lets a read and a write happen
+    // concurrently without contention.
     #[cfg(windows)]
     fn try_connect(path: &str) -> std::io::Result<Self> {
-        let pipe = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
-        let reader = pipe.try_clone()?;
-        Ok(Self::spawn_reader(Box::new(pipe), Box::new(reader)))
+        use interprocess::os::windows::named_pipe::{DuplexPipeStream, pipe_mode};
+        let conn = DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path(path)?;
+        let (reader, writer) = conn.split();
+        Ok(Self::spawn_reader(Box::new(writer), Box::new(reader)))
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -121,18 +133,35 @@ impl Mpv {
         self.writer.flush()
     }
 
-    /// Run a command and return its `data` field.
+    /// Run a command and return its `data` field, waiting up to five seconds for a reply.
     ///
     /// `Ok(None)` means mpv answered with an error — an unknown property, or one this build does not
     /// expose. That is information, not a failure: an older mpv missing one property should not end
     /// the run.
     pub fn command(&mut self, args: &[&str]) -> std::io::Result<Option<Value>> {
+        self.command_timeout(args, Duration::from_secs(5))
+    }
+
+    /// Same as [`command`](Self::command), but with an explicit deadline instead of the fixed five
+    /// seconds.
+    ///
+    /// `remote::server`'s background state-polling loop uses this with a short deadline rather than
+    /// `command`'s own: that loop and every client's own commands share one single-threaded driver
+    /// (`drive_mpv`), so a slow reply to a routine property poll must never be allowed to block a
+    /// real command — like the `Play` a client is waiting on — for as long as `command`'s own
+    /// generous five-second budget. A stale poll reading back as "unknown" for one cycle is a far
+    /// smaller cost than a client's command appearing to hang.
+    pub fn command_timeout(
+        &mut self,
+        args: &[&str],
+        timeout: Duration,
+    ) -> std::io::Result<Option<Value>> {
         self.next_id += 1;
         let id = self.next_id;
         let quoted: Vec<String> = args.iter().map(|a| json::quote(a)).collect();
         self.send(&format!("{{\"command\":[{}],\"request_id\":{id}}}", quoted.join(",")))?;
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + timeout;
         loop {
             let Some(v) = self.recv_until(deadline) else {
                 return Ok(None); // timed out; the caller treats a missing answer as unknown
@@ -166,11 +195,21 @@ impl Mpv {
 
     /// Read a property, or `None` when this build does not expose it.
     pub fn get(&mut self, property: &str) -> Option<Value> {
-        self.command(&["get_property", property]).ok().flatten()
+        self.get_timeout(property, Duration::from_secs(5))
+    }
+
+    /// Same as [`get`](Self::get), with an explicit deadline — see
+    /// [`command_timeout`](Self::command_timeout) for why this exists.
+    pub fn get_timeout(&mut self, property: &str, timeout: Duration) -> Option<Value> {
+        self.command_timeout(&["get_property", property], timeout).ok().flatten()
     }
 
     pub fn get_string(&mut self, property: &str) -> Option<String> {
-        match self.get(property)? {
+        self.get_string_timeout(property, Duration::from_secs(5))
+    }
+
+    pub fn get_string_timeout(&mut self, property: &str, timeout: Duration) -> Option<String> {
+        match self.get_timeout(property, timeout)? {
             Value::Str(s) if !s.is_empty() => Some(s),
             Value::Num(n) => Some(format!("{n}")),
             Value::Bool(b) => Some(b.to_string()),
@@ -179,7 +218,11 @@ impl Mpv {
     }
 
     pub fn get_f64(&mut self, property: &str) -> Option<f64> {
-        self.get(property)?.as_f64()
+        self.get_f64_timeout(property, Duration::from_secs(5))
+    }
+
+    pub fn get_f64_timeout(&mut self, property: &str, timeout: Duration) -> Option<f64> {
+        self.get_timeout(property, timeout)?.as_f64()
     }
 
     /// Wait for the next event, up to `timeout`.
@@ -316,5 +359,59 @@ mod tests {
         // A path with a quote or a backslash in it would otherwise produce a malformed command that
         // mpv rejects — and the file would look unplayable when it is fine.
         assert_eq!(json::quote(r#"C:\Media\a "b".mkv"#), r#""C:\\Media\\a \"b\".mkv""#);
+    }
+
+    fn silent_mpv(rx: Receiver<Value>) -> Mpv {
+        Mpv {
+            writer: Box::new(std::io::sink()),
+            rx,
+            next_id: 0,
+            queued: std::collections::VecDeque::new(),
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn a_reply_within_the_short_deadline_still_answers() {
+        let (tx, rx) = channel();
+        let mut mpv = silent_mpv(rx);
+        tx.send(parse(r#"{"data":"idle","request_id":1,"error":"success"}"#).unwrap()).unwrap();
+        let data =
+            mpv.command_timeout(&["get_property", "path"], Duration::from_millis(50)).unwrap();
+        assert_eq!(data.as_ref().and_then(Value::as_str), Some("idle"));
+    }
+
+    /// The whole point of `command_timeout`: a caller that cannot afford `command`'s own five-second
+    /// wait (`remote::server`'s background state poll, so it never blocks a real client command for
+    /// that long) gets to bound it itself instead.
+    #[test]
+    fn a_reply_that_never_arrives_gives_up_at_the_caller_chosen_deadline_not_five_seconds() {
+        let (_tx, rx) = channel::<Value>();
+        let mut mpv = silent_mpv(rx);
+        let start = Instant::now();
+        let data =
+            mpv.command_timeout(&["get_property", "path"], Duration::from_millis(50)).unwrap();
+        assert_eq!(data, None);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must give up at the short deadline, not command()'s own five seconds: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn get_string_and_get_f64_timeout_variants_parse_the_same_as_their_defaults() {
+        let (tx, rx) = channel();
+        let mut mpv = silent_mpv(rx);
+        tx.send(parse(r#"{"data":"in.mkv","request_id":1,"error":"success"}"#).unwrap()).unwrap();
+        assert_eq!(
+            mpv.get_string_timeout("path", Duration::from_millis(50)),
+            Some("in.mkv".to_string())
+        );
+
+        let (tx, rx) = channel();
+        let mut mpv = silent_mpv(rx);
+        tx.send(parse(r#"{"data":42.5,"request_id":1,"error":"success"}"#).unwrap()).unwrap();
+        assert_eq!(mpv.get_f64_timeout("duration", Duration::from_millis(50)), Some(42.5));
     }
 }

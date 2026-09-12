@@ -1,14 +1,15 @@
 //! The wire protocol between `lumen serve` and a remote client (phone, watch, eventually web).
 //!
-//! **Newline-delimited JSON over a plain TCP socket, not WebSocket.** This is a deliberate choice,
-//! not a shortcut. mpv's own IPC protocol — which `crate::ipc` already speaks — is exactly this
-//! shape: one JSON object per line, read with a blocking loop. Extending that same shape from a
-//! local socket to a LAN socket costs nothing new to understand and nothing new to depend on. A
-//! WebSocket server needs an HTTP upgrade handshake (parsing headers, computing
-//! `Sec-WebSocket-Accept`, which means either a hand-rolled SHA-1 or another dependency) for a
-//! capability this protocol does not need yet: there is no browser client today, and when one shows
-//! up a small WS-to-TCP bridge is a bounded, separate piece of work rather than a reason to carry
-//! that machinery now.
+//! **Newline-delimited JSON over TLS, not WebSocket.** This is a deliberate choice, not a shortcut.
+//! mpv's own IPC protocol — which `crate::ipc` already speaks — is exactly this shape: one JSON
+//! object per line, read with a blocking loop. Extending that same shape from a local socket to a LAN
+//! socket costs nothing new to understand and nothing new to depend on. A WebSocket server needs an
+//! HTTP upgrade handshake (parsing headers, computing `Sec-WebSocket-Accept`, which means either a
+//! hand-rolled SHA-1 or another dependency) for a capability this protocol does not need yet: there is
+//! no browser client today, and when one shows up a small WS-to-TCP bridge is a bounded, separate
+//! piece of work rather than a reason to carry that machinery now. The framing here is plain
+//! newline-delimited lines either way; see `remote/tls.rs` for why the *bytes on the wire* stopped
+//! being plaintext.
 //!
 //! **Push, not poll.** The server writes a new `State` line whenever what is playing changes; the
 //! client just reads its socket. A watch polling over Bluetooth every few seconds to ask "anything
@@ -69,6 +70,23 @@ pub enum ClientMessage {
     Previous {
         id: String,
     },
+    /// `docs/15-next-generation-engines.md` §D: everything a headless, console-less `lumen serve`
+    /// cannot otherwise tell a paired client about itself.
+    Health {
+        id: String,
+    },
+    /// Re-walk the library root right now and make `PlaybackState::library_version` real. `docs/15`
+    /// §A names this exact shape — "periodic re-diff on `serve` startup plus the manual command" — as
+    /// the legitimate MVP, distinct from (and a smaller slice than) the persisted, incremental
+    /// `lumen-index`-backed engine the rest of that section describes and this does not attempt: no
+    /// on-disk index, no diffing against a previous run, just a fresh scan replacing the in-memory one
+    /// `server.rs` already holds. This is also what `server.rs`'s background filesystem watcher
+    /// (`spawn_library_watcher`) calls automatically once a burst of on-disk changes settles — this
+    /// message and that watcher share one `rescan_library` function, so a client that asks explicitly
+    /// and a change that happens on its own produce identically-shaped results.
+    Rescan {
+        id: String,
+    },
 }
 
 impl ClientMessage {
@@ -84,7 +102,9 @@ impl ClientMessage {
             | Self::Seek { id, .. }
             | Self::SetVolume { id, .. }
             | Self::Next { id, .. }
-            | Self::Previous { id, .. } => id,
+            | Self::Previous { id, .. }
+            | Self::Health { id, .. }
+            | Self::Rescan { id, .. } => id,
         }
     }
 
@@ -123,6 +143,8 @@ impl ClientMessage {
             }
             "next" => Some(Self::Next { id }),
             "previous" => Some(Self::Previous { id }),
+            "health" => Some(Self::Health { id }),
+            "rescan" => Some(Self::Rescan { id }),
             _ => None,
         }
     }
@@ -153,6 +175,48 @@ pub enum ServerMessage {
 pub enum ReplyBody {
     Ok,
     Library(Vec<LibraryEntry>),
+    Health(HealthReport),
+    /// A completed [`ClientMessage::Rescan`]: how many playable files the fresh walk found, and the
+    /// `library_version` it now stands at — handed back directly rather than making the client wait
+    /// for the next `State` push (which will also carry it, on the driver thread's own ~400ms cadence)
+    /// to learn whether its trigger actually did anything.
+    Rescan {
+        file_count: u64,
+        library_version: u64,
+    },
+}
+
+/// `docs/15-next-generation-engines.md` §D. Every field a paired client cannot otherwise learn about
+/// a headless server: is the player actually responsive, is the pinned certificate about to expire,
+/// is the library index stale, is the disk about to fill, how many other clients are connected.
+///
+/// Deliberately not a general metrics/telemetry payload — see the design doc's own "why this is the
+/// right shape" section — just the handful of things this specific deployment model (no console, no
+/// window, phone-first control) makes otherwise unanswerable without walking over to the machine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HealthReport {
+    /// How long mpv took to answer a basic property query, this request. Always present when the
+    /// reply itself arrives at all — if mpv were wedged badly enough not to answer, this whole
+    /// request would time out as a protocol-level `Error` instead (the same fate every other command
+    /// already has for a wedged player), which is itself the actionable "player is not responding"
+    /// signal rather than something this field needs to encode a degraded case for.
+    pub mpv_roundtrip_ms: u64,
+    /// Seconds until the pinned TLS certificate's `not_after`. Negative if it has already lapsed.
+    /// `None` for a certificate persisted before expiry was tracked at all — see `tls::ServerCert`.
+    pub tls_cert_expires_in_secs: Option<i64>,
+    /// Unix seconds of the library index's (`docs/15` §A) last successful save. `None` when this
+    /// library has never been reindexed — `lumen serve` itself never writes this file, only `lumen
+    /// reindex`/`lumen verify` do, so a server that has only ever been scanned in memory reports this
+    /// honestly as unknown rather than claiming freshness it cannot back up.
+    pub library_last_indexed_unix_secs: Option<u64>,
+    /// Free bytes on the volume holding the served library. `None` if the platform call itself
+    /// failed — reported as unknown rather than a fabricated number.
+    pub free_disk_bytes: Option<u64>,
+    /// How many sockets are currently connected and authenticated — not how many tokens have ever
+    /// been issued, which says nothing about who is connected *right now*. An approximation, not a
+    /// guarantee: a peer that vanishes without a clean TCP close (`remote::server::ActiveClientGuard`
+    /// documents exactly why) still counts until something tries to write to it and fails.
+    pub paired_client_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -218,6 +282,24 @@ impl ServerMessage {
                         entries.join(",")
                     )
                 }
+                ReplyBody::Rescan { file_count, library_version } => format!(
+                    "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":{{\"file_count\":{},\
+                     \"library_version\":{}}}}}",
+                    quote(id),
+                    file_count,
+                    library_version,
+                ),
+                ReplyBody::Health(h) => format!(
+                    "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":{{\"mpv_roundtrip_ms\":{},\
+                     \"tls_cert_expires_in_secs\":{},\"library_last_indexed_unix_secs\":{},\
+                     \"free_disk_bytes\":{},\"paired_client_count\":{}}}}}",
+                    quote(id),
+                    h.mpv_roundtrip_ms,
+                    opt_i64(h.tls_cert_expires_in_secs),
+                    opt_u64(h.library_last_indexed_unix_secs),
+                    opt_u64(h.free_disk_bytes),
+                    h.paired_client_count,
+                ),
             },
             Self::Error { id, message } => format!(
                 "{{\"type\":\"reply\",\"id\":{},\"ok\":false,\"error\":{}}}",
@@ -226,6 +308,14 @@ impl ServerMessage {
             ),
         }
     }
+}
+
+fn opt_i64(n: Option<i64>) -> String {
+    n.map_or_else(|| "null".to_string(), |v| v.to_string())
+}
+
+fn opt_u64(n: Option<u64>) -> String {
+    n.map_or_else(|| "null".to_string(), |v| v.to_string())
 }
 
 fn now_playing_json(np: &NowPlaying) -> String {
@@ -365,6 +455,39 @@ mod tests {
         assert!(ClientMessage::Auth { id: "1".into(), token: "x".into() }.is_pre_auth());
         assert!(!ClientMessage::Play { id: "1".into(), path: "x".into() }.is_pre_auth());
         assert!(!ClientMessage::Pause { id: "1".into() }.is_pre_auth());
+        // Server health is itself information an unauthenticated LAN listener should not get for
+        // free -- disk space, cert expiry and connected-client count are not for anyone who merely
+        // opened a socket.
+        assert!(!ClientMessage::Health { id: "1".into() }.is_pre_auth());
+    }
+
+    #[test]
+    fn a_health_request_parses_and_carries_its_id() {
+        let line = obj(&[("type", Value::Str("health".into())), ("id", Value::Str("9".into()))]);
+        assert_eq!(ClientMessage::parse(&line).unwrap(), ClientMessage::Health { id: "9".into() });
+    }
+
+    #[test]
+    fn a_rescan_request_parses_and_carries_its_id() {
+        let line = obj(&[("type", Value::Str("rescan".into())), ("id", Value::Str("11".into()))]);
+        assert_eq!(ClientMessage::parse(&line).unwrap(), ClientMessage::Rescan { id: "11".into() });
+        assert!(
+            !ClientMessage::Rescan { id: "11".into() }.is_pre_auth(),
+            "an unauthenticated socket must not be able to trigger a filesystem walk"
+        );
+    }
+
+    #[test]
+    fn a_rescan_reply_carries_the_fresh_count_and_version() {
+        let msg = ServerMessage::Reply {
+            id: "4".into(),
+            result: ReplyBody::Rescan { file_count: 137, library_version: 3 },
+        };
+        let line = msg.to_line();
+        let v = crate::json::parse(line.trim_end()).expect("must be well-formed JSON");
+        let result = v.get("result").expect("a rescan reply must carry a result object");
+        assert_eq!(result.get("file_count").and_then(Value::as_f64), Some(137.0));
+        assert_eq!(result.get("library_version").and_then(Value::as_f64), Some(3.0));
     }
 
     #[test]
@@ -499,6 +622,79 @@ mod tests {
         assert!(line.contains("\"path\":\"/b.mkv\""));
         // The generic reader used elsewhere confirms it is at least well-formed JSON.
         assert!(crate::json::parse(line.trim_end()).is_ok());
+    }
+
+    #[test]
+    fn a_health_reply_carries_every_known_field() {
+        let msg = ServerMessage::Reply {
+            id: "7".into(),
+            result: ReplyBody::Health(HealthReport {
+                mpv_roundtrip_ms: 12,
+                tls_cert_expires_in_secs: Some(1_000_000),
+                library_last_indexed_unix_secs: Some(1_700_000_000),
+                free_disk_bytes: Some(999_999_999),
+                paired_client_count: 2,
+            }),
+        };
+        let line = msg.to_line();
+        let v = crate::json::parse(line.trim_end()).expect("must be well-formed JSON");
+        let result = v.get("result").expect("a health reply must carry a result object");
+        assert_eq!(result.get("mpv_roundtrip_ms").and_then(Value::as_f64), Some(12.0));
+        assert_eq!(
+            result.get("tls_cert_expires_in_secs").and_then(Value::as_f64),
+            Some(1_000_000.0)
+        );
+        assert_eq!(
+            result.get("library_last_indexed_unix_secs").and_then(Value::as_f64),
+            Some(1_700_000_000.0)
+        );
+        assert_eq!(result.get("free_disk_bytes").and_then(Value::as_f64), Some(999_999_999.0));
+        assert_eq!(result.get("paired_client_count").and_then(Value::as_f64), Some(2.0));
+    }
+
+    #[test]
+    fn a_health_reply_reports_unknown_fields_as_null_rather_than_a_fabricated_value() {
+        // A library that has never been reindexed, and a certificate persisted before expiry
+        // tracking existed, are both real states -- not something to paper over with a 0 or a made-up
+        // timestamp that would read as a genuine answer.
+        let msg = ServerMessage::Reply {
+            id: "8".into(),
+            result: ReplyBody::Health(HealthReport {
+                mpv_roundtrip_ms: 5,
+                tls_cert_expires_in_secs: None,
+                library_last_indexed_unix_secs: None,
+                free_disk_bytes: None,
+                paired_client_count: 0,
+            }),
+        };
+        let line = msg.to_line();
+        let v = crate::json::parse(line.trim_end()).unwrap();
+        let result = v.get("result").unwrap();
+        assert_eq!(result.get("tls_cert_expires_in_secs"), Some(&Value::Null));
+        assert_eq!(result.get("library_last_indexed_unix_secs"), Some(&Value::Null));
+        assert_eq!(result.get("free_disk_bytes"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn a_negative_cert_expiry_survives_the_wire_for_an_already_lapsed_certificate() {
+        // Negative, not clamped to zero or omitted: "expired 3 days ago" and "expires in 3 days" are
+        // different situations a client needs to tell apart, not the same "expiring soon" bucket.
+        let msg = ServerMessage::Reply {
+            id: "9".into(),
+            result: ReplyBody::Health(HealthReport {
+                mpv_roundtrip_ms: 1,
+                tls_cert_expires_in_secs: Some(-259_200),
+                library_last_indexed_unix_secs: None,
+                free_disk_bytes: None,
+                paired_client_count: 0,
+            }),
+        };
+        let line = msg.to_line();
+        let v = crate::json::parse(line.trim_end()).unwrap();
+        assert_eq!(
+            v.get("result").unwrap().get("tls_cert_expires_in_secs").and_then(Value::as_f64),
+            Some(-259_200.0)
+        );
     }
 
     #[test]

@@ -1,5 +1,14 @@
 # 09 — Roadmap, Effort & Team
 
+**Current priority: Windows first, Linux second — see `docs/04-platform-strategy.md`'s own scoping
+note.** What actually exists today (`crates/lumen-play`, a CLI player/library-test-harness plus
+`lumen serve`) is not the multi-shell, multi-platform product this document plans toward; it is the
+much narrower slice P0's own spikes below were meant to de-risk before that larger build started.
+None of those spikes (S1-S8) have actually been run, macOS/Apple work stays explicitly out of scope
+for now (`docs/04`), and the phase table's multi-year, multi-platform sequencing is still the
+original, broader strategic plan — kept as reference for a possible future revisit, not a
+description of what is currently being built, tested, or staffed.
+
 ## 1. The sequencing principle
 
 Every phase ships something a real person would use on its own. No phase is "infrastructure." If a phase's output
@@ -70,6 +79,14 @@ its bytes.
 That last one is the argument for the whole approach: it was found by
 `truncation_at_any_offset_never_panics`, a property that asserts nothing more interesting than
 "returning at all".
+
+**The table above is a snapshot from when this section was written, not the current crate list** —
+`lumen-index` (incremental reindexing/verification), `lumen-exec` (the remux execution engine),
+`lumen-segment` (HLS playlist/segment planning), `lumen-discovery` (SSDP/DLNA), and `lumen-play`
+itself (the CLI player, library scanner, and `lumen serve` remote-control/DLNA server that actually
+exercises all of the above) were all added after, closing out a 16-item codec/transcode/remux audit
+backlog in full. See each crate's own source for its current test count rather than trusting a
+number here to stay current.
 
 What `lumen-probe` answers, all without FFmpeg:
 

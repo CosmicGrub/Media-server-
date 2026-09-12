@@ -10,7 +10,7 @@ use lumen_playback::Tier;
 
 use crate::fidelity::{Fidelity, ProfileOutcome};
 use crate::json::quote;
-use crate::scan::{MediaKind, Scan, ScannedFile, duplicate_groups, group};
+use crate::scan::{MediaKind, Scan, ScannedFile, duplicate_groups, group, verify_duplicate_group};
 use crate::session::{FileResult, Outcome, SessionReport};
 
 fn human_size(bytes: u64) -> String {
@@ -108,6 +108,18 @@ pub fn render_scan(scan: &Scan) -> String {
             human_size(wasted)
         ));
         for g in dupes.iter().take(15) {
+            // The identity sketch is a fast candidate filter, not a proof (see `verify_duplicate_
+            // group`'s own doc) -- "same bytes under different names" is a strong enough claim to a
+            // person deciding whether to delete one that it is worth the extra read to actually check,
+            // on just this handful of candidate files rather than the whole library. A read failure
+            // (the file moved again since the scan) reports honestly as unconfirmed rather than either
+            // silently upgrading to a claim it can't back, or hiding the group entirely.
+            let paths: Vec<&std::path::Path> =
+                g.iter().map(|&i| scan.files[i].path.as_path()).collect();
+            let confirmed = verify_duplicate_group(&paths).unwrap_or(false);
+            if !confirmed {
+                s.push_str("  (unconfirmed -- content sketch matched, byte comparison did not)\n");
+            }
             for (n, &i) in g.iter().enumerate() {
                 let marker = if n == 0 { "  " } else { "  = " };
                 s.push_str(&format!(
@@ -436,7 +448,8 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
                         "      {{\"path\":{},\"outcome\":{},\"error\":{},\"seconds_played\":{},\
                          \"file_format\":{},\"video_codec\":{},\"audio_codec\":{},\"width\":{},\
                          \"height\":{},\"fps\":{},\"duration\":{},\"hwdec\":{},\"seekable\":{},\
-                         \"pixel_format\":{},\"primaries\":{},\"gamma\":{},\"hdr\":{},\
+                         \"pixel_format\":{},\"primaries\":{},\"gamma\":{},\"colormatrix\":{},\
+                         \"hdr\":{},\
                          \"tracks\":{{\"video\":{},\"audio\":{},\"subtitle\":{}}},\
                          \"fidelity\":{},\"delayed_frames\":{},\"dropped_frames\":{}}}",
                         quote(&r.path.to_string_lossy()),
@@ -455,6 +468,7 @@ pub fn render_json(scan: &Scan, session: Option<&SessionReport>) -> String {
                         opt_str(r.pixel_format.as_deref()),
                         opt_str(r.primaries.as_deref()),
                         opt_str(r.gamma.as_deref()),
+                        opt_str(r.colormatrix.as_deref()),
                         r.is_hdr(),
                         r.track_counts.video,
                         r.track_counts.audio,
@@ -698,6 +712,7 @@ mod tests {
             pixel_format: None,
             primaries: None,
             gamma: None,
+            colormatrix: None,
             seekable: None,
             audio_channels: None,
             track_counts: crate::session::TrackCounts::default(),
@@ -705,6 +720,8 @@ mod tests {
             fidelity: None,
             delayed_frames: None,
             dropped_frames: None,
+            audio_spdif_requested: false,
+            audio_out_format: None,
         }
     }
 

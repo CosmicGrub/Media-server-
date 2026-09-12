@@ -1,0 +1,18 @@
+# Scoped to the MSVC Windows target only — no effect on Linux, macOS, or the mingw-gnu
+# cross-compiled Windows target `package-windows.sh` produces.
+#
+# By default `rustc` links the MSVC C runtime dynamically, so a plain `cargo build --release`
+# lumen.exe depends on vcruntime140.dll / msvcp140.dll from the Visual C++ Redistributable. That
+# package is bundled into most Windows installs by other software, but "probably already there" is
+# not the standard the rest of this project holds the Windows build to — the mingw-gnu build already
+# verifies its own self-containment by objdump'ing for exactly this class of missing dependency
+# (`package-windows.sh`), and the native MSVC build should not need a separate excuse.
+#
+# `target-feature=+crt-static` statically links the CRT into lumen.exe instead: no redistributable
+# to have installed, nothing to fail with a "VCRUNTIME140.dll was not found" dialog on a bare
+# Windows machine — which would be a worse first impression than any error this program prints
+# itself. Verified in `.github/workflows/release.yml` by checking the built binary's import table
+# for exactly those DLL names, the same evidence-over-assumption approach `package-windows.sh` uses
+# on the other Windows build path.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
