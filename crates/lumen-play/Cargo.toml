@@ -45,6 +45,16 @@ fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 # rescan) is ~20 lines against primitives (`mpsc`, a `recv_timeout` loop) this file already leans on
 # everywhere else, so a second small crate would buy nothing a few lines here don't already cover.
 notify = "8"
+# `lumen serve`'s SIGTERM handling: without a handler installed, the OS's default disposition for
+# the signal the documented Windows Scheduled Task / systemd / Docker restart path actually sends
+# (`Install-LumenServeTask.ps1`, `docs/05`) just ends the process outright, with no chance to kill
+# the mpv child it already spawned. `unsafe_code` is denied workspace-wide, which rules out a
+# hand-rolled `sigaction`/`SetConsoleCtrlHandler` call the same way `getrandom` above was needed for
+# the OS random source. `default-features = false` plus the `termination` feature keeps this to
+# exactly SIGINT/SIGTERM/SIGHUP on Unix (`SetConsoleCtrlHandler` on Windows already catches every
+# console control event regardless of the feature) -- no extra signal surface this server has any
+# use for.
+ctrlc = { version = "3.5.2", default-features = false, features = ["termination"] }
 
 [dev-dependencies]
 # Backdating a file's or directory's own mtime in `hls.rs`'s eviction/sweep tests. `std::fs::File`

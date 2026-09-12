@@ -218,6 +218,17 @@ jobs:
     runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
+      # ci/license-gate.sh's Rust-dependency check (step 3) only runs if `cargo-deny` is already on
+      # PATH -- otherwise it just prints "not installed; skipping" and reports success, which left
+      # deny.toml's licence policy unenforced on every real CI run. `cargo install cargo-deny` would
+      # compile the tool from source (several minutes); taiki-e/install-action instead fetches the
+      # maintainer's prebuilt release binary -- seconds, not minutes. Pinned to the cargo-deny
+      # version this workflow was last verified against so a new release can't silently change
+      # what "passes" means; bump deliberately.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
       # The LGPL-only discipline from ADR-0002 is a shipping constraint, not a preference: a GPL
       # component makes the whole product GPL and forecloses the App Store. Checking it by hand is
       # how it stops being checked.

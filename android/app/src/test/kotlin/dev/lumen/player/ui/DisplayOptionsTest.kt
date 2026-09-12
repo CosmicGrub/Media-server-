@@ -1,5 +1,6 @@
 package dev.lumen.player.ui
 
+import dev.lumen.player.fold.Posture
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -51,21 +52,21 @@ class DisplayOptionsTest {
         assertEquals(
             Arrangement.Stacked,
             arrangementFor(
-                isTabletop = false, isBook = false, widthDp = 827, heightDp = 322, mode = ViewMode.Split
+                isTabletop = false, isBook = false, widthDp = 827, heightDp = 322, mode = ViewMode.Split,
             ),
         )
         // The inner display flat is genuinely big enough for two panes.
         assertEquals(
             Arrangement.SideBySide,
             arrangementFor(
-                isTabletop = false, isBook = false, widthDp = 768, heightDp = 640, mode = ViewMode.Split
+                isTabletop = false, isBook = false, widthDp = 768, heightDp = 640, mode = ViewMode.Split,
             ),
         )
         // Cover screen upright: too narrow either way.
         assertEquals(
             Arrangement.Stacked,
             arrangementFor(
-                isTabletop = false, isBook = false, widthDp = 322, heightDp = 827, mode = ViewMode.Split
+                isTabletop = false, isBook = false, widthDp = 322, heightDp = 827, mode = ViewMode.Split,
             ),
         )
     }
@@ -77,7 +78,7 @@ class DisplayOptionsTest {
                 "mode $mode must not leave a library pane on screen",
                 Arrangement.VideoOnly,
                 arrangementFor(
-                    isTabletop = false, isBook = false, widthDp = 768, heightDp = 640, mode = mode
+                    isTabletop = false, isBook = false, widthDp = 768, heightDp = 640, mode = mode,
                 ),
             )
         }
@@ -92,40 +93,60 @@ class DisplayOptionsTest {
             assertEquals(
                 Arrangement.Tabletop,
                 arrangementFor(
-                    isTabletop = true, isBook = false, widthDp = 768, heightDp = 640, mode = mode
+                    isTabletop = true, isBook = false, widthDp = 768, heightDp = 640, mode = mode,
                 ),
             )
         }
     }
 
     @Test
-    fun `book keeps its shape in every mode, the same way tabletop does`() {
-        // Book posture was detected by FoldState but never reached a layout at all before this --
-        // arrangementFor always fell through to the ordinary width/height rule, so a vertical hinge
-        // was treated exactly like a flat window of the same size. The fixed geometry (video pinned
-        // to one side of the physical hinge) is the whole reason a Book-specific layout exists, so
-        // it has to survive every view mode the same way Tabletop's does.
+    fun `book ignores view mode the same way tabletop does`() {
+        // Before this fix, arrangementFor had no isBook parameter at all: FoldState already detected
+        // Posture.Book, but a vertical hinge had nowhere to go and fell into the plain width/height
+        // rule below, so a book-held foldable could get SideBySide or Stacked depending on mode --
+        // exactly the straddling-the-crease bug this arrangement exists to prevent. Every mode has to
+        // land on Arrangement.Book here, not just some of them.
         for (mode in ViewMode.entries) {
             assertEquals(
                 Arrangement.Book,
                 arrangementFor(
-                    isTabletop = false, isBook = true, widthDp = 768, heightDp = 640, mode = mode
+                    isTabletop = false, isBook = true, widthDp = 768, heightDp = 640, mode = mode,
                 ),
             )
         }
     }
 
     @Test
-    fun `tabletop wins if both postures were somehow reported at once`() {
-        // Not a real device configuration (a hinge is either horizontal or vertical, never both), but
-        // the precedence has to be defined rather than accidental -- Tabletop is checked first in
-        // arrangementFor, so it must be what a caller sees if both flags are ever true together.
+    fun `tabletop takes precedence over book when both flags are set`() {
+        // `FoldState.postureOf` can only ever surface one hinge orientation, so a caller passing both
+        // flags true isn't a state a real device can reach -- but arrangementFor's own contract
+        // doesn't rule it out, so the ordering of the `when` above needs a pinned, tested answer
+        // rather than whichever branch happens to come first.
         assertEquals(
             Arrangement.Tabletop,
             arrangementFor(
-                isTabletop = true, isBook = true, widthDp = 768, heightDp = 640, mode = ViewMode.Split
+                isTabletop = true, isBook = true, widthDp = 768, heightDp = 640, mode = ViewMode.Split,
             ),
         )
+    }
+
+    @Test
+    fun `book splits the window at the hinge's real bounds, not an assumed half`() {
+        // A layout that assumes the hinge sits at the window's horizontal midpoint is wrong on
+        // exactly the device it exists for -- camera cutouts and sensor housings can push the crease
+        // either way. This is the regression a naive `widthDp / 2` implementation would pass on a
+        // centered hinge and fail everywhere else, so both are checked.
+
+        // Roughly centered hinge, e.g. a Fold 5 inner display around 2176px wide.
+        val centered = bookSplit(Posture.Book(hingeLeftPx = 1090, hingeRightPx = 1118))
+        assertEquals(1090, centered.videoWidthPx)
+        assertEquals(28, centered.hingeWidthPx)
+
+        // Off-center hinge -- same crease width, pushed well away from the midpoint.
+        val offCenter = bookSplit(Posture.Book(hingeLeftPx = 1600, hingeRightPx = 1628))
+        assertEquals(1600, offCenter.videoWidthPx)
+        assertEquals(28, offCenter.hingeWidthPx)
+        assertNotEquals(centered.videoWidthPx, offCenter.videoWidthPx)
     }
 
     @Test

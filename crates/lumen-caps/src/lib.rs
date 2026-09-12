@@ -157,10 +157,11 @@ pub struct DisplayCaps {
     /// colour BT.2020 content specifies, because its backlight/filter stack physically covers a
     /// narrower gamut -- DCI-P3 is the common case on real consumer HDR displays, not full BT.2020.
     pub gamut: ColorPrimaries,
-    /// Peak luminance the display can sustain, in nits. Captured for a future finer-grained
-    /// tone-map decision (how hard to roll off highlights depends on how much headroom the target
-    /// actually has) but not yet consulted anywhere -- modelled ahead of being wired in, the same
-    /// "represent the fact before acting on it" approach `stream::TelecinePattern` already took.
+    /// Peak luminance the display can sustain, in nits. Consulted by `lumen_playback::ladder` when
+    /// a forced HDR->SDR tone map is unavoidable, to grade how hard highlights must roll off
+    /// (`lumen_playback::plan::ToneMapRolloff`) from how much headroom this leaves over the
+    /// content's own mastering peak. `None` is graded as the worst case rather than assumed
+    /// capable -- see `ToneMapRolloff::for_headroom`.
     pub peak_luminance_nits: Option<u32>,
 }
 

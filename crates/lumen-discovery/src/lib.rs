@@ -2,14 +2,17 @@
 //! answers a control point's search, so something like a smart TV's "media servers" list can find
 //! `lumen serve` without being told its address.
 //!
-//! **Stage 0.** This crate is the discovery protocol machinery alone: message parsing/building
-//! ([`message`]) and a multicast [`Responder`]. It does not yet declare `lumen serve` a UPnP
-//! `MediaServer` or serve a device-description document -- doing so honestly requires a working
-//! `ContentDirectory` SOAP service behind it (a real UPnP client that finds a `MediaServer` expects
-//! to be able to browse it), which is the next stage. Advertising the device type before that service
-//! exists would be a real bug: a client would find this server, try to browse it, and get nothing.
-//! What this stage *does* provide is the generic, reusable, protocol-correct half -- any caller
-//! supplies its own list of [`Announcement`]s once it has something real to announce.
+//! **Past Stage 0.** This crate started as discovery protocol machinery alone -- message
+//! parsing/building (`message`) and a multicast [`Responder`], with no device-description document
+//! and no working `ContentDirectory` behind it, so declaring `lumen serve` a UPnP `MediaServer` would
+//! have been a real bug: a client would find it, try to browse it, and get nothing. That gap is
+//! closed. This crate now also builds the device-description document
+//! ([`build_device_description`]) and the real `ContentDirectory` SOAP surface behind it
+//! (`content_directory`: `Browse`, `Search` over a bounded criteria subset, and
+//! `GetSystemUpdateID`), and `crates/lumen-play/src/dlna.rs` wires both into `lumen serve --dlna`'s
+//! real SSDP announcements, so a control point that finds this server today can browse and stream
+//! it, not get nothing. What remains genuinely generic and reusable here is `message` and
+//! [`Responder`] -- any caller still supplies its own list of [`Announcement`]s.
 //!
 //! **Deliberately unauthenticated, and deliberately not on `lumen serve`'s existing TLS listener.**
 //! SSDP and the DLNA `ContentDirectory`/`AVTransport` services it is meant to advertise are

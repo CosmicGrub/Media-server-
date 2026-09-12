@@ -67,7 +67,7 @@ use lumen_discovery::{
 };
 use lumen_model::Container;
 
-use crate::scan::Scan;
+use crate::scan::{MediaKind, Scan};
 
 /// How long an SSDP announcement stays valid before this responder re-multicasts it.
 const RENOTIFY_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -684,7 +684,7 @@ fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
                     id: tree.file_id(i).to_string(),
                     parent_id: dir.id.clone(),
                     title: f.label(),
-                    class: object_class_for(f.container),
+                    class: object_class_for(f.kind),
                     resource: Some(DidlResource {
                         url: format!("{}/dlna/stream/{}", ctx.base_url, tree.file_id(i)),
                         mime_type: content_type_for(f.container, f.extension.as_deref())
@@ -732,7 +732,7 @@ fn handle_browse(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
                             id: tree.file_id(i).to_string(),
                             parent_id: parent_id.clone(),
                             title: f.label(),
-                            class: object_class_for(f.container),
+                            class: object_class_for(f.kind),
                             resource: Some(DidlResource {
                                 url: format!("{}/dlna/stream/{}", ctx.base_url, tree.file_id(i)),
                                 mime_type: content_type_for(f.container, f.extension.as_deref())
@@ -825,7 +825,7 @@ fn handle_search(tcp: &mut TcpStream, soap: &str, ctx: &DlnaContext) {
                 // already does.
                 parent_id: tree.file_parent.get(i).cloned().unwrap_or_default(),
                 title: f.label(),
-                class: object_class_for(f.container),
+                class: object_class_for(f.kind),
                 resource: Some(DidlResource {
                     url: format!("{}/dlna/stream/{}", ctx.base_url, tree.file_id(i)),
                     mime_type: content_type_for(f.container, f.extension.as_deref()).to_string(),
@@ -948,23 +948,22 @@ fn serve_stream(tcp: &mut TcpStream, req: &HttpRequest, id: &str, ctx: &DlnaCont
     }
 }
 
-fn object_class_for(container: Option<Container>) -> ObjectClass {
-    match container {
-        Some(
-            Container::Matroska
-            | Container::WebM
-            | Container::Mp4
-            | Container::FragmentedMp4
-            | Container::MpegTs
-            | Container::MpegPs
-            | Container::Avi
-            | Container::Asf
-            | Container::Flv
-            | Container::Ogg,
-        ) => ObjectClass::VideoItem,
-        _ => ObjectClass::VideoItem, // Honest default: this crate does not yet distinguish audio-only
-                                     // scans by container alone; refining this is future work, not a
-                                     // claim every listed item is definitely video today.
+/// `scan::classify`'s `MediaKind`, not `container` alone, is what actually distinguishes an
+/// audio-only file: every `Container` this crate recognises (`Matroska`, `Mp4`, `Ogg`, ...) can
+/// legally carry either video or audio-only content -- `Ogg` in particular is exactly as much
+/// "Vorbis audio" as "Theora video" from its magic bytes alone (`lumen_probe::magic` sniffs both to
+/// the same `Container::Ogg`) -- so a container-only match could never tell an audio-only `.ogg` from
+/// a video one. `MediaKind::Audio` is `scan::classify`'s own answer to exactly that question (mp3,
+/// flac, wav, m4a/aac, ogg, opus, and the rest of `AUDIO_EXTS`, ahead of any container guess), so
+/// reusing it here means an audio file is never misreported as `videoItem` to a DLNA client.
+fn object_class_for(kind: MediaKind) -> ObjectClass {
+    match kind {
+        MediaKind::Audio => ObjectClass::AudioItem,
+        // Every other kind `handle_browse`/`handle_search` ever calls this with is `Video` (only
+        // `scan.playable()` -- `Video` or `Audio` -- ever reaches a DIDL item); `Subtitle`/`Other`
+        // are listed here only so the match stays exhaustive against a kind neither call site can
+        // actually pass.
+        _ => ObjectClass::VideoItem,
     }
 }
 
@@ -2027,10 +2026,59 @@ mod tests {
     }
 
     #[test]
-    fn object_class_is_video_for_every_known_video_container_and_the_unknown_default() {
-        assert_eq!(object_class_for(Some(Container::Matroska)), ObjectClass::VideoItem);
-        assert_eq!(object_class_for(Some(Container::Mp4)), ObjectClass::VideoItem);
-        assert_eq!(object_class_for(None), ObjectClass::VideoItem, "honest default, not a guess");
+    fn object_class_is_audio_only_for_media_kind_audio_and_video_otherwise() {
+        assert_eq!(object_class_for(MediaKind::Audio), ObjectClass::AudioItem);
+        assert_eq!(object_class_for(MediaKind::Video), ObjectClass::VideoItem);
+        assert_eq!(
+            object_class_for(MediaKind::Other),
+            ObjectClass::VideoItem,
+            "honest default for a kind no real Browse/Search result ever carries, not a guess"
+        );
+    }
+
+    #[test]
+    fn browse_reports_audioitem_for_an_audio_only_file_and_videoitem_for_a_video_one() {
+        let (_d, root, scan, tree) =
+            scan_tree("object-class", &[("Song.mp3", b"a"), ("Movie.mkv", b"b")]);
+        let ctx = test_context(tree, scan, root);
+
+        let response = browse(&ctx, "0", "BrowseDirectChildren", 0, 0);
+        let didl = result_didl(&response);
+        // `dc:title` and `upnp:class` are adjacent, in that order (see `build_didl_lite`), and
+        // `lumen_match::parse` titles a bare `Song.mp3`/`Movie.mkv` by stripping the extension alone
+        // -- pairing the two here ties the assertion to the real title text a client would show next
+        // to the class, without depending on container sniffing having recognised these zero-content
+        // test files (it has not: there is no real MKV/MP3 signature in `b"a"`/`b"b"`, so `kind`,
+        // decided by extension per `AUDIO_EXTS`/`VIDEO_EXTS`, is the only thing telling them apart).
+        assert!(
+            didl.contains(
+                "<dc:title>Song</dc:title><upnp:class>object.item.audioItem</upnp:class>"
+            ),
+            "an mp3 must be listed as audioItem, not the videoItem fallback: {didl}"
+        );
+        assert!(
+            didl.contains(
+                "<dc:title>Movie</dc:title><upnp:class>object.item.videoItem</upnp:class>"
+            ),
+            "an mkv must still be listed as videoItem: {didl}"
+        );
+    }
+
+    #[test]
+    fn search_also_reports_audioitem_for_an_audio_only_file() {
+        let (_d, root, scan, tree) =
+            scan_tree("search-object-class", &[("Music/Track.flac", b"a")]);
+        let ctx = test_context(tree, scan, root);
+
+        let response = search(&ctx, "0", "*", 0, 0);
+        let didl = result_didl(&response);
+        assert!(
+            didl.contains(
+                "<upnp:class>object.item.audioItem</upnp:class>\
+                 <res protocolInfo=\"http-get:*:audio/flac:*\""
+            ),
+            "Search must classify an audio-only file the same way Browse does: {didl}"
+        );
     }
 
     #[test]

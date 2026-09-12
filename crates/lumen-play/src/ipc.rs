@@ -20,7 +20,9 @@ use crate::json::{self, Value};
 /// Platform-appropriate socket path.
 pub fn default_ipc_path(tag: &str) -> String {
     if cfg!(windows) {
-        format!(r"\\.\pipe\lumen-{tag}")
+        // Same reasoning as the Unix branch below: two lumen instances (e.g. `serve` and `play`
+        // running at once, or two `serve`s on different ports) must not land on the same pipe name.
+        format!(r"\\.\pipe\lumen-{tag}-{}", std::process::id())
     } else {
         // Not /tmp: a multi-user machine shares it, and a predictable name there is a socket another
         // user can create first. The runtime dir is per-user.
@@ -295,7 +297,7 @@ mod tests {
     #[test]
     fn ipc_paths_are_per_process_so_two_runs_do_not_collide() {
         let a = default_ipc_path("play");
-        assert!(a.contains(&std::process::id().to_string()) || cfg!(windows), "{a}");
+        assert!(a.contains(&std::process::id().to_string()), "{a}");
     }
 
     /// The queueing behaviour, exercised without a socket: `command` must preserve events it meets

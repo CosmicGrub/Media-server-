@@ -74,7 +74,12 @@ pub enum MediaKind {
     Other,
 }
 
-#[derive(Debug, Clone)]
+// `PartialEq` is derived (not just `Clone`) so a fresh `Scan` can be compared against a previous one
+// by content -- see `remote::server::rescan_library`, which uses exactly this to decide whether a
+// rescan actually found anything different before bumping `library_version`. Every field type here
+// already derives `PartialEq` for its own crate's reasons (`Container`, `Confidence`, `ContentSketch`,
+// `ParsedName`), so this adds nothing new to derive transitively.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScannedFile {
     pub path: PathBuf,
     pub size: u64,
@@ -177,7 +182,10 @@ pub struct ScanOptions {
     pub max_depth: Option<usize>,
 }
 
-#[derive(Debug, Clone, Default)]
+// `PartialEq`, for the same reason `ScannedFile` above derives it -- `rescan_library` compares a
+// whole fresh `Scan` against the previous one by content, the same style `SharedState::publish`
+// already uses to decide whether a `PlaybackState` actually changed before bumping its own version.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scan {
     pub files: Vec<ScannedFile>,
     /// Directories that could not be read, with the reason. Recorded rather than fatal: one
