@@ -87,6 +87,17 @@ pub enum ClientMessage {
     Rescan {
         id: String,
     },
+    /// `docs/15-next-generation-engines.md` §A's own sketch of this exact message: a substring,
+    /// case-insensitive search over the library as it currently stands, answered by
+    /// [`ReplyBody::SearchResults`]. That doc sketches it as arriving "once search is cheap because
+    /// the index is real" — this is the smaller slice actually built: matched against the same
+    /// in-memory `Scan` every `Library` reply already reads from, not a persisted index, so a client
+    /// gets a real (if unranked) result today rather than waiting on the larger `lumen-index`-backed
+    /// engine that section otherwise describes.
+    Search {
+        id: String,
+        query: String,
+    },
 }
 
 impl ClientMessage {
@@ -104,7 +115,8 @@ impl ClientMessage {
             | Self::Next { id, .. }
             | Self::Previous { id, .. }
             | Self::Health { id, .. }
-            | Self::Rescan { id, .. } => id,
+            | Self::Rescan { id, .. }
+            | Self::Search { id, .. } => id,
         }
     }
 
@@ -145,6 +157,7 @@ impl ClientMessage {
             "previous" => Some(Self::Previous { id }),
             "health" => Some(Self::Health { id }),
             "rescan" => Some(Self::Rescan { id }),
+            "search" => Some(Self::Search { id, query: str_field("query")? }),
             _ => None,
         }
     }
@@ -184,6 +197,11 @@ pub enum ReplyBody {
         file_count: u64,
         library_version: u64,
     },
+    /// A completed [`ClientMessage::Search`]: every playable file whose title or path matched, in
+    /// scan order. Carries the same [`LibraryEntry`] shape `Library` does — a search result is a
+    /// filtered library listing, not a different kind of thing — and the wire form below reuses
+    /// `Library`'s own array rendering for exactly that reason.
+    SearchResults(Vec<LibraryEntry>),
 }
 
 /// `docs/15-next-generation-engines.md` §D. Every field a paired client cannot otherwise learn about
@@ -264,24 +282,19 @@ impl ServerMessage {
             }
             Self::Reply { id, result } => match result {
                 ReplyBody::Ok => format!("{{\"type\":\"reply\",\"id\":{},\"ok\":true}}", quote(id)),
-                ReplyBody::Library(items) => {
-                    let entries: Vec<String> = items
-                        .iter()
-                        .map(|e| {
-                            format!(
-                                "{{\"path\":{},\"title\":{},\"duration_ms\":{}}}",
-                                quote(&e.path),
-                                quote(&e.title),
-                                e.duration_ms
-                            )
-                        })
-                        .collect();
-                    format!(
-                        "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":[{}]}}",
-                        quote(id),
-                        entries.join(",")
-                    )
-                }
+                ReplyBody::Library(items) => format!(
+                    "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":[{}]}}",
+                    quote(id),
+                    library_entries_json(items)
+                ),
+                // Same wire shape as `Library` above -- a search result is a filtered library
+                // listing, not a different kind of thing, so it reuses that exact array rendering
+                // rather than a second, drifting copy of it.
+                ReplyBody::SearchResults(items) => format!(
+                    "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":[{}]}}",
+                    quote(id),
+                    library_entries_json(items)
+                ),
                 ReplyBody::Rescan { file_count, library_version } => format!(
                     "{{\"type\":\"reply\",\"id\":{},\"ok\":true,\"result\":{{\"file_count\":{},\
                      \"library_version\":{}}}}}",
@@ -316,6 +329,24 @@ fn opt_i64(n: Option<i64>) -> String {
 
 fn opt_u64(n: Option<u64>) -> String {
     n.map_or_else(|| "null".to_string(), |v| v.to_string())
+}
+
+/// The comma-joined `{"path":...,"title":...,"duration_ms":...}` entries shared by `Library`'s and
+/// `SearchResults`' own `to_json` arms — split out so the two never drift into two differently-shaped
+/// renderings of the exact same [`LibraryEntry`].
+fn library_entries_json(items: &[LibraryEntry]) -> String {
+    items
+        .iter()
+        .map(|e| {
+            format!(
+                "{{\"path\":{},\"title\":{},\"duration_ms\":{}}}",
+                quote(&e.path),
+                quote(&e.title),
+                e.duration_ms
+            )
+        })
+        .collect::<Vec<String>>()
+        .join(",")
 }
 
 fn now_playing_json(np: &NowPlaying) -> String {
@@ -475,6 +506,46 @@ mod tests {
             !ClientMessage::Rescan { id: "11".into() }.is_pre_auth(),
             "an unauthenticated socket must not be able to trigger a filesystem walk"
         );
+    }
+
+    #[test]
+    fn a_search_request_parses_and_carries_its_query() {
+        let line = obj(&[
+            ("type", Value::Str("search".into())),
+            ("id", Value::Str("12".into())),
+            ("query", Value::Str("interstellar".into())),
+        ]);
+        assert_eq!(
+            ClientMessage::parse(&line).unwrap(),
+            ClientMessage::Search { id: "12".into(), query: "interstellar".into() }
+        );
+        assert!(
+            !ClientMessage::Search { id: "12".into(), query: "x".into() }.is_pre_auth(),
+            "an unauthenticated socket must not be able to search the library any more than list it"
+        );
+    }
+
+    #[test]
+    fn a_search_without_a_query_is_refused_rather_than_guessed_at() {
+        let line = obj(&[("type", Value::Str("search".into())), ("id", Value::Str("13".into()))]);
+        assert_eq!(ClientMessage::parse(&line), None);
+    }
+
+    #[test]
+    fn a_search_reply_carries_every_matching_entry() {
+        let msg = ServerMessage::Reply {
+            id: "14".into(),
+            result: ReplyBody::SearchResults(vec![LibraryEntry {
+                path: "/a.mkv".into(),
+                title: "A".into(),
+                duration_ms: 1000,
+            }]),
+        };
+        let line = msg.to_line();
+        assert!(line.contains("\"path\":\"/a.mkv\""));
+        // Same wire shape a `Library` reply already carries -- a search result is a filtered library
+        // listing, not a second kind of thing on the wire.
+        assert!(crate::json::parse(line.trim_end()).is_ok());
     }
 
     #[test]

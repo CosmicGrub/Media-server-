@@ -52,6 +52,51 @@ pub enum ContainerPlan {
     Unavailable,
 }
 
+/// How hard a forced HDR->SDR tone map needs to compress highlights, graded by how much peak-
+/// luminance headroom the display actually has over the content's own mastering peak. Ordered like
+/// [`Tier`]: the tighter the headroom, the earlier and harder the knee has to come in to keep
+/// highlight detail from clipping outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ToneMapRolloff {
+    /// Display peak meets or exceeds the content's mastering peak: only mild compression is needed
+    /// near the very top of the range.
+    Gentle,
+    /// Display peak covers roughly half the content's mastering peak or more: a mid knee is needed
+    /// to avoid crushing highlight detail.
+    Moderate,
+    /// Display peak is well under the content's mastering peak: highlights must be compressed hard
+    /// and early.
+    Aggressive,
+}
+
+impl ToneMapRolloff {
+    /// `docs/11` names no canonical mastering-peak default, so an untagged stream (no SMPTE ST 2086
+    /// metadata) is graded against 1,000 nits -- the same "real flagship consumer panel" reference
+    /// point [`lumen_caps::DisplayCaps::hdr_4k`] already commits to, not a mastering-monitor figure.
+    const DEFAULT_CONTENT_PEAK_NITS: u32 = 1_000;
+
+    /// Grade the rolloff a forced tone map needs from the display's `peak_luminance_nits` and the
+    /// content's own mastering peak (falling back to [`Self::DEFAULT_CONTENT_PEAK_NITS`] when the
+    /// stream carries no mastering metadata).
+    ///
+    /// An unreported display peak is graded [`Self::Aggressive`] rather than assumed capable -- the
+    /// same "unmeasured must not be treated as fine" stance the network-headroom check takes in
+    /// `ladder.rs`, just pointed the safe direction for a display instead of a link.
+    pub fn for_headroom(display_peak_nits: Option<u32>, content_peak_nits: Option<u32>) -> Self {
+        let Some(display) = display_peak_nits else {
+            return Self::Aggressive;
+        };
+        let content = content_peak_nits.unwrap_or(Self::DEFAULT_CONTENT_PEAK_NITS);
+        if display >= content {
+            Self::Gentle
+        } else if display.saturating_mul(2) >= content {
+            Self::Moderate
+        } else {
+            Self::Aggressive
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct VideoTranscodeSpec {
     pub codec: VideoCodec,
@@ -59,6 +104,9 @@ pub struct VideoTranscodeSpec {
     pub max_height: u32,
     pub max_bitrate_bps: Option<u64>,
     pub tone_map_to_sdr: bool,
+    /// How hard the tone map should compress highlights when `tone_map_to_sdr` is set. `None`
+    /// whenever `tone_map_to_sdr` is false -- there is nothing to grade.
+    pub tone_map_rolloff: Option<ToneMapRolloff>,
     pub deinterlace: bool,
     pub burn_in_subtitles: bool,
 }
@@ -332,6 +380,7 @@ mod tests {
             max_height: 1080,
             max_bitrate_bps: None,
             tone_map_to_sdr: false,
+            tone_map_rolloff: None,
             deinterlace: false,
             burn_in_subtitles: false,
         };
@@ -395,5 +444,54 @@ mod tests {
         assert!(p.is_blocked());
         assert_eq!(p.rejections.len(), 1);
         assert!(!p.explain()[0].is_empty());
+    }
+
+    #[test]
+    fn a_low_peak_display_gets_a_harder_rolloff_than_a_high_peak_one_for_the_same_content() {
+        // Same content, mastered at 1,000 nits. A display that can only sustain 200 nits has far
+        // less headroom than one that can sustain 4,000, and must compress highlights harder to
+        // avoid clipping them outright.
+        let dim = ToneMapRolloff::for_headroom(Some(200), Some(1_000));
+        let bright = ToneMapRolloff::for_headroom(Some(4_000), Some(1_000));
+        assert_eq!(dim, ToneMapRolloff::Aggressive);
+        assert_eq!(bright, ToneMapRolloff::Gentle);
+        assert!(dim > bright, "less headroom must never grade as an easier rolloff");
+    }
+
+    #[test]
+    fn rolloff_grades_by_the_ratio_of_display_peak_to_content_peak() {
+        // Display peak at or above the mastering peak: no real compression needed.
+        assert_eq!(ToneMapRolloff::for_headroom(Some(1_000), Some(1_000)), ToneMapRolloff::Gentle);
+        assert_eq!(ToneMapRolloff::for_headroom(Some(1_500), Some(1_000)), ToneMapRolloff::Gentle);
+        // Roughly half the headroom or more: a mid knee.
+        assert_eq!(ToneMapRolloff::for_headroom(Some(600), Some(1_000)), ToneMapRolloff::Moderate);
+        assert_eq!(ToneMapRolloff::for_headroom(Some(500), Some(1_000)), ToneMapRolloff::Moderate);
+        // Well under half: the hard case.
+        assert_eq!(
+            ToneMapRolloff::for_headroom(Some(499), Some(1_000)),
+            ToneMapRolloff::Aggressive
+        );
+        assert_eq!(
+            ToneMapRolloff::for_headroom(Some(100), Some(1_000)),
+            ToneMapRolloff::Aggressive
+        );
+    }
+
+    #[test]
+    fn unreported_display_peak_is_graded_as_the_worst_case_not_assumed_capable() {
+        // `docs/11`'s "unmeasured must not be treated as fine" stance, pointed at a display instead
+        // of a network link: a display that never reported its peak luminance gets no benefit of
+        // the doubt.
+        assert_eq!(ToneMapRolloff::for_headroom(None, Some(1_000)), ToneMapRolloff::Aggressive);
+        assert_eq!(ToneMapRolloff::for_headroom(None, None), ToneMapRolloff::Aggressive);
+    }
+
+    #[test]
+    fn untagged_content_peak_falls_back_to_the_thousand_nit_reference() {
+        // No SMPTE ST 2086 mastering metadata on the stream: graded against the same 1,000-nit
+        // reference `DisplayCaps::hdr_4k` documents as a real flagship panel, not a mastering
+        // monitor figure.
+        assert_eq!(ToneMapRolloff::for_headroom(Some(1_000), None), ToneMapRolloff::Gentle);
+        assert_eq!(ToneMapRolloff::for_headroom(Some(250), None), ToneMapRolloff::Aggressive);
     }
 }

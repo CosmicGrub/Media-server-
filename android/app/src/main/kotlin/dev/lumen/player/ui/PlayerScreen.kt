@@ -249,18 +249,18 @@ private fun TabletopLayout(
 }
 
 /**
- * Held like a book: video on one side of a vertical hinge, everything else on the other.
+ * [Posture.Book]'s counterpart to [TabletopLayout]: a vertical hinge instead of a horizontal one,
+ * video beside the crease instead of above it.
  *
- * The counterpart to [TabletopLayout] for [Posture.Book] -- posture detection has recognised a
- * vertical hinge since `FoldState.kt` was written, but until this layout existed nothing ever
- * consumed it: `arrangementFor` fell straight through to the ordinary width/height rule, so a Fold 5
- * held open like a book was laid out exactly as if it were an unfolded flat window of the same size,
- * with a video pane that could straddle the physical crease.
+ * [Posture.Book] has carried its hinge bounds since `FoldState.kt` first modeled the posture, but
+ * nothing read them before this arrangement existed -- `arrangementFor` had no case for a vertical
+ * hinge, so a book-held foldable fell into the ordinary width/height rule below and could end up with
+ * its video pane split right across the physical crease.
  *
- * Same reasoning as [TabletopLayout] for the crease itself: nothing is drawn on it, since it is a
- * visible, slightly recessed line on the hardware this build targets and a control placed there is
- * hard to read and unreliable to press. The hinge bounds arrive in pixels from `WindowInfoTracker`
- * and have to become dp for Compose, same as the tabletop case.
+ * [bookSplit] works out the pixel geometry; this function's own job is just converting those widths
+ * to dp, the same conversion [TabletopLayout] does for its horizontal hinge. The crease itself stays
+ * unrendered for the reason it does in [TabletopLayout]: it is a visible, slightly recessed seam in
+ * the display, a poor place to put anything a viewer needs to see clearly or tap reliably.
  */
 @UnstableApi
 @Composable
@@ -274,12 +274,13 @@ private fun BookLayout(
     video: @Composable (Modifier) -> Unit,
 ) {
     val density = LocalDensity.current
-    val leftWidthDp = with(density) { p.hingeLeftPx.toDp() }
-    val hingeWidthDp = with(density) { (p.hingeRightPx - p.hingeLeftPx).toDp() }
+    val split = bookSplit(p)
+    val videoWidthDp = with(density) { split.videoWidthPx.toDp() }
+    val hingeWidthDp = with(density) { split.hingeWidthPx.toDp() }
 
     Row(Modifier.fillMaxSize()) {
         Box(
-            Modifier.fillMaxHeight().width(leftWidthDp).background(Color.Black),
+            Modifier.fillMaxHeight().width(videoWidthDp).background(Color.Black),
             contentAlignment = Alignment.Center,
         ) { video(Modifier.fillMaxSize()) }
         // The crease itself. Left empty on purpose — see above.

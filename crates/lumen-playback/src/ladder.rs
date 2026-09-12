@@ -13,13 +13,13 @@
 
 use lumen_caps::{ClientCapabilities, TranscodePolicy};
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, Container, Integrity, MediaSource, SubtitleCodec,
-    SubtitleStream, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, Container, HdrFormat, Integrity, MasteringDisplay,
+    MediaSource, SubtitleCodec, SubtitleStream, VideoCodec, VideoStream,
 };
 
 use crate::plan::{
-    AudioPath, ContainerPlan, PlaybackPlan, Rejection, SubtitleDelivery, Tier, VideoPath,
-    VideoTranscodeSpec,
+    AudioPath, ContainerPlan, PlaybackPlan, Rejection, SubtitleDelivery, Tier, ToneMapRolloff,
+    VideoPath, VideoTranscodeSpec,
 };
 use crate::reason::{BitrateCause, BurnInCause, RejectReason};
 
@@ -310,9 +310,28 @@ fn decide_video(
         max_height: dc.map_or(1080, |d| d.max_height.min(v.height.max(1))),
         max_bitrate_bps: bitrate_ceiling(caps, source.bitrate_bps),
         tone_map_to_sdr: hdr.is_hdr() && !caps.display.handles_hdr(hdr),
+        tone_map_rolloff: tone_map_rolloff_for(caps, hdr, v.color.mastering),
         deinterlace: v.field_order.is_interlaced(),
         burn_in_subtitles: false,
     })
+}
+
+/// Whether a forced HDR->SDR tone map is needed and, if so, how hard it must roll off highlights —
+/// `None` when the display already handles `hdr` outright, so there is nothing to grade. Graded from
+/// the display's `peak_luminance_nits` against the stream's own mastering peak, per
+/// [`ToneMapRolloff::for_headroom`].
+fn tone_map_rolloff_for(
+    caps: &ClientCapabilities,
+    hdr: HdrFormat,
+    mastering: Option<MasteringDisplay>,
+) -> Option<ToneMapRolloff> {
+    if !hdr.is_hdr() || caps.display.handles_hdr(hdr) {
+        return None;
+    }
+    Some(ToneMapRolloff::for_headroom(
+        caps.display.peak_luminance_nits,
+        mastering.map(|m| m.max_luminance_nits),
+    ))
 }
 
 /// Prefer the most efficient codec the client can actually decode, so a forced transcode costs the
@@ -526,6 +545,8 @@ fn decide_container(
                     tone_map_to_sdr: video.is_some_and(|x| {
                         x.color.hdr.is_hdr() && !caps.display.handles_hdr(x.color.hdr)
                     }),
+                    tone_map_rolloff: video
+                        .and_then(|x| tone_map_rolloff_for(caps, x.color.hdr, x.color.mastering)),
                     deinterlace: video.is_some_and(|x| x.field_order.is_interlaced()),
                     burn_in_subtitles: false,
                 })
@@ -643,6 +664,7 @@ fn decide_subtitle(
                     .map_or(caps.display.height, |v| caps.display.height.min(v.height)),
                 max_bitrate_bps: bitrate_ceiling(caps, None),
                 tone_map_to_sdr: false,
+                tone_map_rolloff: None,
                 deinterlace: false,
                 burn_in_subtitles: true,
             }),
@@ -650,4 +672,110 @@ fn decide_subtitle(
         },
     };
     (SubtitleDelivery::BurnedIn, video_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lumen_caps::DisplayCaps;
+    use lumen_model::{
+        ChromaSubsampling, ColorInfo, ColorPrimaries, CropRect, FieldOrder, Rational, StereoMode,
+        StreamFlags, TelecinePattern, Transport,
+    };
+
+    /// A single HDR10 video stream mastered at `mastering_peak_nits`, on an otherwise-empty
+    /// Matroska source -- enough for `plan()` to have a forced tone map to decide about.
+    fn hdr_source(mastering_peak_nits: u32) -> MediaSource {
+        let mut s = MediaSource::new(Container::Matroska, Transport::Local);
+        s.video.push(VideoStream {
+            index: 0,
+            codec: VideoCodec::Hevc,
+            profile: None,
+            level: None,
+            width: 3840,
+            height: 2160,
+            sample_aspect: Rational::new(1, 1),
+            frame_rate: Some(Rational::new(24, 1)),
+            bit_depth: 10,
+            color: ColorInfo {
+                primaries: ColorPrimaries::Bt2020,
+                hdr: HdrFormat::Hdr10,
+                mastering: Some(MasteringDisplay {
+                    max_luminance_nits: mastering_peak_nits,
+                    ..Default::default()
+                }),
+                ..ColorInfo::default()
+            },
+            field_order: FieldOrder::Progressive,
+            stereo_mode: StereoMode::Mono,
+            bitrate_bps: None,
+            flags: StreamFlags::enabled(),
+            crop: CropRect::default(),
+            telecine: TelecinePattern::default(),
+            chroma: ChromaSubsampling::default(),
+        });
+        s
+    }
+
+    /// A native client that cannot tone map locally, with an SDR-only display of the given peak
+    /// luminance -- forces the HDR10 stream above into a server-side tone-mapped transcode.
+    fn sdr_only_client(display_peak_nits: Option<u32>) -> ClientCapabilities {
+        ClientCapabilities {
+            can_tone_map: false,
+            display: DisplayCaps {
+                peak_luminance_nits: display_peak_nits,
+                ..DisplayCaps::sdr_1080p()
+            },
+            ..ClientCapabilities::reference_native()
+        }
+    }
+
+    fn transcode_spec(p: &PlaybackPlan) -> &VideoTranscodeSpec {
+        match &p.video {
+            VideoPath::Transcode(spec) => spec,
+            other => panic!("expected a forced tone-mapped transcode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dim_display_gets_a_harder_rolloff_than_a_bright_one_for_the_same_content() {
+        // Same content, mastered at 1,000 nits, played on two displays that both lack the format
+        // outright and can't tone map locally, differing only in how much peak luminance they have.
+        let source = hdr_source(1_000);
+        let selection = Selection { video: Some(0), audio: None, subtitle: None };
+
+        let dim = plan(&source, selection, &sdr_only_client(Some(200)));
+        let bright = plan(&source, selection, &sdr_only_client(Some(4_000)));
+
+        let dim_spec = transcode_spec(&dim);
+        let bright_spec = transcode_spec(&bright);
+        assert!(dim_spec.tone_map_to_sdr);
+        assert!(bright_spec.tone_map_to_sdr);
+        assert_eq!(dim_spec.tone_map_rolloff, Some(ToneMapRolloff::Aggressive));
+        assert_eq!(bright_spec.tone_map_rolloff, Some(ToneMapRolloff::Gentle));
+        assert!(
+            dim_spec.tone_map_rolloff > bright_spec.tone_map_rolloff,
+            "the dimmer display must never be graded an easier rolloff than the brighter one"
+        );
+    }
+
+    #[test]
+    fn a_display_with_no_reported_peak_gets_the_hardest_rolloff() {
+        // `caps.display.peak_luminance_nits` unset must not be read as "assume it's fine" -- the
+        // same stance the ladder already takes on an unmeasured network link.
+        let source = hdr_source(1_000);
+        let selection = Selection { video: Some(0), audio: None, subtitle: None };
+        let outcome = plan(&source, selection, &sdr_only_client(None));
+        assert_eq!(transcode_spec(&outcome).tone_map_rolloff, Some(ToneMapRolloff::Aggressive));
+    }
+
+    #[test]
+    fn no_rolloff_is_graded_when_the_display_already_handles_the_hdr_format() {
+        // The reference native display supports HDR10 outright, so no tone map -- and therefore no
+        // rolloff grade -- is needed at all.
+        let source = hdr_source(1_000);
+        let selection = Selection { video: Some(0), audio: None, subtitle: None };
+        let outcome = plan(&source, selection, &ClientCapabilities::reference_native());
+        assert_eq!(outcome.video, VideoPath::Copy);
+    }
 }

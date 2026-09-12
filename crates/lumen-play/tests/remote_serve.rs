@@ -656,7 +656,11 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
 /// starts at 0 (unchanged from before this existed), a file dropped into the library after startup is
 /// invisible until a real `rescan` request re-walks the tree, and the version that comes back in the
 /// `Rescan` reply is the same one the very next unprompted `state` push carries -- not a second,
-/// independently-tracked number that could drift from what clients actually see.
+/// independently-tracked number that could drift from what clients actually see. Also proves the
+/// version only moves when a rescan actually finds something different: a rescan that sees the exact
+/// same library it already had must leave `library_version` untouched, and a later rescan that finds
+/// a genuinely new file must bump it again -- a real content comparison, not a counter that either
+/// bumps on every call or stops bumping altogether.
 #[test]
 fn rescan_makes_library_version_real_and_reflects_a_newly_added_file() {
     if !mpv_on_path() {
@@ -797,23 +801,42 @@ fn rescan_makes_library_version_real_and_reflects_a_newly_added_file() {
         "the next state push must carry the version the rescan reply just reported"
     );
 
-    // A second rescan with nothing new on disk still bumps the version -- this is a re-walk trigger,
-    // not a diff against the previous run (that finer-grained tracking is the larger, deliberately
-    // deferred `lumen-index`-backed engine `docs/15` §A describes, not this).
+    // A second rescan with nothing new on disk must NOT bump the version -- a fresh walk that finds
+    // exactly the same library it already had is not a change, and bumping anyway would spuriously
+    // invalidate every paired client's cached library listing on a rescan that found nothing.
+    // (Diffing against a previous run's *content*, not skipping unchanged files during the walk
+    // itself -- that finer-grained tracking is the larger, deliberately deferred `lumen-index`-backed
+    // engine `docs/15` §A describes, not this.)
     tls.write_all(request("3", "\"type\":\"rescan\"").as_bytes()).unwrap();
     let second_rescan = read_reply(&mut tls);
     let result = second_rescan.map("result").expect("a rescan reply must carry a result object");
     assert_eq!(num_in(&result, "file_count"), Some(2.0), "still the same two real files");
     assert_eq!(
         num_in(&result, "library_version"),
+        Some(1.0),
+        "a rescan that finds nothing different must not bump the version"
+    );
+
+    // A third rescan, after a genuinely new file appears, must bump the version again -- proof this
+    // is a real content comparison against the previous scan, not a mode that simply stopped bumping
+    // altogether. A dummy file is enough here -- `scan::scan` classifies by extension and name, not
+    // by successfully decoding the bytes (see the watcher tests below), and this rescan is never
+    // asked to play it.
+    std::fs::write(dir.0.join("Third.mkv"), b"not a real container, just needs to exist").unwrap();
+    tls.write_all(request("4", "\"type\":\"rescan\"").as_bytes()).unwrap();
+    let third_rescan = read_reply(&mut tls);
+    let result = third_rescan.map("result").expect("a rescan reply must carry a result object");
+    assert_eq!(num_in(&result, "file_count"), Some(3.0), "the fresh walk must see all three files");
+    assert_eq!(
+        num_in(&result, "library_version"),
         Some(2.0),
-        "every completed rescan bumps the version, changed or not"
+        "a rescan that genuinely finds something new must bump the version"
     );
 
     // An unauthenticated socket must not be able to trigger a filesystem walk any more than it can
     // control playback -- the same posture the existing test already proves for `pause`.
     let mut stranger = connect_tls(port, &fingerprint, Duration::from_secs(5));
-    stranger.write_all(request("4", "\"type\":\"rescan\"").as_bytes()).unwrap();
+    stranger.write_all(request("5", "\"type\":\"rescan\"").as_bytes()).unwrap();
     let refused = read_reply(&mut stranger);
     assert_eq!(
         refused.bool("ok"),
@@ -823,6 +846,424 @@ fn rescan_makes_library_version_real_and_reflects_a_newly_added_file() {
 
     let _ = server.kill();
     let _ = server.wait();
+}
+
+/// The pid of a direct child process of `parent_pid` whose command name contains `name_substr`, or
+/// `None` if no such child exists right now — polled by [`wait_for_child_pid_named`] rather than
+/// trusted on a single read, since mpv's launch is asynchronous from this test's point of view. Shells
+/// out to `ps` rather than reading `/proc` by hand: `unsafe_code` is denied workspace-wide the same
+/// way the crate's own dependencies note elsewhere, and a plain external command needs none.
+#[cfg(unix)]
+fn find_child_pid_named(parent_pid: u32, name_substr: &str) -> Option<u32> {
+    let out = std::process::Command::new("ps").args(["-eo", "pid=,ppid=,comm="]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let pid: u32 = parts.next()?.parse().ok()?;
+        let ppid: u32 = parts.next()?.parse().ok()?;
+        let comm = parts.next().unwrap_or("");
+        if ppid == parent_pid && comm.contains(name_substr) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Polls [`find_child_pid_named`] until it finds a match or `timeout` elapses — the same
+/// deadline-loop convention every other wait in this file already follows for server-side behaviour
+/// whose timing is this test's to observe, not to control.
+#[cfg(unix)]
+fn wait_for_child_pid_named(parent_pid: u32, name_substr: &str, timeout: Duration) -> Option<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(pid) = find_child_pid_named(parent_pid, name_substr) {
+            return Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The pid of *any* direct child of `parent_pid`, regardless of its command name — used where the
+/// child's `comm` is not reliably predictable up front (a shebang script executed via `binfmt_script`
+/// reports the interpreter's own name, e.g. `sh` or `dash`, not the script's), but exactly one child
+/// process is known to exist at the point this is called, so "any child" and "the child this test
+/// cares about" are the same thing.
+#[cfg(unix)]
+fn find_any_child_pid(parent_pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps").args(["-eo", "pid=,ppid="]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let pid: u32 = parts.next()?.parse().ok()?;
+        let ppid: u32 = parts.next()?.parse().ok()?;
+        if ppid == parent_pid {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Polls [`find_any_child_pid`] until it finds a match or `timeout` elapses — the same deadline-loop
+/// convention [`wait_for_child_pid_named`] already follows.
+#[cfg(unix)]
+fn wait_for_any_child_pid(parent_pid: u32, timeout: Duration) -> Option<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(pid) = find_any_child_pid(parent_pid) {
+            return Some(pid);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether a process with this pid still exists — `kill -0` sends no signal, it only checks.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // Stderr is suppressed, not left to inherit: a dead pid answering "No such process" is the
+    // expected, common case every poll loop below hits at least once, not a real error worth
+    // printing into this test's own output every time.
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// mpv-orphaned-on-exit: a SIGTERM delivered to a real `lumen serve` process must kill the mpv child
+/// it already spawned before the process itself exits, not leave it running with nothing left to
+/// reap it -- the documented Windows Scheduled Task / systemd / Docker restart path (`DEVICE.md`,
+/// `docs/05`) sends exactly this signal on every restart. Unix-only: this drives the signal by
+/// shelling out to `kill -TERM`, which has no equivalent on Windows, and `Child::kill` (used
+/// everywhere else in this file to end a test's own server) sends `SIGKILL`, not `SIGTERM`, so it
+/// cannot stand in for what this test actually needs to prove.
+#[cfg(unix)]
+#[test]
+fn sigterm_kills_the_mpv_child_before_the_server_exits() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("sigterm");
+    let port = 39000 + (std::process::id() % 4000) as u16;
+    let (mut server, _tls) = spawn_paired_server(&dir.0, port);
+    let server_pid = server.id();
+
+    let mpv_pid = wait_for_child_pid_named(server_pid, "mpv", Duration::from_secs(10))
+        .expect("mpv must be running as a direct child of the server process");
+    assert!(pid_alive(mpv_pid), "the mpv child must be alive right after startup");
+
+    // Send a real SIGTERM -- not `Child::kill`, which is `SIGKILL` and would bypass the handler this
+    // test exists to prove exists.
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &server_pid.to_string()])
+        .status()
+        .expect("the `kill` utility must be runnable");
+    assert!(status.success(), "sending SIGTERM to the server process must succeed");
+
+    // The server must actually exit -- `wait()` blocks until it does, with the deadline this test's
+    // own harness timeout provides.
+    let exit = server.0.wait().expect("the server process must be waitable after SIGTERM");
+    assert!(!exit.success(), "a process that caught its own termination signal does not exit 0");
+
+    // The real proof: the mpv child must be gone too, not merely reparented and still running. A
+    // short poll rather than an immediate check -- `kill`/`wait` above already blocked until the
+    // server process itself was gone, but the SIGTERM handler's own `Child::kill`/`wait` on mpv runs
+    // just before that process actually exits, not necessarily before this test's next instruction.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while pid_alive(mpv_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !pid_alive(mpv_pid),
+        "the mpv child (pid {mpv_pid}) must not outlive a server that caught SIGTERM"
+    );
+}
+
+/// mpv-orphaned-on-exit, the harder case a first pass at this fix missed: a SIGTERM arriving *while
+/// `lumen serve` is still inside its initial `Mpv::connect` retry loop* -- which, per `Mpv::connect`'s
+/// own doc comment, can legitimately run for the full 20-second timeout on a slow or loaded host --
+/// must still kill the mpv child that was already spawned. An earlier version of `run()` stored the
+/// child into the shared `Arc<Mutex<Option<Child>>>` and installed the SIGTERM handler only *after*
+/// `Mpv::connect` returned `Ok`, leaving that entire handshake as a window where a SIGTERM fell
+/// through to the OS's default disposition (the process dies immediately, no handler runs) instead of
+/// killing the mpv child that was already running. Reproduced here by pointing `LUMEN_MPV` at a
+/// wrapper script that sleeps before `exec`ing into the real mpv binary, so the child process exists
+/// immediately (proving mpv really has been spawned) while `Mpv::connect`'s IPC socket does not appear
+/// until long after this test's SIGTERM lands.
+///
+/// Deliberately does not reuse `spawn_paired_server`: that helper waits for a pairing code and TLS
+/// fingerprint on stdout, both printed only *after* `Mpv::connect` succeeds, so waiting for them would
+/// by construction let `run()` get past the exact window this test exists to still be inside of.
+#[cfg(unix)]
+#[test]
+fn sigterm_during_the_initial_mpv_connect_wait_still_kills_the_mpv_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("sigterm-during-connect");
+
+    // Stands in for mpv: sleeps long enough to guarantee this test's SIGTERM lands while `run()` is
+    // still inside `Mpv::connect`'s retry loop, then `exec`s into the real mpv with every argument
+    // `spawn_idle_mpv` passed it (`--input-ipc-server` included), so a genuine mpv would come up
+    // exactly as it does in every other test in this file once the sleep ends -- this test only needs
+    // to interrupt before that.
+    let wrapper = dir.0.join("slow-mpv.sh");
+    std::fs::write(&wrapper, "#!/bin/sh\nsleep 8\nexec mpv \"$@\"\n").unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config_dir = dir.0.join("config");
+    let bin = env!("CARGO_BIN_EXE_lumen");
+    let port = 41000 + (std::process::id() % 4000) as u16;
+    let mut server = KillOnDrop(
+        std::process::Command::new(bin)
+            .args([
+                "serve",
+                dir.0.to_str().unwrap(),
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--",
+                "--vo=null",
+                "--ao=null",
+                "--force-window=no",
+            ])
+            .env("XDG_CONFIG_HOME", &config_dir)
+            .env("APPDATA", &config_dir)
+            .env("HOME", &config_dir)
+            // Overrides `mpvbin::find()`'s own search so `spawn_idle_mpv` launches the slow wrapper
+            // above instead of a real mpv directly.
+            .env("LUMEN_MPV", &wrapper)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("lumen must be runnable"),
+    );
+    if let Some(stdout) = server.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                println!("[lumen serve stdout] {line}");
+            }
+        });
+    }
+    if let Some(stderr) = server.stderr.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                eprintln!("[lumen serve stderr] {line}");
+            }
+        });
+    }
+    let server_pid = server.id();
+
+    // The wrapper (not yet mpv itself, since it is still inside its own `sleep`) as the server's only
+    // direct child -- proof `run()` really is still waiting on `Mpv::connect`, not already past it.
+    let child_pid = wait_for_any_child_pid(server_pid, Duration::from_secs(5))
+        .expect("the slow-mpv wrapper must be running as a direct child of the server process");
+    assert!(pid_alive(child_pid), "the wrapper child must be alive right after startup");
+
+    // Fire the SIGTERM now, deliberately still inside the sleep -- the exact window the fix above
+    // closes: mpv (via the wrapper) already spawned, `Mpv::connect` not yet returned.
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &server_pid.to_string()])
+        .status()
+        .expect("the `kill` utility must be runnable");
+    assert!(status.success(), "sending SIGTERM to the server process must succeed");
+
+    let exit = server.0.wait().expect("the server process must be waitable after SIGTERM");
+    assert!(!exit.success(), "a process that caught its own termination signal does not exit 0");
+
+    // The real proof: the wrapper child (which, `exec`, never changes pid even once it becomes real
+    // mpv) must not survive the server's exit. A short poll, not an immediate check -- the handler's
+    // own `Child::kill`/`wait` on it runs just before the server process actually exits, not
+    // necessarily before this test's very next instruction.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while pid_alive(child_pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !pid_alive(child_pid),
+        "the mpv child (pid {child_pid}, still inside its startup sleep when SIGTERM was sent) must \
+         not outlive a server that caught SIGTERM during the initial `Mpv::connect` wait"
+    );
+}
+
+/// mpv-no-self-heal: when mpv dies out from under a running `lumen serve` (a crash, or here, a
+/// deliberate `SIGKILL` standing in for one), the driver thread must relaunch a fresh idle mpv,
+/// reconnect over its IPC socket, and resume serving commands -- not exit for good and leave the
+/// server answering every subsequent command with "the player is not responding" until a human
+/// restarts the whole process by hand. Unix-only for the same reason `sigterm_kills_the_mpv_child...`
+/// above is: finding and signalling the mpv child by pid shells out to `ps`/`kill`, neither of which
+/// exists on Windows.
+#[cfg(unix)]
+#[test]
+fn drive_mpv_respawns_after_the_player_dies_and_commands_keep_working() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("respawn");
+    let file = encode_probe_file(&dir.0);
+    let port = 43000 + (std::process::id() % 4000) as u16;
+    let (mut server, mut tls) = spawn_paired_server(&dir.0, port);
+    let server_pid = server.id();
+
+    let mpv_pid = wait_for_child_pid_named(server_pid, "mpv", Duration::from_secs(10))
+        .expect("mpv must be running as a direct child of the server process");
+
+    // Kill mpv out from under the server with `SIGKILL` -- a crash, not a graceful `quit` the driver
+    // might have a separate, easier path for.
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &mpv_pid.to_string()])
+        .status()
+        .expect("the `kill` utility must be runnable");
+    assert!(status.success(), "killing the mpv child must succeed");
+
+    // The driver must notice, relaunch a fresh idle mpv, and resume serving commands -- proven by a
+    // real `play` request eventually succeeding again, not just by the server process staying alive
+    // (which it would anyway; only the driver thread died in the pre-fix behaviour).
+    let escaped = file.to_str().unwrap().replace('\\', "\\\\").replace('"', "\\\"");
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let mut recovered = false;
+    let mut attempt = 0;
+    while std::time::Instant::now() < deadline {
+        attempt += 1;
+        tls.write_all(
+            request(&format!("r{attempt}"), &format!("\"type\":\"play\",\"path\":\"{escaped}\""))
+                .as_bytes(),
+        )
+        .unwrap();
+        let reply = read_reply(&mut tls);
+        if reply.bool("ok") == Some(true) {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        recovered,
+        "the driver must respawn mpv and resume accepting commands after it dies out from under it"
+    );
+
+    // The respawned mpv must be a genuinely different process, not the same pid somehow still
+    // running -- confirms this really was a fresh launch, not a fluke where the kill missed.
+    let new_pid = wait_for_child_pid_named(server_pid, "mpv", Duration::from_secs(5))
+        .expect("a fresh mpv must be running as a child of the server process");
+    assert_ne!(new_pid, mpv_pid, "the driver must have launched a genuinely new mpv process");
+
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// no-search-wire-message: `ClientMessage::Search` over a real `lumen serve`, proving the whole path
+/// end to end -- the request is parsed, matched against the real in-memory library `Library` itself
+/// reads from, and answered with `ReplyBody::SearchResults` carrying only the matching entries.
+#[test]
+fn search_matches_titles_and_paths_case_insensitively_against_the_real_library() {
+    if !mpv_on_path() {
+        eprintln!("skipping: mpv is not on PATH in this environment");
+        return;
+    }
+
+    let dir = TempDir::new("search");
+    // Dummy files, not real encodes -- `scan::scan` classifies by extension and name, and this test
+    // never plays anything, only lists and searches it. Two distinct titles under two distinct
+    // folders, so a title-only search and a path-only search can each be proven to find one but not
+    // the other.
+    std::fs::create_dir_all(dir.0.join("Interstellar (2014)")).unwrap();
+    std::fs::write(
+        dir.0.join("Interstellar (2014)").join("Interstellar.mkv"),
+        b"not a real container, just needs to exist",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.0.join("The Office")).unwrap();
+    std::fs::write(
+        dir.0.join("The Office").join("S01E01.mkv"),
+        b"not a real container, just needs to exist",
+    )
+    .unwrap();
+    let port = 47000 + (std::process::id() % 4000) as u16;
+    let (mut server, mut tls) = spawn_paired_server(&dir.0, port);
+
+    // Case-insensitive, matched against the title.
+    let by_title = raw_reply(&mut tls, "s1", "\"type\":\"search\",\"query\":\"INTERSTELLAR\"");
+    assert!(by_title.contains("\"ok\":true"), "search must be accepted: {by_title}");
+    assert!(
+        by_title.contains("Interstellar"),
+        "a title search for \"INTERSTELLAR\" must find the Interstellar entry: {by_title}"
+    );
+    assert!(
+        !by_title.contains("S01E01"),
+        "a title search for \"INTERSTELLAR\" must not also return The Office: {by_title}"
+    );
+
+    // Matched against the path (a folder name the parsed title never carries) rather than the title.
+    let by_path = raw_reply(&mut tls, "s2", "\"type\":\"search\",\"query\":\"the office\"");
+    assert!(by_path.contains("\"ok\":true"), "a path-matching search must be accepted: {by_path}");
+    assert!(
+        by_path.contains("S01E01") || by_path.contains("The Office"),
+        "a search for \"the office\" must match by folder path, not just title: {by_path}"
+    );
+    assert!(
+        !by_path.contains("Interstellar.mkv"),
+        "a search for \"the office\" must not also return Interstellar: {by_path}"
+    );
+
+    // A query nothing matches returns an accepted, empty result -- not an error.
+    let empty = raw_reply(&mut tls, "s3", "\"type\":\"search\",\"query\":\"nonexistent\"");
+    assert!(empty.contains("\"ok\":true"), "an unmatched query must still be accepted: {empty}");
+    assert!(
+        empty.contains("\"result\":[]"),
+        "a query that matches nothing must return an empty result, not an error: {empty}"
+    );
+
+    // The pre-auth boundary itself (`ClientMessage::Search::is_pre_auth`) is already covered at the
+    // wire-protocol level by `protocol.rs`'s own `a_search_request_parses_and_carries_its_query`, and
+    // the general "an unauthenticated socket gets nothing but pair/auth" behaviour is already proven
+    // end to end by `a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv` above -- this test
+    // stays scoped to what is actually new here: the matching itself.
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// Sends one request and returns the raw reply line, skipping any interleaved `state` pushes --
+/// generalises `library_reply_raw`'s own approach (kept as a thin wrapper around this) to an
+/// arbitrary request body, needed here because `Reply`'s parser discards array structure (see
+/// `serde_json_lite`'s own comment) and a search/library reply's `result` array is exactly what these
+/// tests need to look inside.
+fn raw_reply(tls: &mut ClientTls, id: &str, request_body: &str) -> String {
+    tls.write_all(request(id, request_body).as_bytes()).unwrap();
+    let deadline = std::time::Instant::now() + SETTLE_TIMEOUT;
+    // One accumulator across every iteration, not a fresh one per read -- see `poll_read_line`'s own
+    // doc for why a reply straddling a timed-out read would otherwise lose its own first half.
+    let mut pending = String::new();
+    while std::time::Instant::now() < deadline {
+        match tls.read_line(&mut pending) {
+            Ok(0) => panic!("connection closed while a message was expected"),
+            Ok(_) => {
+                let line = std::mem::take(&mut pending);
+                let reply = Reply::parse(&line);
+                if reply.ty().as_deref() != Some("state") {
+                    return line;
+                }
+            }
+            Err(e) if is_client_timeout(&e) => continue,
+            Err(e) => panic!("unexpected I/O error reading from the server: {e}"),
+        }
+    }
+    panic!("no reply arrived within the deadline for request {id:?}");
 }
 
 /// Spawns a real `lumen serve` pointed at `dir`, waits for its pairing code and TLS fingerprint on
@@ -899,6 +1340,27 @@ fn spawn_paired_server(dir: &std::path::Path, port: u16) -> (KillOnDrop, ClientT
     (server, tls)
 }
 
+/// Mirrors `library_watch::WATCHER_DEBOUNCE` (1.5s). Duplicated here, named, rather than left as an
+/// unexplained magic number in the deadlines below: this file is a separate binary's external test and
+/// drives `lumen serve` only as a subprocess, so it cannot import a `pub(crate)` item from the crate
+/// under test the way an in-crate test could.
+const WATCHER_DEBOUNCE_MS: u64 = 1500;
+
+/// How long a poll loop waits for a `state` push carrying a real, expected change before concluding it
+/// is never coming -- the debounce period above plus real filesystem-walk time, multiplied up with real
+/// headroom rather than padded by an unrelated flat number of seconds. A quiet, idle machine sees the
+/// change land in a small fraction of this budget; what the multiplier actually buys is room for a
+/// `cargo test --workspace` run at full parallelism -- contending with dozens of other tests' own
+/// `lumen serve` and real `mpv` processes for the same handful of CPU cores -- to still get scheduled
+/// and finish a real walk before this gives up.
+const SETTLE_TIMEOUT: Duration = Duration::from_millis(WATCHER_DEBOUNCE_MS * 10);
+
+/// How long a poll loop keeps watching a connection that has already reached the version it expects, to
+/// catch one that keeps climbing when it should not -- `POST_RESCAN_QUIET_PERIOD` (equal to
+/// `WATCHER_DEBOUNCE_MS`, see `library_watch.rs`) plus the same real-world headroom `SETTLE_TIMEOUT`
+/// above already reasons through.
+const CONFIRM_SETTLED_TIMEOUT: Duration = Duration::from_millis(WATCHER_DEBOUNCE_MS * 4);
+
 /// A short read timeout on `tls`'s own socket, so a poll loop waiting on this connection can retry
 /// rather than block forever. Needed because the server only ever pushes a fresh `state` line when
 /// something in it actually changed (see `handle_connection`) -- unlike `read_message` elsewhere in
@@ -916,17 +1378,88 @@ fn is_client_timeout(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
-/// One line, tolerating a timed-out read (nothing new yet) rather than panicking on it -- `None` in
-/// that case. Requires [`set_poll_timeout`] to have been called on `tls` already, or this blocks
-/// exactly like `read_message` does.
-fn try_read_message(tls: &mut ClientTls) -> Option<Reply> {
-    let mut line = String::new();
-    match tls.read_line(&mut line) {
+/// The logic behind [`try_read_message`], factored out from the concrete `ClientTls` type so it can be
+/// exercised against a scripted fake reader in a deterministic unit test (see
+/// `a_line_split_by_a_read_timeout_still_assembles_whole` below) instead of only ever being provoked by
+/// rerunning the real, timing-dependent integration tests until a loaded machine happens to split a
+/// `state` push across more than one read.
+///
+/// `pending` is the caller's own accumulator, threaded through every call in one poll loop rather than
+/// a fresh buffer started here each time. `read_line`'s own default `BufRead` implementation appends
+/// into whatever buffer it is given and *consumes* those bytes off the connection before it can know
+/// whether a trailing `\n` is coming yet -- so a version of this function that started a brand new
+/// buffer on every call and simply dropped it on timeout (an earlier version of this helper did exactly
+/// that) throws already-consumed bytes away for good the instant one message happens to arrive split
+/// across more than one `read()`. An idle CI machine's loopback socket rarely does that; a machine
+/// contending with dozens of other tests' own `lumen serve` and real `mpv` processes for the same
+/// handful of CPU cores under a full `cargo test --workspace` run does it routinely -- this is the
+/// "timing assumption that does not hold under load" the flaky failures this fixes were actually
+/// tripping on. Reusing the same buffer across every call in the loop instead means a message split
+/// across several consecutive timeouts still assembles correctly.
+fn poll_read_line(
+    src: &mut impl BufRead,
+    pending: &mut String,
+    is_timeout: impl Fn(&std::io::Error) -> bool,
+) -> Option<String> {
+    match src.read_line(pending) {
         Ok(0) => panic!("connection closed while a message was expected"),
-        Ok(_) => Some(Reply::parse(&line)),
-        Err(e) if is_client_timeout(&e) => None,
+        Ok(_) => Some(std::mem::take(pending)),
+        Err(e) if is_timeout(&e) => None,
         Err(e) => panic!("unexpected I/O error reading from the server: {e}"),
     }
+}
+
+/// One line, tolerating a timed-out read (nothing new yet) rather than panicking on it -- `None` in
+/// that case. Requires [`set_poll_timeout`] to have been called on `tls` already, or this blocks
+/// exactly like `read_message` does. `pending` must be the same accumulator across every call in one
+/// poll loop -- see [`poll_read_line`]'s own doc for why.
+fn try_read_message(tls: &mut ClientTls, pending: &mut String) -> Option<Reply> {
+    poll_read_line(tls, pending, is_client_timeout).map(|line| Reply::parse(&line))
+}
+
+/// Reproduces exactly the scenario [`poll_read_line`]'s own doc explains: one line's worth of bytes
+/// arrives as two separate reads with a timed-out read in between -- the shape a server under real
+/// machine contention delivers a `state` push in, not the single clean read an idle CI box's loopback
+/// socket almost always provides. A `pending` buffer threaded across calls, as every real caller in
+/// this file does, must still reassemble the whole line once the rest arrives, rather than losing the
+/// first half the moment the timeout in between is treated as "no news" and that call's own buffer is
+/// thrown away -- which is exactly what this test would catch if `poll_read_line` ever went back to
+/// starting a fresh buffer internally instead of accumulating into the caller's.
+#[test]
+fn a_line_split_by_a_read_timeout_still_assembles_whole() {
+    /// A fake connection that answers a fixed sequence of `Read::read` calls -- some real bytes, one
+    /// simulated timeout partway through a line, then the rest -- so the split can be reproduced
+    /// deterministically instead of chased by rerunning the real integration tests until it happens.
+    struct ScriptedReads(std::collections::VecDeque<std::io::Result<Vec<u8>>>);
+    impl Read for ScriptedReads {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(&bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(e)) => Err(e),
+                None => Ok(0), // Script exhausted: behave as a clean EOF.
+            }
+        }
+    }
+
+    let scripted = ScriptedReads(std::collections::VecDeque::from([
+        Ok(b"{\"type\":\"sta".to_vec()),
+        Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "would block")),
+        Ok(b"te\",\"library_version\":1}\n".to_vec()),
+    ]));
+    let mut reader = BufReader::new(scripted);
+    let mut pending = String::new();
+
+    // First poll: the first half arrives, then the simulated timeout -- nothing to report yet, but
+    // the first half must not be discarded.
+    assert_eq!(poll_read_line(&mut reader, &mut pending, is_client_timeout), None);
+    // Second poll: the rest of the line arrives -- the whole thing must come back intact, not just
+    // the second half that arrived on this call alone.
+    let line = poll_read_line(&mut reader, &mut pending, is_client_timeout)
+        .expect("the rest of the line must complete the message");
+    assert_eq!(line, "{\"type\":\"state\",\"library_version\":1}\n");
 }
 
 /// Polls `tls` until a `state` push carries a `library_version` different from `since`, or `timeout`
@@ -939,8 +1472,9 @@ fn wait_for_library_version_change(
     timeout: Duration,
 ) -> Option<u64> {
     let deadline = std::time::Instant::now() + timeout;
+    let mut pending = String::new();
     while std::time::Instant::now() < deadline {
-        let Some(msg) = try_read_message(tls) else { continue };
+        let Some(msg) = try_read_message(tls, &mut pending) else { continue };
         if msg.ty().as_deref() == Some("state") {
             let v = num_in(&msg.0, "library_version").map(|n| n as u64);
             if v != since {
@@ -975,8 +1509,9 @@ fn distinct_library_versions_over(
     let deadline = std::time::Instant::now() + window;
     let mut max_seen = baseline;
     let mut beyond_baseline: Vec<u64> = Vec::new();
+    let mut pending = String::new();
     while std::time::Instant::now() < deadline {
-        let Some(msg) = try_read_message(tls) else { continue };
+        let Some(msg) = try_read_message(tls, &mut pending) else { continue };
         if msg.ty().as_deref() == Some("state") {
             if let Some(v) = num_in(&msg.0, "library_version").map(|n| n as u64) {
                 if v > max_seen {
@@ -994,23 +1529,7 @@ fn distinct_library_versions_over(
 /// comment) deliberately discards. A raw substring check on the file name is enough to confirm a
 /// specific entry is listed without teaching the probe parser to understand arrays just for this.
 fn library_reply_raw(tls: &mut ClientTls, id: &str) -> String {
-    tls.write_all(request(id, "\"type\":\"library\"").as_bytes()).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        let mut line = String::new();
-        match tls.read_line(&mut line) {
-            Ok(0) => panic!("connection closed while a message was expected"),
-            Ok(_) => {
-                let reply = Reply::parse(&line);
-                if reply.ty().as_deref() != Some("state") {
-                    return line;
-                }
-            }
-            Err(e) if is_client_timeout(&e) => continue,
-            Err(e) => panic!("unexpected I/O error reading from the server: {e}"),
-        }
-    }
-    panic!("no library reply arrived within the deadline");
+    raw_reply(tls, id, "\"type\":\"library\"")
 }
 
 /// Proves `docs/15` §A's phase-2 item: `library_version` moves on its own when a file appears on disk,
@@ -1038,7 +1557,7 @@ fn an_unprompted_filesystem_change_triggers_an_automatic_rescan() {
     // The very first unprompted state push must still start at version 0 -- same invariant the
     // manual-rescan test above already proves, re-checked here because this test's premise is what
     // happens to that number *without* a `rescan` message ever being sent.
-    let initial = wait_for_library_version_change(&mut tls, None, Duration::from_secs(10));
+    let initial = wait_for_library_version_change(&mut tls, None, SETTLE_TIMEOUT);
     assert_eq!(initial, Some(0), "library_version must start at 0");
 
     // Drop a new real file into the library on disk. No `rescan` message is sent anywhere in this
@@ -1046,9 +1565,9 @@ fn an_unprompted_filesystem_change_triggers_an_automatic_rescan() {
     std::fs::write(dir.0.join("AutoDetected.mkv"), b"not a real container, just needs to exist")
         .unwrap();
 
-    // `WATCHER_DEBOUNCE` (1.5s) plus real walk time, generously bounded -- a poll loop, not a fixed
-    // sleep, proves "it happens", not just "it happens within some sleep duration this test picked".
-    let bumped = wait_for_library_version_change(&mut tls, Some(0), Duration::from_secs(10));
+    // `WATCHER_DEBOUNCE_MS` plus real walk time, generously bounded -- a poll loop, not a fixed sleep,
+    // proves "it happens", not just "it happens within some sleep duration this test picked".
+    let bumped = wait_for_library_version_change(&mut tls, Some(0), SETTLE_TIMEOUT);
     assert_eq!(
         bumped,
         Some(1),
@@ -1068,7 +1587,7 @@ fn an_unprompted_filesystem_change_triggers_an_automatic_rescan() {
     // redundant `state` push repeating that same confirmed value (see `distinct_library_versions_over`'s
     // own doc) is not itself a failure.
     let after_settling =
-        distinct_library_versions_over(&mut tls, bumped.unwrap(), Duration::from_secs(5));
+        distinct_library_versions_over(&mut tls, bumped.unwrap(), CONFIRM_SETTLED_TIMEOUT);
     assert!(
         after_settling.is_empty(),
         "library_version must not keep climbing once nothing further has changed on disk: saw {after_settling:?}"
@@ -1096,7 +1615,7 @@ fn a_burst_of_new_files_is_coalesced_into_one_automatic_rescan() {
     let (mut server, mut tls) = spawn_paired_server(&dir.0, port);
     set_poll_timeout(&mut tls);
 
-    let initial = wait_for_library_version_change(&mut tls, None, Duration::from_secs(10));
+    let initial = wait_for_library_version_change(&mut tls, None, SETTLE_TIMEOUT);
     assert_eq!(initial, Some(0), "library_version must start at 0");
 
     // Write several files back to back, with no delay between them -- the burst a batch copy or
@@ -1107,7 +1626,7 @@ fn a_burst_of_new_files_is_coalesced_into_one_automatic_rescan() {
         std::fs::write(dir.0.join(name), b"not a real container, just needs to exist").unwrap();
     }
 
-    let bumped = wait_for_library_version_change(&mut tls, Some(0), Duration::from_secs(10));
+    let bumped = wait_for_library_version_change(&mut tls, Some(0), SETTLE_TIMEOUT);
     assert_eq!(
         bumped,
         Some(1),
@@ -1129,7 +1648,7 @@ fn a_burst_of_new_files_is_coalesced_into_one_automatic_rescan() {
     // same value: no version *beyond* the one confirmed above was ever observed -- not 2, not 3, not
     // one per file.
     let after_settling =
-        distinct_library_versions_over(&mut tls, bumped.unwrap(), Duration::from_secs(5));
+        distinct_library_versions_over(&mut tls, bumped.unwrap(), CONFIRM_SETTLED_TIMEOUT);
     assert!(
         after_settling.is_empty(),
         "a coalesced burst must produce exactly one version transition, with nothing further \
