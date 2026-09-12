@@ -28,6 +28,13 @@ on:
 permissions:
   contents: read
 
+# Cancel a still-running run for the same branch the moment a newer push arrives. The `emulator` job
+# alone can run 45 minutes across a 2-entry API-level matrix; three pushes minutes apart should not
+# mean three of those in flight when only the last one's result was ever going to matter.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
@@ -117,7 +124,7 @@ jobs:
   # under active development, not a version anyone should pin to. It is marked as a prerelease for
   # the same reason.
   publish:
-    name: publish to android-latest
+    name: publish to android-latest-fold5
     needs: build
     # Only from the development branch and the default branch. A release that moved on every feature
     # branch would make the "latest" link mean nothing.
@@ -125,6 +132,13 @@ jobs:
     runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     permissions:
       contents: write
+
+    env:
+      # A fork-specific rolling tag. Keeping this distinct from `android-latest` (the shared
+      # development build) and from the other device forks' own tags is what lets all of them
+      # publish from the same repository without three branches fighting to move the same tag out
+      # from under each other on every push.
+      RELEASE_TAG: android-latest-fold5
 
     steps:
       - uses: actions/checkout@v4
@@ -158,7 +172,10 @@ jobs:
           SHORT: ${{ steps.assets.outputs.short }}
         run: |
           set -euo pipefail
-          NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
+          NOTES="Rolling build of the Galaxy Z Fold 5 fork (\`${GITHUB_REF_NAME}\`) at \`${SHORT}\`.
+
+          Installs side-by-side with the shared development build and the other device forks —
+          this one's applicationId is \`dev.lumen.player.fold5\`, not \`dev.lumen.player\`.
 
           **Sideload straight from the phone:** open this page in the phone's browser, tap
           \`lumen.apk\`, and allow installation from that browser when Android asks.
@@ -172,31 +189,31 @@ jobs:
           Play listing. It is not a production signing key, and this is a development build rather
           than anything that should be distributed."
 
-          if gh release view android-latest >/dev/null 2>&1; then
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             # `gh release edit --target` cannot move the tag of a published release — the API ignores
             # target_commitish once a release is out of draft — so the tag is moved directly. Without
             # this the release would keep pointing at whichever commit first created it while serving
             # assets from a much later one.
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/android-latest" \
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
               -f sha="$GITHUB_SHA" -F force=true > /dev/null
-            gh release edit android-latest \
-              --title "Lumen Android — build ${SHORT}" --notes "$NOTES" --prerelease
+            gh release edit "$RELEASE_TAG" \
+              --title "Lumen Android (Fold 5) — build ${SHORT}" --notes "$NOTES" --prerelease
           else
-            gh release create android-latest \
+            gh release create "$RELEASE_TAG" \
               --target "$GITHUB_SHA" \
-              --title "Lumen Android — build ${SHORT}" \
+              --title "Lumen Android (Fold 5) — build ${SHORT}" \
               --notes "$NOTES" \
               --prerelease
           fi
           # `--clobber` rather than deleting the release: deleting it would break every link already
           # shared, which is the one thing a rolling "latest" URL exists to avoid.
-          gh release upload android-latest lumen.apk lumen-debug.apk --clobber
+          gh release upload "$RELEASE_TAG" lumen.apk lumen-debug.apk --clobber
 
       - name: Say where it landed
         run: |
           echo "### APK published" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/android-latest>" >> "$GITHUB_STEP_SUMMARY"
+          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}>" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Open that on the phone and tap \`lumen.apk\`." >> "$GITHUB_STEP_SUMMARY"
 
@@ -317,3 +334,91 @@ jobs:
           path: android/app/build/reports/androidTests/
           if-no-files-found: ignore
           retention-days: 7
+
+  # The Fold 5 analogue of the Tab S9 FE walkthrough above -- same script, different profile, plus
+  # the one thing a slab-shaped device cannot exercise at all: folding. No canned "Galaxy Z Fold 5"
+  # profile exists, and `pixel_fold` -- tried first -- turned out to be an Android-Studio-only device
+  # definition: `avdmanager create avd --device pixel_fold` failed here with "No device found
+  # matching --device pixel_fold", confirmed live in CI, because the plain SDK cmdline-tools this
+  # headless runner uses ships only the generic/AOSP device list, not Studio's own bundled Pixel-model
+  # catalog (the on-device-tests job above gets away with `pixel_6`, an older name that has been part
+  # of that generic list for longer). `7.6in Foldable` is a real entry in that generic list -- and,
+  # unlike `pixel_fold` ever was, a literal match for this device's own 7.6" inner screen (see
+  # DEVICE.md) -- close enough on aspect ratio to actually exercise the posture-aware layout
+  # `fold/FoldState.kt` drives, not just resize a phone layout to fit.
+  device-walkthrough:
+    name: device walkthrough (Fold 5)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Free disk space for the AVD
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android/sdk/ndk \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/share/boost \
+                      /usr/local/lib/node_modules || true
+          echo "after:"; df -h / | tail -1
+
+      - name: Download the built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: android/apks
+
+      # mpv on the *runner*, not the emulator -- this is what synthesizes the real test clip pushed
+      # to the device below, the same lavfi+encode technique the desktop CLI's own tests and
+      # release.yml's playback verification already use. No fixture checked into the repo.
+      - name: Install mpv (for synthesizing the test clip)
+        working-directory: ${{ github.workspace }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mpv
+
+      - name: Synthesize a real test clip
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mpv "av://lavfi:testsrc2=size=320x180:rate=15:duration=4" \
+            --audio-file="av://lavfi:sine=frequency=440:duration=4" \
+            --o=lumen-probe.mp4 --ovc=libx264 --ovcopts=preset=ultrafast --oac=aac --msg-level=all=error
+          ls -lh lumen-probe.mp4
+
+      - name: Walk through the app on a Fold 5-profiled emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: 7.6in Foldable
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+            -no-snapshot-save -camera-back none
+          disk-size: 6144M
+          disable-animations: true
+          script: cd android && ./ci/device-walkthrough.sh dev.lumen.player.fold5.debug --foldable
+
+      - name: Upload walkthrough evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumen-fold5-walkthrough
+          path: android/walkthrough/
+          if-no-files-found: warn
+          retention-days: 14

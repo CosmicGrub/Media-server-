@@ -201,14 +201,6 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Hide or restore the status and navigation bars.
-     *
-     * `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE` is the part that matters: without it, hiding the
-     * navigation bar on a gesture-navigation device leaves no way back except the hardware buttons
-     * the Fold 5 does not have. With it, a swipe from the edge brings the bars back temporarily and
-     * they retreat on their own.
-     */
-    /**
      * The system is about to leave this Activity — the user pressed Home, or switched apps.
      *
      * This is the documented hook for entering PiP automatically: unlike a button the user has to
@@ -254,6 +246,14 @@ class MainActivity : ComponentActivity() {
         isInPip.value = isInPictureInPictureMode
     }
 
+    /**
+     * Hide or restore the status and navigation bars.
+     *
+     * `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE` is the part that matters: without it, hiding the
+     * navigation bar on a gesture-navigation device leaves no way back except the hardware buttons
+     * the Fold 5 does not have. With it, a swipe from the edge brings the bars back temporarily and
+     * they retreat on their own.
+     */
     private fun setSystemBarsHidden(hidden: Boolean) {
         val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
         controller.systemBarsBehavior =

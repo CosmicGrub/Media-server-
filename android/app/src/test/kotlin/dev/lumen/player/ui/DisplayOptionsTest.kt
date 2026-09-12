@@ -50,17 +50,23 @@ class DisplayOptionsTest {
         // short window.
         assertEquals(
             Arrangement.Stacked,
-            arrangementFor(isTabletop = false, widthDp = 827, heightDp = 322, mode = ViewMode.Split),
+            arrangementFor(
+                isTabletop = false, isBook = false, widthDp = 827, heightDp = 322, mode = ViewMode.Split
+            ),
         )
         // The inner display flat is genuinely big enough for two panes.
         assertEquals(
             Arrangement.SideBySide,
-            arrangementFor(isTabletop = false, widthDp = 768, heightDp = 640, mode = ViewMode.Split),
+            arrangementFor(
+                isTabletop = false, isBook = false, widthDp = 768, heightDp = 640, mode = ViewMode.Split
+            ),
         )
         // Cover screen upright: too narrow either way.
         assertEquals(
             Arrangement.Stacked,
-            arrangementFor(isTabletop = false, widthDp = 322, heightDp = 827, mode = ViewMode.Split),
+            arrangementFor(
+                isTabletop = false, isBook = false, widthDp = 322, heightDp = 827, mode = ViewMode.Split
+            ),
         )
     }
 
@@ -70,7 +76,9 @@ class DisplayOptionsTest {
             assertEquals(
                 "mode $mode must not leave a library pane on screen",
                 Arrangement.VideoOnly,
-                arrangementFor(isTabletop = false, widthDp = 768, heightDp = 640, mode = mode),
+                arrangementFor(
+                    isTabletop = false, isBook = false, widthDp = 768, heightDp = 640, mode = mode
+                ),
             )
         }
     }
@@ -83,9 +91,41 @@ class DisplayOptionsTest {
         for (mode in ViewMode.entries) {
             assertEquals(
                 Arrangement.Tabletop,
-                arrangementFor(isTabletop = true, widthDp = 768, heightDp = 640, mode = mode),
+                arrangementFor(
+                    isTabletop = true, isBook = false, widthDp = 768, heightDp = 640, mode = mode
+                ),
             )
         }
+    }
+
+    @Test
+    fun `book keeps its shape in every mode, the same way tabletop does`() {
+        // Book posture was detected by FoldState but never reached a layout at all before this --
+        // arrangementFor always fell through to the ordinary width/height rule, so a vertical hinge
+        // was treated exactly like a flat window of the same size. The fixed geometry (video pinned
+        // to one side of the physical hinge) is the whole reason a Book-specific layout exists, so
+        // it has to survive every view mode the same way Tabletop's does.
+        for (mode in ViewMode.entries) {
+            assertEquals(
+                Arrangement.Book,
+                arrangementFor(
+                    isTabletop = false, isBook = true, widthDp = 768, heightDp = 640, mode = mode
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `tabletop wins if both postures were somehow reported at once`() {
+        // Not a real device configuration (a hinge is either horizontal or vertical, never both), but
+        // the precedence has to be defined rather than accidental -- Tabletop is checked first in
+        // arrangementFor, so it must be what a caller sees if both flags are ever true together.
+        assertEquals(
+            Arrangement.Tabletop,
+            arrangementFor(
+                isTabletop = true, isBook = true, widthDp = 768, heightDp = 640, mode = ViewMode.Split
+            ),
+        )
     }
 
     @Test

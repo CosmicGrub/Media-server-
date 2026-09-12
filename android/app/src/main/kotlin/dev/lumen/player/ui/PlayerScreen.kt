@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -84,11 +85,13 @@ fun PlayerScreen(
     val config = LocalConfiguration.current
 
     val tabletop = posture as? Posture.Tabletop
+    val book = posture as? Posture.Book
     val arrangement = if (isInPip) {
         Arrangement.VideoOnly
     } else {
         arrangementFor(
             isTabletop = tabletop != null,
+            isBook = book != null,
             widthDp = config.screenWidthDp,
             heightDp = config.screenHeightDp,
             mode = settings.viewMode,
@@ -130,6 +133,9 @@ fun PlayerScreen(
         when (arrangement) {
             Arrangement.Tabletop -> TabletopLayout(
                 vm, state, tabletop!!, settings, contentPadding, onRequestAccess, video
+            )
+            Arrangement.Book -> BookLayout(
+                vm, state, book!!, settings, contentPadding, onRequestAccess, video
             )
             Arrangement.SideBySide ->
                 SideBySideLayout(vm, state, settings, contentPadding, onRequestAccess, video)
@@ -231,6 +237,57 @@ private fun TabletopLayout(
         Column(
             Modifier
                 .fillMaxSize()
+                .padding(bottom = contentPadding.calculateBottomPadding())
+                .padding(horizontal = 12.dp)
+        ) {
+            NowPlayingBar(state, vm)
+            if (settings.viewMode.showsLibrary) {
+                LibraryList(state, vm, onRequestAccess, Modifier.fillMaxSize())
+            }
+        }
+    }
+}
+
+/**
+ * Held like a book: video on one side of a vertical hinge, everything else on the other.
+ *
+ * The counterpart to [TabletopLayout] for [Posture.Book] -- posture detection has recognised a
+ * vertical hinge since `FoldState.kt` was written, but until this layout existed nothing ever
+ * consumed it: `arrangementFor` fell straight through to the ordinary width/height rule, so a Fold 5
+ * held open like a book was laid out exactly as if it were an unfolded flat window of the same size,
+ * with a video pane that could straddle the physical crease.
+ *
+ * Same reasoning as [TabletopLayout] for the crease itself: nothing is drawn on it, since it is a
+ * visible, slightly recessed line on the hardware this build targets and a control placed there is
+ * hard to read and unreliable to press. The hinge bounds arrive in pixels from `WindowInfoTracker`
+ * and have to become dp for Compose, same as the tabletop case.
+ */
+@UnstableApi
+@Composable
+private fun BookLayout(
+    vm: PlayerViewModel,
+    state: UiState,
+    p: Posture.Book,
+    settings: DisplaySettings,
+    contentPadding: PaddingValues,
+    onRequestAccess: () -> Unit,
+    video: @Composable (Modifier) -> Unit,
+) {
+    val density = LocalDensity.current
+    val leftWidthDp = with(density) { p.hingeLeftPx.toDp() }
+    val hingeWidthDp = with(density) { (p.hingeRightPx - p.hingeLeftPx).toDp() }
+
+    Row(Modifier.fillMaxSize()) {
+        Box(
+            Modifier.fillMaxHeight().width(leftWidthDp).background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) { video(Modifier.fillMaxSize()) }
+        // The crease itself. Left empty on purpose — see above.
+        Spacer(Modifier.fillMaxHeight().width(hingeWidthDp))
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(top = contentPadding.calculateTopPadding())
                 .padding(bottom = contentPadding.calculateBottomPadding())
                 .padding(horizontal = 12.dp)
         ) {

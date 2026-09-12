@@ -69,8 +69,9 @@ class PlaybackService : MediaSessionService() {
 
     /** Tapping the notification returns to the app rather than launching a second copy of it. */
     private fun openAppIntent(): PendingIntent {
-        val intent = packageManager.getLaunchIntentForPackage(packageName)
-            ?.addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val intent = (packageManager.getLaunchIntentForPackage(packageName)
+            ?: Intent(this, dev.lumen.player.MainActivity::class.java))
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
         return PendingIntent.getActivity(
             this,
             0,

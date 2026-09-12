@@ -60,4 +60,46 @@ class PostureTest {
         // Video occupies everything above the crease; the rest is for controls.
         assertEquals(890, top, "video region height")
     }
+
+    @Test
+    fun `selectFold returns null for no features at all`() {
+        assertEquals(null, selectFold(emptyList(), emptyList()))
+    }
+
+    @Test
+    fun `selectFold picks the only feature there is`() {
+        assertEquals(0, selectFold(listOf(true), listOf(500_000L)))
+        assertEquals(0, selectFold(listOf(false), listOf(500_000L)))
+    }
+
+    @Test
+    fun `selectFold prefers a half-open feature over a flat one regardless of size`() {
+        // A real device reports at most one hinge, but the API shape allows more; if it ever
+        // happens, the flat one changes nothing about the layout no matter how large it is, so the
+        // half-open one is what has to win even when it is physically the smaller of the two.
+        val halfOpen = listOf(false, true)
+        val area = listOf(9_000_000L, 100L)
+        assertEquals(1, selectFold(halfOpen, area))
+    }
+
+    @Test
+    fun `selectFold breaks a tie between two half-open features by area`() {
+        val halfOpen = listOf(true, true, true)
+        val area = listOf(200_000L, 900_000L, 500_000L)
+        assertEquals(1, selectFold(halfOpen, area))
+    }
+
+    @Test
+    fun `selectFold picks something even when nothing is half-open`() {
+        // Every feature flat: the result does not matter for the eventual posture (they all resolve
+        // to Flat), but the function must still return a valid index rather than null, which would
+        // be read as "no features at all" -- a different, wrong signal.
+        val idx = selectFold(listOf(false, false), listOf(10L, 20L))
+        assertEquals(true, idx == 0 || idx == 1)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `selectFold refuses mismatched list lengths rather than reading past the end`() {
+        selectFold(listOf(true, false), listOf(100L))
+    }
 }
