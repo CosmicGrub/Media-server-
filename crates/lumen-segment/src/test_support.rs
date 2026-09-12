@@ -7,8 +7,6 @@
 //! not actually serialize against each other -- see [`SCRIPT_WRITE`]'s own doc comment for why that
 //! matters).
 
-use std::path::Path;
-
 /// Guards every fake-`ffmpeg`-script test in this crate, across both [`crate::command`] and
 /// [`crate::dash`].
 ///
@@ -38,7 +36,7 @@ pub(crate) static SCRIPT_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(())
 /// span from calling this through spawning the script; see that lock's own doc comment for why a
 /// closed handle here is not, by itself, enough.
 #[cfg(unix)]
-pub(crate) fn write_executable_script(path: &Path, contents: &str) {
+pub(crate) fn write_executable_script(path: &std::path::Path, contents: &str) {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
