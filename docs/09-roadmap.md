@@ -83,10 +83,12 @@ That last one is the argument for the whole approach: it was found by
 **The table above is a snapshot from when this section was written, not the current crate list** —
 `lumen-index` (incremental reindexing/verification), `lumen-exec` (the remux execution engine),
 `lumen-segment` (HLS playlist/segment planning), `lumen-discovery` (SSDP/DLNA), and `lumen-play`
-itself (the CLI player, library scanner, and `lumen serve` remote-control/DLNA server that actually
-exercises all of the above) were all added after, closing out a 16-item codec/transcode/remux audit
-backlog in full. See each crate's own source for its current test count rather than trusting a
-number here to stay current.
+itself (the CLI player, library scanner, and `lumen serve` remote-control/DLNA server) were all
+added after, closing out a 16-item codec/transcode/remux audit backlog in full. `lumen-play`
+exercises `lumen-index`, `lumen-segment`, and `lumen-discovery`, but **not** `lumen-exec`:
+`lumen-exec` is not in `lumen-play`'s dependency graph, and nothing in the shipped `lumen` binary
+calls it — see `lumen-exec/src/lib.rs`'s module doc for the current state of that gap. See each
+crate's own source for its current test count rather than trusting a number here to stay current.
 
 What `lumen-probe` answers, all without FFmpeg:
 

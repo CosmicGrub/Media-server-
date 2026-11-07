@@ -12,6 +12,17 @@
 //! completion and captures its exit status and stderr; there is no progress streaming, cancellation,
 //! or job queue here -- a real production remux service needs all three, and none of them belong in
 //! the crate that only knows how to build one correct `ffmpeg` invocation and run it once.
+//!
+//! **Currently unwired: this crate has no callers.** This is a complete, tested library --
+//! [`RemuxJob::from_plan`], [`build_command`], and [`execute`] all work and are exercised by this
+//! crate's own tests against a real `ffmpeg` -- but nothing in `lumen-play`'s shipped `lumen`
+//! binary calls it. `lumen-exec` is not a dependency of `lumen-play`, and `lumen-play`'s own
+//! `PlaybackPlan` consumers (`fidelity.rs`, `report.rs`) only report on what a plan says, never
+//! execute it: the `/stream/` route serves raw Direct Play bytes with no plan awareness at all, and
+//! HLS/DASH delivery goes through `lumen-segment`'s own independent `-c copy`-only segmenter.
+//! Whenever the playback ladder actually decides on a whole-file `ContainerPlan::Remux`, there is
+//! today no code path in the shipped binary that acts on that decision -- do not assume `lumen-play`
+//! exercises this crate just because it exists in the workspace.
 
 mod job;
 mod run;
