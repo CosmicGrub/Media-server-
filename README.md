@@ -97,7 +97,7 @@ on hard files. If resources are limited, stopping at Phase 2 or 3 and being exce
 depends on is implemented and tested.
 
 ```bash
-cargo test --workspace     # 831 tests (doc-tests aside), 51 of them in the *_props property suites
+cargo test --workspace     # 863 tests (doc-tests aside), 51 of them in the *_props property suites
 ci/license-gate.sh         # ADR-0002 licence posture
 python3 conformance/runner/coverage.py
 ```
@@ -106,7 +106,7 @@ python3 conformance/runner/coverage.py
 |---|---|---|
 | [`lumen-model`](crates/lumen-model) | Containers, codecs, streams, colour/HDR, remux carriage rules | 38 |
 | [`lumen-caps`](crates/lumen-caps) | Client and **sink-level** capability model | 9 |
-| [`lumen-playback`](crates/lumen-playback) | **The playback decision ladder** and track auto-selection | 21 + 22 |
+| [`lumen-playback`](crates/lumen-playback) | **The playback decision ladder** and track auto-selection | 28 + 22 |
 | [`lumen-identity`](crates/lumen-identity) | Move-surviving content sketch | 18 |
 | [`lumen-probe`](crates/lumen-probe) | Content sniffing, MKV/MP4 structural analysis, the recovery ladder | 85 + 10 |
 | [`lumen-match`](crates/lumen-match) | Filename parsing and candidate ranking (research R8) | 41 + 18 |
@@ -115,12 +115,12 @@ python3 conformance/runner/coverage.py
 | [`lumen-index`](crates/lumen-index) | Persisted incremental library index and byte-level verification | 43 |
 | [`lumen-exec`](crates/lumen-exec) | Remux execution engine | 20 |
 | [`lumen-segment`](crates/lumen-segment) | HLS/DASH playlist and segment planning | 34 |
-| [`lumen-discovery`](crates/lumen-discovery) | SSDP responder, DLNA `ContentDirectory`, DIDL-Lite | 37 |
-| [`lumen-play`](crates/lumen-play) | **The runnable thing**: `lumen` CLI, and `lumen serve` — paired TLS remote control, HLS/DASH/VR delivery, DLNA | 262 + 7 |
+| [`lumen-discovery`](crates/lumen-discovery) | SSDP responder, DLNA `ContentDirectory`, DIDL-Lite | 40 |
+| [`lumen-play`](crates/lumen-play) | **The runnable thing**: `lumen` CLI, and `lumen serve` — paired TLS remote control, HLS/DASH/VR delivery, DLNA | 278 + 13 |
 
 Where a row reads `a + b`, `a` is the crate's unit tests and `b` its `tests/` suites — the property
 suites (`parse_props` 11, `meta_props` 8, `ladder_props` 22, `probe_props` 10) plus `lumen-match`'s
-corpus and `lumen-play`'s two live-server suites. The rows sum to 773; the other 58 of the 831 belong
+corpus and `lumen-play`'s two live-server suites. The rows sum to 805; the other 58 of the 863 belong
 to [`spikes/s1-compositing`](spikes/s1-compositing), a workspace member but not a crate of the core.
 
 The runnable player and server is [`crates/lumen-play`](crates/lumen-play) — its README covers the
