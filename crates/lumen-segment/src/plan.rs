@@ -4,8 +4,10 @@
 //! the nearest keyframe rather than cutting mid-GOP -- a real source's actual segment lengths after
 //! running will drift from these idealized, evenly-sized boundaries by up to one GOP. This module has
 //! no keyframe timing to work from (that would mean probing the source first), so what it produces is
-//! useful for "roughly how many segments will this be" and for driving [`crate::command`]'s
-//! `-hls_time` target, not for predicting exact output segment lengths.
+//! useful for "roughly how many segments will this be" -- a standalone estimation utility, not
+//! currently wired into [`crate::command`] or the `dash` job types, both of which take their
+//! `-hls_time`/segment-length target as a plain field the caller sets directly -- not for predicting
+//! exact output segment lengths.
 
 /// Splits `total_duration_secs` into segments of at most `target_secs` each, computed from clean
 /// multiples of `target_secs` rather than by repeated subtraction -- floating-point error from
