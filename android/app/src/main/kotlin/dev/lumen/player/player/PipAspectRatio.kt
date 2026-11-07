@@ -34,7 +34,12 @@ object PipAspectRatio {
         if (width <= 0 || height <= 0) return FALLBACK
         val ratio = (width.toDouble() / height.toDouble()).coerceIn(MIN, MAX)
         val den = 1000
-        val num = (ratio * den).toInt().coerceAtLeast(1)
+        var num = Math.round(ratio * den).toInt().coerceAtLeast(1)
+        // Rounding (and the scaling itself) is lossy, so the scaled ratio can still land just
+        // outside the accepted band at either edge. Nudge it back in rather than let a
+        // quantization error escape the one guarantee this function exists to make.
+        if (num.toDouble() / den < MIN) num++
+        if (num.toDouble() / den > MAX) num--
         val g = gcd(num, den)
         return (num / g) to (den / g)
     }

@@ -27,26 +27,28 @@ class PipAspectRatioTest {
         // PiP accepts. The whole point of this type existing is that this must not crash.
         val clamped = PipAspectRatio.clamp(2760, 1000)
         val r = ratio(clamped)
-        assertTrue("expected <= MAX, got $r", r <= PipAspectRatio.MAX + 0.001)
+        assertTrue("expected <= MAX, got $r", r <= PipAspectRatio.MAX)
     }
 
     @Test
     fun `a tall portrait capture is clamped at the other end`() {
         val clamped = PipAspectRatio.clamp(1080, 3000)
         val r = ratio(clamped)
-        assertTrue("expected >= MIN, got $r", r >= PipAspectRatio.MIN - 0.001)
+        assertTrue("expected >= MIN, got $r", r >= PipAspectRatio.MIN)
     }
 
     @Test
     fun `every result lands inside the accepted band, swept across a wide range of shapes`() {
         // Rather than argue the formula, check the property it exists to guarantee, across enough
-        // shapes that a boundary mistake could not hide between the cases picked by hand.
+        // shapes that a boundary mistake could not hide between the cases picked by hand. No
+        // slack in the tolerance: the platform itself enforces this exactly, so a result that is
+        // merely close is still a crash.
         for (w in 100..3000 step 137) {
             for (h in 100..3000 step 211) {
                 val r = ratio(PipAspectRatio.clamp(w, h))
                 assertTrue(
                     "($w, $h) -> $r is outside [${PipAspectRatio.MIN}, ${PipAspectRatio.MAX}]",
-                    r >= PipAspectRatio.MIN - 0.001 && r <= PipAspectRatio.MAX + 0.001,
+                    r >= PipAspectRatio.MIN && r <= PipAspectRatio.MAX,
                 )
             }
         }
