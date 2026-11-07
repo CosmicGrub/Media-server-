@@ -91,7 +91,8 @@ jobs:
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           APK=app/build/outputs/apk/release/app-release.apk
           echo "=== badging ==="
-          "$BT/aapt2" dump badging "$APK" | grep -E "package:|sdkVersion|targetSdkVersion|native-code|application-label" || true
+          "$BT/aapt2" dump badging "$APK" > badging.txt
+          grep -E "package:|sdkVersion|targetSdkVersion|native-code|application-label" badging.txt || true
           echo "=== signature ==="
           "$BT/apksigner" verify --print-certs "$APK" | head -5
           echo "=== size ==="
@@ -123,6 +124,102 @@ jobs:
   # The tag is deliberately rolling rather than versioned: this is the current build of a branch
   # under active development, not a version anyone should pin to. It is marked as a prerelease for
   # the same reason.
+  #
+  # This is the generic tag MASTERFILE.md's "Getting a CI build onto the phone" section documents
+  # (and the one the comment on the Fold-5-specific job below still assumes exists) — it has to keep
+  # existing independently of `android-latest-fold5` and any other device fork's own tag, or the
+  # documented `gh release download android-latest` stops working the moment a device fork's publish
+  # job is the only one left in the file.
+  publish-latest:
+    name: publish to android-latest
+    needs: build
+    # Only from the development branch and the default branch. A release that moved on every feature
+    # branch would make the "latest" link mean nothing.
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/claude/multiplatform-media-player-server-b7dwe7'
+    runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
+    permissions:
+      contents: write
+
+    env:
+      RELEASE_TAG: android-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the built APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: lumen-android-apk
+          path: apks
+
+      # Named for a human reading a download list on a phone, where the build directory structure
+      # that produced them is invisible and `app-release.apk` says nothing about what it is.
+      #
+      # The names carry no commit hash on purpose. A rolling release wants one permanent URL, so the
+      # asset name has to stay put and `--clobber` has to be able to replace it; a hash in the name
+      # would mint a new link every push and leave the old builds piling up beside it. Which build
+      # this is lives in the title and the notes instead.
+      - name: Name the assets for a human
+        id: assets
+        run: |
+          set -euo pipefail
+          SHORT="${GITHUB_SHA::7}"
+          cp apks/release/app-release.apk lumen.apk
+          cp apks/debug/app-debug.apk lumen-debug.apk
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          ls -lh lumen.apk lumen-debug.apk
+
+      - name: Publish or update the rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT: ${{ steps.assets.outputs.short }}
+        run: |
+          set -euo pipefail
+          NOTES="Rolling build of \`${GITHUB_REF_NAME}\` at \`${SHORT}\`.
+
+          **Sideload straight from the phone:** open this page in the phone's browser, tap
+          \`lumen.apk\`, and allow installation from that browser when Android asks.
+
+          **Or over USB from a PC**, with developer options and USB debugging on:
+          \`\`\`
+          adb install -r lumen.apk
+          \`\`\`
+
+          Signed with the standard Android debug key, which is what makes it installable without a
+          Play listing. It is not a production signing key, and this is a development build rather
+          than anything that should be distributed."
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # `gh release edit --target` cannot move the tag of a published release — the API ignores
+            # target_commitish once a release is out of draft — so the tag is moved directly. Without
+            # this the release would keep pointing at whichever commit first created it while serving
+            # assets from a much later one.
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}" \
+              -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release edit "$RELEASE_TAG" \
+              --title "Lumen Android — build ${SHORT}" --notes "$NOTES" --prerelease
+          else
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "Lumen Android — build ${SHORT}" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
+          # `--clobber` rather than deleting the release: deleting it would break every link already
+          # shared, which is the one thing a rolling "latest" URL exists to avoid.
+          gh release upload "$RELEASE_TAG" lumen.apk lumen-debug.apk --clobber
+
+      - name: Say where it landed
+        run: |
+          echo "### APK published" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "<https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}>" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Open that on the phone and tap \`lumen.apk\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # The Fold-5-fork analogue of the job above: same mechanics, but under its own tag and with its own
+  # applicationId called out in the notes, so it can install side by side with the generic build
+  # instead of fighting it for one signature/package slot.
   publish:
     name: publish to android-latest-fold5
     needs: build
@@ -335,8 +432,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # The Fold 5 analogue of the Tab S9 FE walkthrough above -- same script, different profile, plus
-  # the one thing a slab-shaped device cannot exercise at all: folding. No canned "Galaxy Z Fold 5"
+  # A driven walkthrough on a Fold-5-profiled emulator -- same script shape as the `emulator` job
+  # above, plus the one thing a slab-shaped device cannot exercise at all: folding. No canned "Galaxy Z Fold 5"
   # profile exists, and `pixel_fold` -- tried first -- turned out to be an Android-Studio-only device
   # definition: `avdmanager create avd --device pixel_fold` failed here with "No device found
   # matching --device pixel_fold", confirmed live in CI, because the plain SDK cmdline-tools this
