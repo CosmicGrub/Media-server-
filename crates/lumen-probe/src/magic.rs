@@ -195,10 +195,25 @@ fn sniff_isobmff(head: &[u8]) -> Option<Candidate> {
         });
     }
 
+    // ISOBMFF's 64-bit `largesize` extension (`docs/12-container-conformance.md` line 173,
+    // "Required") marks a top-level box whose size exceeds 4 GiB by writing exactly `1` in the
+    // 4-byte size field, with the real size following as an 8-byte big-endian value. Those same
+    // 4 bytes (`00 00 00 01`) are also `AT_ZERO`'s AnnexB start-code signature, scored `Certain`.
+    // Left at `Probable`, this candidate always loses that coincidental byte match, so a largesize
+    // `mdat` (the common case for >4GiB camera-original footage) gets misidentified as an
+    // unplayable raw elementary stream. The box-type match above already rules out a real AnnexB
+    // stream at this offset, so the pairing is just as unambiguous — call it `Certain` too, and the
+    // stable sort in `sniff` keeps this candidate (pushed first) ahead of the coincidental one.
+    let is_largesize = head[0..4] == [0x00, 0x00, 0x00, 0x01];
+
     Some(Candidate {
         container: Container::Mp4,
-        confidence: Confidence::Probable,
-        evidence: "ISOBMFF top-level box, no ftyp",
+        confidence: if is_largesize { Confidence::Certain } else { Confidence::Probable },
+        evidence: if is_largesize {
+            "ISOBMFF top-level box, 64-bit largesize"
+        } else {
+            "ISOBMFF top-level box, no ftyp"
+        },
     })
 }
 
@@ -514,6 +529,34 @@ mod tests {
         let c = &sniff(&head)[0];
         assert_eq!(c.container, Container::RawElementaryStream);
         assert_eq!(c.confidence, Confidence::Probable);
+    }
+
+    #[test]
+    fn largesize_mdat_is_recognised_as_mp4_not_annexb() {
+        // docs/12-container-conformance.md line 173 requires supporting the 64-bit `largesize`
+        // extension: a top-level box over 4 GiB (routine for >4GiB camera-original 4K/8K footage
+        // with "fast start" disabled) encodes its size as the 4-byte marker `00 00 00 01` followed
+        // by the real 8-byte size. Those same 4 bytes are also the AnnexB start-code signature at
+        // `Certain` confidence; this must not let a raw-elementary-stream guess win over the MP4
+        // that the box type (`mdat`) plainly is.
+        let mut head = vec![0x00, 0x00, 0x00, 0x01];
+        head.extend_from_slice(b"mdat");
+        head.extend_from_slice(&0x1_0000_0010u64.to_be_bytes()); // >4GiB real size
+        head.extend_from_slice(&[0u8; 16]);
+
+        let candidates = sniff(&head);
+        assert_eq!(
+            candidates[0].container,
+            Container::Mp4,
+            "a largesize mdat must win over the coincidental AnnexB byte match, got {candidates:?}"
+        );
+        assert_eq!(candidates[0].confidence, Confidence::Certain);
+
+        // Even when misleadingly named, content still wins over extension (docs/12 Rule 1) — and
+        // here content and extension agree anyway.
+        let mut got = candidates;
+        rank_with_extension(&mut got, Some("mp4"));
+        assert_eq!(got[0].container, Container::Mp4);
     }
 
     #[test]
