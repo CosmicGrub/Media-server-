@@ -108,7 +108,8 @@ Other
   --help              this text
   --version           version and target platform
 
-Exit codes: 0 all played, 1 at least one file failed, 2 usage or setup error.";
+Exit codes: 0 all played, 1 at least one file failed or nothing played at all, 2 usage or setup
+error.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -284,8 +285,18 @@ fn run(cmd: &str, args: &[String]) -> Result<ExitCode, String> {
     write_json(args, &found, Some(&session))?;
 
     // A failed file is the finding. Exiting zero on a run that could not open half the library would
-    // make this useless in a script.
-    Ok(if session.failed().count() > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+    // make this useless in a script. A run that played nothing at all -- e.g. mpv's whole process
+    // died before it ever reached a file, such as a fatal VO/GPU init failure on a headless box --
+    // is just as much a non-result even when nothing was explicitly `Failed`, every file sitting at
+    // `NotReached` instead. But `NotReached` alone must not flip the exit code: that is also exactly
+    // what an ordinary `play` session looks like when the viewer quits mpv (`q`) partway through
+    // after watching some of what they wanted, which is success, not failure. So only a run that
+    // reached zero playbacks counts here.
+    Ok(if session.failed().count() > 0 || (session.played() == 0 && !session.results.is_empty()) {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 /// Append a calibration entry for every file this session actually played -- `docs/15` §C. A file
