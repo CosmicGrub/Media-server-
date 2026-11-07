@@ -111,9 +111,12 @@ pub enum DashExecError {
     /// The manifest was written, but a hand-rolled scan for `<Representation id="...">` found none --
     /// an empty or absurdly short source, most likely.
     NoRepresentationsProduced,
-    /// The manifest declared a representation that has no real init or media segment file sitting next
-    /// to it on disk -- `why` says which is missing. This crate never serves what it hasn't confirmed
-    /// is real, the same posture [`crate::command::execute`] already takes for HLS.
+    /// The manifest declared a representation whose real on-disk chunk files don't match what the
+    /// manifest itself says -- `why` says how: missing entirely, or present but in the wrong count for
+    /// the manifest's own `SegmentTimeline` (the signature of a stale chunk left over from a prior,
+    /// unrelated job into the same `output_dir` -- see [`has_chunk_for`]'s own doc comment). This crate
+    /// never serves what it hasn't confirmed is real, the same posture [`crate::command::execute`]
+    /// already takes for HLS.
     RepresentationIncomplete {
         representation_id: String,
         why: &'static str,
@@ -143,12 +146,19 @@ impl std::error::Error for DashExecError {}
 /// Runs `job` with the `ffmpeg` binary at `ffmpeg_bin` and confirms real output landed on disk: the
 /// manifest exists and names at least one representation, and for every representation it names, that
 /// representation's own init segment (built from the same [`INIT_SEGMENT_NAME_PATTERN`] `build_command`
-/// gave ffmpeg, with `$RepresentationID$` substituted) is a real, non-empty file, and at least one
-/// `chunk-<id>-*.m4s` file for it exists in `output_dir`. This is a presence check, the DASH analogue
-/// of [`crate::command::execute`]'s own posture -- it does not parse or validate `SegmentTimeline`
-/// math, which needs no re-derivation here: a real chunk file landing on disk under the name the
-/// manifest's own template promises is what matters, not modeling DASH's segment-addressing arithmetic
-/// a second time.
+/// gave ffmpeg, with `$RepresentationID$` substituted) is a real, non-empty file, and the
+/// `chunk-<id>-*.m4s` files for it in `output_dir` match what that representation's own
+/// `SegmentTimeline` declares. **Precondition this does not itself enforce: `output_dir` should be
+/// fresh for this job** -- a glob alone cannot tell a chunk `ffmpeg` just wrote from a same-named one
+/// a prior, unrelated job into the same directory left behind, since ffmpeg's DASH muxer never cleans
+/// a reused output directory, only overwrites the exact filenames it rewrites. What *is* checked here
+/// as a direct defense against exactly that: the count of `chunk-<id>-*.m4s` files on disk is compared
+/// against the number of segments this representation's own `SegmentTimeline` declares (summing each
+/// `<S .../>` entry's `r+1`) -- when the manifest provides one, a stale leftover chunk sitting under
+/// the right name pattern inflates the on-disk count past what the manifest itself says should be
+/// there, and is caught as [`DashExecError::RepresentationIncomplete`] rather than silently accepted.
+/// This still does not parse or re-derive `SegmentTimeline` *duration* math -- only the segment counts
+/// it already encodes via `r`.
 pub fn execute(job: &DashSegmentJob, ffmpeg_bin: &Path) -> Result<DashExecOutcome, DashExecError> {
     let args = build_command(job);
 
@@ -177,6 +187,7 @@ pub fn execute(job: &DashSegmentJob, ffmpeg_bin: &Path) -> Result<DashExecOutcom
     if representation_ids.is_empty() {
         return Err(DashExecError::NoRepresentationsProduced);
     }
+    let representation_bodies = parse_representation_bodies(&text);
 
     for id in &representation_ids {
         let init_name = INIT_SEGMENT_NAME_PATTERN.replace("$RepresentationID$", id);
@@ -189,10 +200,27 @@ pub fn execute(job: &DashSegmentJob, ffmpeg_bin: &Path) -> Result<DashExecOutcom
                 });
             }
         }
-        if !has_chunk_for(&job.output_dir, id) {
+
+        let chunk_count = count_chunks_for(&job.output_dir, id);
+        if chunk_count == 0 {
             return Err(DashExecError::RepresentationIncomplete {
                 representation_id: id.clone(),
                 why: "no chunk segment files were found",
+            });
+        }
+        // `expected_chunk_count` is 0 when this representation's own body carries no (parseable)
+        // `SegmentTimeline` -- nothing to compare against, so only the presence check above applies.
+        let expected = representation_bodies
+            .iter()
+            .find(|(rid, _)| rid == id)
+            .map(|(_, body)| expected_chunk_count(body))
+            .unwrap_or(0);
+        if expected > 0 && chunk_count != expected {
+            return Err(DashExecError::RepresentationIncomplete {
+                representation_id: id.clone(),
+                why: "chunk segment file count on disk does not match the manifest's own \
+                      SegmentTimeline -- a stale chunk left over from a different, unrelated job into \
+                      the same output_dir, most likely",
             });
         }
     }
@@ -200,17 +228,28 @@ pub fn execute(job: &DashSegmentJob, ffmpeg_bin: &Path) -> Result<DashExecOutcom
     Ok(DashExecOutcome { manifest_path, representation_count: representation_ids.len(), elapsed })
 }
 
-/// A `fs::read_dir` glob-style scan for at least one real `chunk-<representation_id>-*.m4s` file --
-/// deliberately not parsing `SegmentTimeline` to know exactly how many to expect (see [`execute`]'s
-/// own doc comment on why): a real file existing under the name pattern the manifest's own template
-/// promises is the only thing this needs to prove.
-fn has_chunk_for(output_dir: &Path, representation_id: &str) -> bool {
+/// A `fs::read_dir` glob-style scan counting every real `chunk-<representation_id>-*.m4s` file --
+/// deliberately not *only* checking presence (a bare `.any()` glob match): a name landing in
+/// `output_dir` under the right pattern is not on its own proof it came from *this* `ffmpeg`
+/// invocation rather than a differently-shaped, unrelated prior job into the same directory, since
+/// ffmpeg's DASH muxer never cleans a reused output directory, only overwrites the exact filenames it
+/// rewrites -- confirmed live (ffmpeg 6.1.1): a representation id reassigned between two unrelated
+/// jobs into the same `output_dir` leaves every chunk number the new job never reached still sitting
+/// under the old job's content. Returning the real count (not just whether it's nonzero) lets
+/// [`execute`] compare it against the manifest's own `SegmentTimeline`-declared count and catch
+/// exactly that leftover.
+fn count_chunks_for(output_dir: &Path, representation_id: &str) -> usize {
     let prefix = format!("chunk-{representation_id}-");
-    std::fs::read_dir(output_dir).into_iter().flatten().flatten().any(|entry| {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        name.starts_with(&prefix) && name.ends_with(".m4s")
-    })
+    std::fs::read_dir(output_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix) && name.ends_with(".m4s")
+        })
+        .count()
 }
 
 /// Hand-rolled `<Representation id="...">` scanner -- bounded and total, the same "malformed input is
@@ -243,6 +282,55 @@ fn extract_attr(tag_attrs: &str, name: &str) -> Option<String> {
     let start = tag_attrs.find(&needle)? + needle.len();
     let end = tag_attrs[start..].find('"')?;
     Some(tag_attrs[start..start + end].to_string())
+}
+
+/// Same bounded scan [`parse_representation_ids`] does, but also keeps each `<Representation
+/// id="...">` element's own body text around -- from just after its opening tag's `>` to its own
+/// `</Representation>` -- so [`expected_chunk_count`] has something scoped to count `<S .../>` entries
+/// in, without that count ever being attributed to the wrong representation. Real ffmpeg output never
+/// nests one `<Representation>` inside another, so the first `</Representation>` reached is always
+/// this element's own -- the same non-general-XML, bounded-by-this-element's-own-tags posture
+/// [`parse_representation_ids`]'s own doc comment takes.
+fn parse_representation_bodies(text: &str) -> Vec<(String, &str)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(tag_pos) = rest.find("<Representation") {
+        rest = &rest[tag_pos + "<Representation".len()..];
+        let Some(tag_end) = rest.find('>') else { break };
+        let id = extract_attr(&rest[..tag_end], "id");
+        let body_start = tag_end + 1;
+        let body = match rest[body_start..].find("</Representation>") {
+            Some(end) => &rest[body_start..body_start + end],
+            None => "",
+        };
+        if let Some(id) = id {
+            out.push((id, body));
+        }
+        rest = &rest[tag_end..];
+    }
+    out
+}
+
+/// Counts how many media segments one representation's own `<SegmentTimeline>` declares -- summing
+/// `r+1` for every `<S .../>` entry (DASH's run-length encoding: "this duration, repeated `r` more
+/// times"; `r` defaults to 0, meaning "appears once"). Scoped to `representation_body` -- one
+/// `<Representation>` element's own text, from [`parse_representation_bodies`] -- so a `<S .../>`
+/// belonging to a different representation's `SegmentTimeline` is never counted here. Returns 0 for a
+/// body with no `<S .../>` entries at all (no `SegmentTimeline`, or one [`execute`]'s caller never
+/// asked ffmpeg to produce); callers treat 0 as "nothing to compare against", not "zero segments
+/// expected".
+fn expected_chunk_count(representation_body: &str) -> usize {
+    let mut count = 0usize;
+    let mut rest = representation_body;
+    while let Some(tag_pos) = rest.find("<S ") {
+        rest = &rest[tag_pos + "<S ".len()..];
+        let Some(tag_end) = rest.find('>') else { break };
+        let attrs = &rest[..tag_end];
+        let repeat = extract_attr(attrs, "r").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        count += repeat + 1;
+        rest = &rest[tag_end..];
+    }
+    count
 }
 
 #[cfg(test)]
@@ -324,18 +412,72 @@ mod tests {
     }
 
     #[test]
-    fn has_chunk_for_matches_only_its_own_representations_prefix() {
+    fn count_chunks_for_matches_only_its_own_representations_prefix() {
         let dir = std::env::temp_dir()
             .join(format!("lumen-segment-dash-chunk-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("chunk-0-00001.m4s"), b"x").unwrap();
         std::fs::write(dir.join("chunk-10-00001.m4s"), b"x").unwrap();
-        assert!(has_chunk_for(&dir, "0"));
-        assert!(has_chunk_for(&dir, "10"));
-        assert!(!has_chunk_for(&dir, "1"), "\"1\" must not match \"chunk-10-...\" by prefix alone");
-        assert!(!has_chunk_for(&dir, "2"));
+        std::fs::write(dir.join("chunk-10-00002.m4s"), b"x").unwrap();
+        assert_eq!(count_chunks_for(&dir, "0"), 1);
+        assert_eq!(count_chunks_for(&dir, "10"), 2);
+        assert_eq!(
+            count_chunks_for(&dir, "1"),
+            0,
+            "\"1\" must not match \"chunk-10-...\" by prefix alone"
+        );
+        assert_eq!(count_chunks_for(&dir, "2"), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expected_chunk_count_sums_segment_timeline_repeat_counts() {
+        // Real shape confirmed live against ffmpeg 6.1.1: a `SegmentTimeline` with a single `<S r="9"
+        // />` entry (9 repeats, meaning 10 total) for one representation and a four-entry timeline
+        // (1 + 8 + 1 + 1 = 11) for another, nested inside each one's own `<Representation>`.
+        let video_body = r#"
+            <SegmentTemplate timescale="10240" initialization="init-0.m4s" media="chunk-0-$Number%05d$.m4s" startNumber="1">
+                <SegmentTimeline>
+                    <S t="0" d="10240" r="9" />
+                </SegmentTimeline>
+            </SegmentTemplate>"#;
+        assert_eq!(expected_chunk_count(video_body), 10);
+
+        let audio_body = r#"
+            <SegmentTemplate timescale="44100" initialization="init-1.m4s" media="chunk-1-$Number%05d$.m4s" startNumber="1">
+                <SegmentTimeline>
+                    <S t="0" d="35840" />
+                    <S d="44032" r="7" />
+                    <S d="45056" />
+                    <S d="7848" />
+                </SegmentTimeline>
+            </SegmentTemplate>"#;
+        assert_eq!(expected_chunk_count(audio_body), 11);
+
+        assert_eq!(
+            expected_chunk_count(""),
+            0,
+            "no SegmentTimeline at all means nothing to compare"
+        );
+    }
+
+    #[test]
+    fn parse_representation_bodies_scopes_each_bodys_segment_timeline_to_its_own_id() {
+        let text = r#"<MPD><Period>
+            <AdaptationSet><Representation id="0" mimeType="video/mp4">
+                <SegmentTemplate><SegmentTimeline><S t="0" d="1" r="1" /></SegmentTimeline></SegmentTemplate>
+            </Representation></AdaptationSet>
+            <AdaptationSet><Representation id="1" mimeType="audio/mp4">
+                <SegmentTemplate><SegmentTimeline><S t="0" d="1" /></SegmentTimeline></SegmentTemplate>
+            </Representation></AdaptationSet>
+        </Period></MPD>"#;
+        let bodies = parse_representation_bodies(text);
+        assert_eq!(bodies.len(), 2);
+        let video = bodies.iter().find(|(id, _)| id == "0").unwrap();
+        let audio = bodies.iter().find(|(id, _)| id == "1").unwrap();
+        assert_eq!(expected_chunk_count(video.1), 2);
+        assert_eq!(expected_chunk_count(audio.1), 1);
     }
 
     #[test]
@@ -427,6 +569,68 @@ mod tests {
         };
         let err = execute(&job, &fake_ffmpeg).unwrap_err();
         assert!(matches!(err, DashExecError::RepresentationIncomplete { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_leftover_chunk_from_an_unrelated_prior_job_is_never_mistaken_for_this_runs_real_output()
+     {
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir()
+            .join(format!("lumen-segment-fake-ffmpeg-dash-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // Seeds `output_dir` with exactly the finding's own live repro shape: 10 leftover
+        // `chunk-0-*.m4s` files from an earlier, unrelated job that assigned representation id "0" to
+        // a 10-segment video track, before this job's fake ffmpeg ever runs.
+        for n in 1..=10 {
+            std::fs::write(out_dir.join(format!("chunk-0-{n:05}.m4s")), b"stale-video-bytes")
+                .unwrap();
+        }
+
+        let fake_ffmpeg = dir.join("ffmpeg");
+        // This job's own real output: representation id "0" reassigned to a 2-segment audio track --
+        // writes only `init-0.m4s` and overwrites `chunk-0-00001.m4s`/`chunk-0-00002.m4s`, exactly
+        // like a real ffmpeg DASH muxer does, never touching (let alone removing) 00003..00010.
+        crate::test_support::write_executable_script(
+            &fake_ffmpeg,
+            "#!/bin/sh\n\
+             for a in \"$@\"; do last=\"$a\"; done\n\
+             dir=$(dirname \"$last\")\n\
+             printf x > \"$dir/init-0.m4s\"\n\
+             printf x > \"$dir/chunk-0-00001.m4s\"\n\
+             printf x > \"$dir/chunk-0-00002.m4s\"\n\
+             printf '<MPD><Period><AdaptationSet><Representation id=\"0\" mimeType=\"audio/mp4\">' \
+             > \"$last\"\n\
+             printf '<SegmentTemplate><SegmentTimeline>' >> \"$last\"\n\
+             printf '<S t=\"0\" d=\"44032\" /><S d=\"45050\" />' >> \"$last\"\n\
+             printf '</SegmentTimeline></SegmentTemplate>' >> \"$last\"\n\
+             printf '</Representation></AdaptationSet></Period></MPD>' >> \"$last\"\n\
+             exit 0\n",
+        );
+
+        let job = DashSegmentJob {
+            source: dir.join("in.mkv"),
+            output_dir: out_dir,
+            manifest_name: "manifest.mpd".into(),
+            segment_seconds: 1,
+        };
+        let err = execute(&job, &fake_ffmpeg).expect_err(
+            "8 stale leftover chunks under the reassigned id must be caught, not silently accepted \
+             as this run's real output",
+        );
+        match err {
+            DashExecError::RepresentationIncomplete { representation_id, why } => {
+                assert_eq!(representation_id, "0");
+                assert!(why.contains("does not match"), "{why}");
+            }
+            other => panic!("expected RepresentationIncomplete, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -595,6 +799,149 @@ mod tests {
             out.lines().any(|l| l.contains("h264") && l.contains("video")),
             "expected a stream-copied h264 video stream:\n{out}"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The finding's own live repro, reproduced against a genuine ffmpeg build (6.1.1): one real DASH
+    /// job (10s video+audio, forced 1s keyframes so representation "0"=video genuinely produces 10
+    /// chunks) into `output_dir`, then a second, unrelated real DASH job (2s audio-only) into the
+    /// *same* `output_dir` -- whose own manifest reassigns representation id "0" to audio with only a
+    /// 2-entry `SegmentTimeline`, while `chunk-0-00003.m4s` through `chunk-0-00010.m4s` on disk are
+    /// still run 1's video bytes. Before this module's fix, `execute` accepted run 2 as fully verified
+    /// output; confirms it no longer does. Skipped, not failed, when `ffmpeg` is not on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn two_unrelated_real_ffmpeg_jobs_into_the_same_output_dir_the_second_is_never_silently_accepted()
+     {
+        if !std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipping: ffmpeg is not on PATH in this environment");
+            return;
+        }
+
+        let dir = std::env::temp_dir()
+            .join(format!("lumen-segment-real-ffmpeg-dash-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_dir = dir.join("outdash3");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // Run 1's source: 10s video+audio, encoded with ffmpeg's own lavfi test sources.
+        let long_source = dir.join("source_long.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=10:duration=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=10",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "10",
+                "-keyint_min",
+                "10",
+                "-c:a",
+                "aac",
+                long_source.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg must be runnable to encode run 1's source");
+        assert!(status.success(), "encoding run 1's source failed");
+
+        // Run 1 itself: ffmpeg's real DASH muxer, forcing a 1s keyframe interval (`-g`/`-keyint_min`)
+        // so representation "0" (video) genuinely produces 10 one-second chunks -- matching the
+        // finding's own repro exactly. `build_command` has no knob for `-g`/`-keyint_min`, so run 1 is
+        // built by hand here; run 2 below uses this crate's real, unmodified `execute`.
+        let run1_status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                long_source.to_str().unwrap(),
+                "-map",
+                "0",
+                "-c:v",
+                "libx264",
+                "-g",
+                "10",
+                "-keyint_min",
+                "10",
+                "-c:a",
+                "copy",
+                "-f",
+                "dash",
+                "-seg_duration",
+                "1",
+                "-use_template",
+                "1",
+                "-use_timeline",
+                "1",
+                "-init_seg_name",
+                INIT_SEGMENT_NAME_PATTERN,
+                "-media_seg_name",
+                MEDIA_SEGMENT_NAME_PATTERN,
+                out_dir.join("manifest.mpd").to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg must be runnable for run 1");
+        assert!(run1_status.success(), "run 1 (video+audio) must succeed");
+        // Confirms the fixture really does produce the shape the finding describes: 10 video chunks
+        // under representation id "0" before run 2 ever starts.
+        assert_eq!(count_chunks_for(&out_dir, "0"), 10, "run 1 must leave exactly 10 video chunks");
+
+        // Run 2's source: 2s audio-only, into the *same* `output_dir`, via this crate's own,
+        // unmodified `build_command`/`execute` -- no special-casing for the fact it's reused.
+        let short_source = dir.join("source_short_audio.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-c:a",
+                "aac",
+                short_source.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg must be runnable to encode run 2's source");
+        assert!(status.success(), "encoding run 2's source failed");
+
+        let run2_job = DashSegmentJob {
+            source: short_source,
+            output_dir: out_dir.clone(),
+            manifest_name: "manifest.mpd".to_string(),
+            segment_seconds: 1,
+        };
+        let err = execute(&run2_job, Path::new("ffmpeg")).expect_err(
+            "run 2 must be rejected: representation \"0\" is now audio with a 2-entry \
+             SegmentTimeline, but 8 stale video chunks from run 1 are still sitting under that id",
+        );
+        match err {
+            DashExecError::RepresentationIncomplete { representation_id, why } => {
+                assert_eq!(representation_id, "0");
+                assert!(why.contains("does not match"), "{why}");
+            }
+            other => panic!("expected RepresentationIncomplete, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

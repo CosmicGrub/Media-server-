@@ -134,10 +134,18 @@ impl std::fmt::Display for HlsExecError {
 impl std::error::Error for HlsExecError {}
 
 /// Runs `job` with the `ffmpeg` binary at `ffmpeg_bin` and confirms real output landed on disk: the
-/// playlist file exists, and at least one segment with the right extension sits beside it. This is a
-/// presence check, not [`lumen_exec`]'s stronger content-sniffing verification -- an HLS playlist is
-/// plain text `lumen_probe::sniff` has no signature for, and checking every individual segment's own
-/// bytes is real, separate future work.
+/// playlist file exists, and every segment it declares via `#EXTINF` is a real, non-empty file sitting
+/// beside it. **Deliberately not a bare `output_dir` extension scan** -- counting every `.ts`/`.m4s`
+/// file in the directory, regardless of whether the playlist this run just wrote actually names it,
+/// cannot tell a segment this job produced from a same-extension one a prior, unrelated job into the
+/// same `output_dir` left behind (ffmpeg's HLS muxer, like its DASH muxer, never cleans a reused
+/// output directory, only overwrites the exact filenames it rewrites) -- a leftover stale segment
+/// would silently inflate [`HlsExecOutcome::segment_count`] past what this run actually wrote.
+/// `segment_count` is therefore always exactly the playlist's own `#EXTINF` count, never a directory's
+/// raw file count. This is still a presence check, not [`lumen_exec`]'s stronger content-sniffing
+/// verification -- an HLS playlist is plain text `lumen_probe::sniff` has no signature for, and
+/// checking every individual segment's own bytes beyond "exists and is non-empty" is real, separate
+/// future work.
 pub fn execute(job: &HlsSegmentJob, ffmpeg_bin: &Path) -> Result<HlsExecOutcome, HlsExecError> {
     let args = build_command(job);
 
@@ -157,21 +165,50 @@ pub fn execute(job: &HlsSegmentJob, ffmpeg_bin: &Path) -> Result<HlsExecOutcome,
     if !playlist_path.is_file() {
         return Err(HlsExecError::PlaylistMissing);
     }
+    let playlist_text =
+        std::fs::read_to_string(&playlist_path).map_err(|_| HlsExecError::PlaylistMissing)?;
 
-    let ext = job.format.segment_extension();
-    let segment_count = std::fs::read_dir(&job.output_dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some(ext))
-                .count()
-        })
-        .unwrap_or(0);
-    if segment_count == 0 {
+    let segment_names = parse_extinf_segment_names(&playlist_text);
+    if segment_names.is_empty() {
         return Err(HlsExecError::NoSegmentsProduced);
     }
+    for name in &segment_names {
+        match std::fs::metadata(job.output_dir.join(name)) {
+            Ok(m) if m.len() > 0 => {}
+            // The playlist names a segment that isn't genuinely sitting on disk -- this crate never
+            // serves what it hasn't confirmed is real, the same posture as every other missing-file
+            // case in this module.
+            _ => return Err(HlsExecError::NoSegmentsProduced),
+        }
+    }
 
-    Ok(HlsExecOutcome { playlist_path, segment_count, elapsed })
+    Ok(HlsExecOutcome { playlist_path, segment_count: segment_names.len(), elapsed })
+}
+
+/// Hand-rolled `#EXTINF` scanner returning each declared segment's own file name -- mirroring
+/// `lumen-play`'s own `parse_extinf_pairs` (`remote/server/hls.rs`), kept here so this crate's own
+/// verification doesn't have to trust a bare `output_dir` extension scan that cannot tell a segment
+/// *this* run produced from one a differently-shaped, unrelated prior job left behind under the same
+/// name pattern (see [`execute`]'s own doc comment). Bounded and total like every other hand-rolled
+/// parser in this workspace: a malformed or truncated `#EXTINF` entry is skipped, never panics. Each
+/// URI is reduced to its own file name (`Path::file_name`) before being joined onto `output_dir`,
+/// exactly as defensively as `lumen-play`'s own copy of this logic already does.
+fn parse_extinf_segment_names(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if !line.starts_with("#EXTINF:") {
+            continue;
+        }
+        let Some(uri_line) = lines.next() else { break };
+        let uri = uri_line.trim();
+        if uri.is_empty() || uri.starts_with('#') {
+            continue;
+        }
+        let Some(name) = Path::new(uri).file_name().and_then(|n| n.to_str()) else { continue };
+        out.push(name.to_string());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -235,17 +272,19 @@ mod tests {
         let out_dir = dir.join("out");
         std::fs::create_dir_all(&out_dir).unwrap();
         let fake_ffmpeg = dir.join("ffmpeg");
-        // Ignores its real arguments and writes a playlist plus three fake segments -- enough to
-        // prove `execute` really spawns, waits, and then counts what actually landed on disk.
+        // Ignores its real arguments and writes a playlist (with real `#EXTINF` entries, matching a
+        // genuine ffmpeg playlist's own shape) plus three fake segments -- enough to prove `execute`
+        // really spawns, waits, and then counts what the playlist itself declares.
         crate::test_support::write_executable_script(
             &fake_ffmpeg,
             "#!/bin/sh\n\
              for a in \"$@\"; do last=\"$a\"; done\n\
              dir=$(dirname \"$last\")\n\
-             : > \"$dir/seg_00000.ts\"\n\
-             : > \"$dir/seg_00001.ts\"\n\
-             : > \"$dir/seg_00002.ts\"\n\
-             echo '#EXTM3U' > \"$last\"\n\
+             printf x > \"$dir/seg_00000.ts\"\n\
+             printf x > \"$dir/seg_00001.ts\"\n\
+             printf x > \"$dir/seg_00002.ts\"\n\
+             printf '#EXTM3U\\n#EXTINF:6.0,\\nseg_00000.ts\\n#EXTINF:6.0,\\nseg_00001.ts\\n' > \"$last\"\n\
+             printf '#EXTINF:6.0,\\nseg_00002.ts\\n#EXT-X-ENDLIST\\n' >> \"$last\"\n\
              exit 0\n",
         );
 
@@ -259,6 +298,54 @@ mod tests {
         let outcome = execute(&job, &fake_ffmpeg).expect("the fake ffmpeg must succeed and verify");
         assert_eq!(outcome.segment_count, 3);
         assert!(outcome.playlist_path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_leftover_segment_from_an_unrelated_prior_job_is_never_counted() {
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir()
+            .join(format!("lumen-segment-fake-ffmpeg-hls-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // Seeds `output_dir` with leftover `.ts` segments from an earlier, unrelated job -- exactly
+        // the shape the finding's own repro describes: ffmpeg's HLS muxer never cleans a reused
+        // output directory, only overwrites the exact filenames it rewrites.
+        std::fs::write(out_dir.join("seg_00000.ts"), b"stale-bytes-from-a-prior-job").unwrap();
+        std::fs::write(out_dir.join("seg_00001.ts"), b"stale-bytes-from-a-prior-job").unwrap();
+        std::fs::write(out_dir.join("seg_00002.ts"), b"stale-bytes-from-a-prior-job").unwrap();
+
+        let fake_ffmpeg = dir.join("ffmpeg");
+        // This job's own real output: a single-segment playlist that only overwrites `seg_00000.ts`,
+        // never touching (let alone removing) the two stale leftovers at indices 1 and 2.
+        crate::test_support::write_executable_script(
+            &fake_ffmpeg,
+            "#!/bin/sh\n\
+             for a in \"$@\"; do last=\"$a\"; done\n\
+             dir=$(dirname \"$last\")\n\
+             printf x > \"$dir/seg_00000.ts\"\n\
+             printf '#EXTM3U\\n#EXTINF:6.0,\\nseg_00000.ts\\n#EXT-X-ENDLIST\\n' > \"$last\"\n\
+             exit 0\n",
+        );
+
+        let job = HlsSegmentJob {
+            source: dir.join("in.mkv"),
+            output_dir: out_dir,
+            playlist_name: "stream.m3u8".into(),
+            segment_seconds: 6,
+            format: SegmentFormat::MpegTs,
+        };
+        let outcome = execute(&job, &fake_ffmpeg).expect("the fake ffmpeg must succeed and verify");
+        assert_eq!(
+            outcome.segment_count, 1,
+            "segment_count must reflect the playlist's own single EXTINF entry, not the 3 .ts files \
+             (2 of them stale) actually sitting in output_dir"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -410,6 +497,130 @@ mod tests {
         assert!(
             out.lines().any(|l| l.contains("aac") && l.contains("audio")),
             "expected a stream-copied aac audio stream:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The HLS analogue of the finding's own DASH repro, reproduced against a genuine ffmpeg build
+    /// (6.1.1): one real HLS job (a 6s source, 1s segments) into `output_dir` leaves several `.ts`
+    /// segments, then a second, unrelated real HLS job (a 2s source) into the *same* `output_dir`
+    /// writes a playlist declaring only one segment -- while the earlier job's extra `.ts` files are
+    /// still sitting there, untouched (ffmpeg's HLS muxer never cleans a reused output directory).
+    /// Before this module's fix, `segment_count` was a bare count of every `.ts` file in `output_dir`
+    /// and would have overreported run 2's real output; confirms it no longer does.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_unrelated_real_ffmpeg_jobs_leftover_segments_are_never_counted_as_this_runs_output()
+    {
+        if !std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("skipping: ffmpeg is not on PATH in this environment");
+            return;
+        }
+
+        let dir = std::env::temp_dir()
+            .join(format!("lumen-segment-real-ffmpeg-hls-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out_dir = dir.join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // Run 1's source: 6s video, 1s segments -> several real `.ts` files land in `out_dir`.
+        let long_source = dir.join("source_long.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=10:duration=6",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "10",
+                "-keyint_min",
+                "10",
+                long_source.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg must be runnable to encode run 1's source");
+        assert!(status.success(), "encoding run 1's source failed");
+
+        let run1_job = HlsSegmentJob {
+            source: long_source,
+            output_dir: out_dir.clone(),
+            playlist_name: "stream.m3u8".into(),
+            segment_seconds: 1,
+            format: SegmentFormat::MpegTs,
+        };
+        let run1_outcome =
+            execute(&run1_job, Path::new("ffmpeg")).expect("run 1 (6s source) must succeed");
+        assert!(run1_outcome.segment_count > 1, "run 1 must leave more than one segment behind");
+        let leftover_count = run1_outcome.segment_count;
+
+        // Run 2's source: 2s video, into the *same* `output_dir`, via this crate's own, unmodified
+        // `build_command`/`execute` -- no special-casing for the fact it's reused.
+        let short_source = dir.join("source_short.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=10:duration=2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "10",
+                "-keyint_min",
+                "10",
+                short_source.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("ffmpeg must be runnable to encode run 2's source");
+        assert!(status.success(), "encoding run 2's source failed");
+
+        let run2_job = HlsSegmentJob {
+            source: short_source,
+            output_dir: out_dir.clone(),
+            playlist_name: "stream.m3u8".into(),
+            segment_seconds: 1,
+            format: SegmentFormat::MpegTs,
+        };
+        let run2_outcome =
+            execute(&run2_job, Path::new("ffmpeg")).expect("run 2 (2s source) must succeed");
+
+        assert!(
+            run2_outcome.segment_count < leftover_count,
+            "run 2's own segment_count ({}) must be smaller than what run 1 left behind ({}) -- \
+             otherwise this test's own fixture never reproduced stale leftovers in the first place",
+            run2_outcome.segment_count,
+            leftover_count
+        );
+        let on_disk_ts_files = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("ts"))
+            .count();
+        assert!(
+            on_disk_ts_files > run2_outcome.segment_count,
+            "run 1's stale segments must still be sitting in output_dir ({on_disk_ts_files} .ts \
+             files) even though run 2 only really produced {}",
+            run2_outcome.segment_count
         );
 
         let _ = std::fs::remove_dir_all(&dir);
