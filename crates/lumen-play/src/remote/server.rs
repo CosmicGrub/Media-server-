@@ -288,6 +288,15 @@ struct ServerContext {
     /// watcher (see `spawn_library_watcher`), so there is exactly one place a client-visible version
     /// bump can come from regardless of which trigger caused it.
     library_version: Arc<AtomicU64>,
+    /// Serializes [`rescan_library`]'s walk-and-apply end to end. A manual `ClientMessage::Rescan`
+    /// and the background filesystem watcher (`spawn_library_watcher`) can legitimately call
+    /// `rescan_library` at the same time, and the filesystem walk itself is slow and unlocked --
+    /// without this, whichever call happens to reach the final compare-and-replace *last* wins and
+    /// overwrites `library`, even if its own walk started earlier and so never saw a file the other
+    /// call's walk did. Held for the whole function, not just the apply, so overlapping rescans run
+    /// one at a time instead of racing: the second one to start always walks and applies strictly
+    /// after the first has fully finished, never the other way around.
+    rescan_lock: Mutex<()>,
 }
 
 /// Run the server. Blocks until the process is killed — this is meant to run in the foreground of a
@@ -482,6 +491,7 @@ pub fn run(
         dash_locks: Mutex::new(HashMap::new()),
         dash_active_readers: Mutex::new(HashMap::new()),
         library_version,
+        rescan_lock: Mutex::new(()),
     });
 
     // `docs/15` §A's automatic-rescan phase-2 item, on top of the manual `ClientMessage::Rescan`
@@ -664,14 +674,19 @@ fn respawn_mpv(
     for attempt in 1..=MAX_MPV_RESPAWN_ATTEMPTS {
         log(&format!("driver: mpv died; respawn attempt {attempt}/{MAX_MPV_RESPAWN_ATTEMPTS}"));
         let _ = std::fs::remove_file(ipc_path); // a stale socket/pipe left by the dead instance
+        // The mutex is taken *before* spawning, not after, and held across the spawn call itself:
+        // `spawn_idle_mpv` returning `Ok` means a real OS child already exists, and anything landing
+        // between that return and the store below (a SIGTERM reaching the handler installed in
+        // `run`, concretely) would otherwise find `None` in `mpv_child`, kill nothing, and exit the
+        // whole process -- orphaning the process just spawned. Holding the lock across the spawn
+        // closes that window entirely: a concurrent `kill_mpv_child` call either runs before this
+        // one starts (nothing to kill yet, correct) or blocks until the store below has happened
+        // (something to kill, and it finds it), never in between.
+        let mut guard = mpv_child.lock().unwrap();
         match spawn_idle_mpv(ipc_path, extra_mpv_args) {
             Ok(child) => {
-                // Stored the moment it exists, not only once `connect` below succeeds: `connect`
-                // itself can wait up to 20 seconds for a stuck launch, and a SIGTERM or a
-                // `TcpListener::bind` failure's `MpvChildGuard` arriving during that window must
-                // still be able to find and kill this process, not a stale `None` that makes it
-                // look like nothing is running yet.
-                *mpv_child.lock().unwrap() = Some(child);
+                *guard = Some(child);
+                drop(guard);
                 match Mpv::connect(ipc_path, Duration::from_secs(20)) {
                     Ok(mpv) => {
                         log("driver: respawned mpv is back up; resuming the command loop");
@@ -683,7 +698,10 @@ fn respawn_mpv(
                     }
                 }
             }
-            Err(e) => log(&format!("driver: could not relaunch mpv ({e})")),
+            Err(e) => {
+                drop(guard);
+                log(&format!("driver: could not relaunch mpv ({e})"));
+            }
         }
         if attempt < MAX_MPV_RESPAWN_ATTEMPTS {
             std::thread::sleep(backoff);
@@ -1076,7 +1094,14 @@ fn library_entry_matches_query(title: &str, path: &str, query: &str) -> bool {
 /// watcher settling after an edit that touched a file's mtime but not its content — bumped
 /// `library_version` regardless, which told every paired client's cached library listing it was
 /// stale even when a fresh fetch would have shown the exact same list.
+///
+/// `ctx.rescan_lock` is held for the entire call, walk included, not just the final apply — see its
+/// own doc comment. Two overlapping callers (a manual `Rescan` racing the watcher, or two clients
+/// both asking at once) therefore run strictly one after the other rather than racing to apply
+/// whichever walk happens to finish last: the second call's walk only ever starts once the first
+/// has already replaced `library`, so it can never clobber fresher data with a stale snapshot.
 fn rescan_library(ctx: &ServerContext) -> (u64, u64) {
+    let _serialize = ctx.rescan_lock.lock().unwrap();
     let fresh = scan::scan(std::slice::from_ref(&ctx.library_root), &ScanOptions::default());
     let file_count = fresh.playable().count() as u64;
     let mut library = ctx.library.lock().unwrap();
@@ -1153,12 +1178,21 @@ fn resolve_playable_path(ctx: &ServerContext, requested: &str) -> Result<String,
 /// The pure check behind [`resolve_playable_path`], split out so it can be tested without spinning
 /// up a whole `ServerContext` — the containment logic is what matters here, not the plumbing around
 /// it.
+///
+/// Both ways this can fail — the path does not exist at all, or it exists but sits outside
+/// `library_root` — collapse into the same generic client-facing message. `dispatch`'s `Play` arm
+/// forwards this `Err` to the client verbatim, unlike `http.rs`/`hls.rs`/`dash.rs`, which already
+/// discard it in favour of a bare 404; two textually distinct messages here would let any paired
+/// client (or a token stolen off disk) use `Play` as an existence oracle over the *entire* host
+/// filesystem — "outside the library" meaning the path exists, "does not exist" meaning it does not
+/// — well beyond the library root this check exists to confine them to. The distinction is simply
+/// not something a client needs to tell a server-side log it, if that is ever wanted, from the two
+/// `canonicalize`/`starts_with` branches directly.
 fn contain_within_library(library_root: &Path, requested: &str) -> Result<String, String> {
-    let real = Path::new(requested)
-        .canonicalize()
-        .map_err(|_| "that file does not exist on this server".to_string())?;
+    const REFUSED: &str = "that file is not playable";
+    let real = Path::new(requested).canonicalize().map_err(|_| REFUSED.to_string())?;
     if !real.starts_with(library_root) {
-        return Err("that file is outside the served library".into());
+        return Err(REFUSED.into());
     }
     Ok(real.to_string_lossy().into_owned())
 }
@@ -1260,7 +1294,10 @@ mod tests {
 
         let err = contain_within_library(&root, outsider.to_str().unwrap())
             .expect_err("a path outside the served root must be refused");
-        assert!(err.contains("outside"), "unexpected message: {err}");
+        assert_eq!(
+            err, "that file is not playable",
+            "a refusal must not reveal whether the path exists outside the library"
+        );
     }
 
     #[test]
@@ -1280,7 +1317,10 @@ mod tests {
             .join(victim.file_name().unwrap());
         let err = contain_within_library(&root, traversal.to_str().unwrap())
             .expect_err("a `..`-traversal out of the served root must be refused");
-        assert!(err.contains("outside"), "unexpected message: {err}");
+        assert_eq!(
+            err, "that file is not playable",
+            "a refusal must not reveal whether the path exists outside the library"
+        );
     }
 
     #[test]
@@ -1288,5 +1328,21 @@ mod tests {
         let root = temp_dir("nonexistent-root");
         let missing = root.join("nope.mkv");
         assert!(contain_within_library(&root, missing.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_missing_file_and_an_out_of_library_file_get_the_identical_refusal_message() {
+        // The two failure cases must be indistinguishable to a caller -- otherwise a paired client
+        // could use `Play`'s error message as an oracle for whether an arbitrary absolute path
+        // exists anywhere on the host, far beyond the served library root.
+        let root = temp_dir("oracle-root");
+        let missing = root.join("nope.mkv");
+        let outsider_dir = temp_dir("oracle-victim");
+        let outsider = outsider_dir.join("secret.mkv");
+        std::fs::write(&outsider, b"secret").unwrap();
+
+        let missing_err = contain_within_library(&root, missing.to_str().unwrap()).unwrap_err();
+        let outside_err = contain_within_library(&root, outsider.to_str().unwrap()).unwrap_err();
+        assert_eq!(missing_err, outside_err);
     }
 }
