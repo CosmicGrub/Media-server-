@@ -1,5 +1,9 @@
 /target
 **/*.rs.bk
+
+# Local Claude Code tooling state (e.g. git worktrees spun up for isolated agent runs).
+# Never part of the project itself.
+/.claude/
 conformance/media/
 conformance/golden/
 native/out/
