@@ -1,11 +1,13 @@
 # This branch: Windows PC
 
-This is an **independent fork**, not a landing page. It started from the shared development branch
-(`claude/multiplatform-media-player-server-b7dwe7`) at commit `9cb8b0d` and now diverges from it on
-purpose: this branch's own history is the record of what changed here, and nothing about it is
-fast-forwarded from elsewhere automatically. Two sibling forks exist the same way —
-`device/galaxy-z-fold-5` and `device/galaxy-tab-s9-fe` — each moving independently from the same
-starting point.
+This document was written while `device/windows-pc` was an **independent fork**, not a landing
+page: it started from the shared development branch (`claude/multiplatform-media-player-server-b7dwe7`)
+at commit `9cb8b0d` and diverged from it on purpose, with its own history as the record of what
+changed here. That fork has since been merged into `main` (PR #4, `db27e6a`), along with
+`device/galaxy-z-fold-5` (PR #3, `ee9648b`) — of the three sibling forks, only
+`device/galaxy-tab-s9-fe` still moves independently. What follows describes how this Windows-specific
+work was built and what it adds; treat the file paths and build details as current, and the
+fork-independence framing as history.
 
 ## What this targets, and the Windows 10 / 11 claim specifically
 
@@ -92,24 +94,28 @@ nothing installed and nothing touches the registry until you deliberately ask fo
 Task. `lumen.exe doctor` checks the machine; `lumen.exe serve <path>` starts the server the phone
 pairs with; `Install-LumenServeTask.ps1 -LibraryPath <path>` makes that survive reboots and sign-outs.
 
-## How this branch works
+## How this branch worked
 
-This is a real fork: commit here, and the history diverges from the development branch and from the
-other two device forks starting at their common ancestor `9cb8b0d`. Nothing rebases or
-fast-forwards this branch automatically.
+This was a real fork: commits here diverged the history from the development branch and from the
+other two device forks starting at their common ancestor `9cb8b0d`, and nothing rebased or
+fast-forwarded it automatically.
 
-That independence cuts both ways:
+That independence cut both ways, while it lasted:
 
 - A fix or addition made only here (a Windows-tooling script like the one above, a
-  `package-windows.sh` change) stays local to this fork unless someone deliberately cherry-picks or
-  merges it elsewhere. It will not appear on either Android fork or the shared development branch on
-  its own — nor should most of it, since most of what belongs here is Windows-only by nature.
+  `package-windows.sh` change) stayed local to this fork unless someone deliberately cherry-picked or
+  merged it elsewhere — it did not appear on either Android fork or the shared development branch on
+  its own, nor should most of it have, since most of what belongs here is Windows-only by nature.
 - Conversely, a fix landed on the development branch (a protocol change in `remote/`, a shared bug
-  fix elsewhere in `crates/`) does not reach this fork automatically either. Pulling those in is a
-  deliberate merge (`git merge claude/multiplatform-media-player-server-b7dwe7`), not something that
-  happens by default — this matters more here than on the Android forks, since this is the *server*
-  side of the pairing protocol and a protocol change upstream needs to be merged in before it can
-  speak to an Android fork built against the newer wire format.
+  fix elsewhere in `crates/`) did not reach this fork automatically either; pulling those in took a
+  deliberate merge, not something that happened by default — this mattered more here than on the
+  Android forks, since this is the *server* side of the pairing protocol and a protocol change
+  upstream needed to be merged in before it could speak to an Android fork built against the newer
+  wire format.
 
-In short: propagation between forks is manual and intentional in both directions, not automatic in
-either.
+That manual, intentional propagation is now settled history: `device/windows-pc` was merged into
+`main` via PR #4 (`db27e6a`, with `ea89755` and `44f3604` carrying the cross-fork merges), and
+`device/galaxy-z-fold-5` via PR #3 (`ee9648b`, `4c93722`) — both landing changes that had crossed
+these fork boundaries, such as the Android "Book posture" feature (`24b5712`). `device/windows-pc`'s
+own history, including this file, is part of that merged state. Only `device/galaxy-tab-s9-fe`
+still propagates manually, the way described above.
