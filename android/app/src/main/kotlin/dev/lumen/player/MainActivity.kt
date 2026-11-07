@@ -2,9 +2,12 @@ package dev.lumen.player
 
 import android.Manifest
 import android.app.PictureInPictureParams
+import android.content.Intent
 import android.content.res.Configuration
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.Rational
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -33,11 +36,14 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.util.UnstableApi
+import dev.lumen.player.library.MediaItem as LumenMediaItem
 import dev.lumen.player.player.PipAspectRatio
 import dev.lumen.player.player.PlayerViewModel
 import dev.lumen.player.remote.RemoteScreen
 import dev.lumen.player.remote.RemoteViewModel
 import dev.lumen.player.ui.PlayerScreen
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 
 @UnstableApi
 class MainActivity : ComponentActivity() {
@@ -80,9 +86,19 @@ class MainActivity : ComponentActivity() {
      */
     private val isInPip = mutableStateOf(false)
 
+    /**
+     * A file handed to us via Intent.ACTION_VIEW on a video or audio mime type — a file manager,
+     * browser or share sheet opening a Uri, per the manifest's intent-filter — waiting to be played.
+     * Held as Compose state (same pattern as [isInPip]) because it is set from [onNewIntent], a
+     * plain Activity callback the composition cannot otherwise observe, and cleared once
+     * `vm.play()` has been handed it.
+     */
+    private val pendingViewUri = mutableStateOf<Uri?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         displayOptions = dev.lumen.player.ui.DisplayOptionsStore(this)
+        pendingViewUri.value = viewUriFrom(intent)
         // Edge to edge, because letterboxing on the inner display is exactly what a foldable build
         // exists to avoid.
         enableEdgeToEdge()
@@ -146,6 +162,18 @@ class MainActivity : ComponentActivity() {
                     }
                     androidx.compose.runtime.LaunchedEffect(display.viewMode) {
                         setSystemBarsHidden(display.viewMode.hidesSystemBars)
+                    }
+
+                    // Honor a file handed over via ACTION_VIEW (the manifest's video/audio
+                    // intent-filter). Waits for the controller rather than playing immediately —
+                    // connecting to the playback service is asynchronous, and `vm.play()` would
+                    // otherwise just report "not connected yet" for a cold start.
+                    val pendingUri = pendingViewUri.value
+                    androidx.compose.runtime.LaunchedEffect(pendingUri) {
+                        if (pendingUri == null) return@LaunchedEffect
+                        vm.player.filterNotNull().first()
+                        vm.play(externalMediaItem(pendingUri))
+                        pendingViewUri.value = null
                     }
 
                     // Which player this screen shows. A plain boolean rather than pulling in
@@ -244,6 +272,76 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         isInPip.value = isInPictureInPictureMode
+    }
+
+    /**
+     * The singleTask re-entry path: a second ACTION_VIEW (another file opened from a file manager
+     * or share sheet while Lumen is already running) arrives here instead of a new [onCreate].
+     * Without this, that second file would be silently dropped the same way the first one was
+     * before this fix.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        viewUriFrom(intent)?.let { pendingViewUri.value = it }
+    }
+
+    /** The Uri of a file handed to us via the manifest's video/audio ACTION_VIEW filter, if any. */
+    private fun viewUriFrom(intent: Intent?): Uri? =
+        intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data
+
+    /**
+     * The uri's byte size, when the content provider behind it is willing to say.
+     *
+     * [dev.lumen.player.library.ContentKey] mixes the size in before sampling file bytes, and when
+     * the size is zero its sampling range is empty — every such Uri would then hash to the same
+     * key and collide in the resume store. A `content://` Uri almost always answers
+     * [OpenableColumns.SIZE]; where it does not, the file descriptor's own length is tried before
+     * giving up and returning zero.
+     */
+    private fun querySize(uri: Uri): Long {
+        val viaColumn = runCatching {
+            contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use {
+                if (it.moveToFirst()) {
+                    val index = it.getColumnIndex(OpenableColumns.SIZE)
+                    if (index >= 0 && !it.isNull(index)) it.getLong(index) else null
+                } else {
+                    null
+                }
+            }
+        }.getOrNull()
+        if (viaColumn != null && viaColumn > 0) return viaColumn
+
+        return runCatching {
+            contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length }
+        }.getOrNull()?.takeIf { it > 0 } ?: 0L
+    }
+
+    /**
+     * A playable [LumenMediaItem] for a Uri handed over by another app.
+     *
+     * Built directly from the Uri rather than looked up in the MediaStore library: a Uri handed in
+     * this way need not be a MediaStore row at all (a content:// Uri from a file manager's own
+     * provider, say), so the lookup dev.lumen.player.library.MediaLibrary does for the in-app list
+     * would just as often fail to find it. Duration and dimensions — metadata MediaStore would have
+     * supplied — are left at zero; playback degrades gracefully without them. Size is looked up via
+     * [querySize] rather than left at zero, since a zero size degenerates the resume store's content
+     * key (see [querySize]'s doc) and would make every externally opened file collide in it.
+     */
+    private fun externalMediaItem(uri: Uri): LumenMediaItem {
+        val name = uri.lastPathSegment ?: "Untitled"
+        return LumenMediaItem(
+            id = uri.toString().hashCode().toLong(),
+            uri = uri,
+            title = name,
+            displayName = name,
+            durationMs = 0L,
+            sizeBytes = querySize(uri),
+            width = 0,
+            height = 0,
+            mimeType = contentResolver.getType(uri),
+            relativePath = null,
+        )
     }
 
     /**
