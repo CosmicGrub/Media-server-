@@ -67,6 +67,15 @@ class RemoteClient {
     private val nextId = AtomicLong(1)
     private val pending = ConcurrentHashMap<String, CompletableDeferred<RemoteProtocol.ServerMessage>>()
 
+    /** Identifies which [connect] call a given [readLoop] belongs to. Bumped every time [connect]
+     * wires up a new socket, so a reader loop whose socket was superseded by a later [connect] can
+     * tell, once it finally notices its own socket died, that it is not the current connection
+     * anymore -- see the generation check at the end of [readLoop]. Without this, a reader loop left
+     * over from a connection that [close] asked to tear down (but could not wait for, since [close]
+     * is not suspending) would run its "connection closed" cleanup on the *new* connection's shared
+     * `pending`/`_connection` state once it finally unblocks. */
+    private val connectionGeneration = AtomicLong(0)
+
     private val _connection = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     val connection: StateFlow<ConnectionState> = _connection.asStateFlow()
 
@@ -91,6 +100,7 @@ class RemoteClient {
      */
     suspend fun connect(host: String, port: Int, pinnedFingerprint: String?) {
         close()
+        val generation = connectionGeneration.incrementAndGet()
         _connection.value = ConnectionState.Connecting
         try {
             val s = withContext(Dispatchers.IO) {
@@ -106,7 +116,7 @@ class RemoteClient {
             socket = s
             writer = LineWriter(OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8))
             _connection.value = ConnectionState.AwaitingPairing
-            readerJob = scope.launch { readLoop(s) }
+            readerJob = scope.launch { readLoop(s, generation) }
         } catch (e: java.io.IOException) {
             // Covers both a plain connection failure and a rejected/mismatched TLS handshake --
             // startHandshake() throws SSLHandshakeException, an IOException subclass, wrapping
@@ -116,7 +126,7 @@ class RemoteClient {
         }
     }
 
-    private suspend fun readLoop(s: Socket) {
+    private suspend fun readLoop(s: Socket, generation: Long) {
         val reader = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.UTF_8))
         try {
             while (true) {
@@ -134,6 +144,13 @@ class RemoteClient {
             // A read failing mid-loop is the same "connection is gone" event as a clean close from
             // the peer's side; both are handled identically below.
         }
+        // This loop only learns its socket died after the fact -- by the time we get here, [close]
+        // (called from this client's own [connect] or from outside) may already have moved on to a
+        // brand-new connection that reuses this same `pending`/`_connection` state. If [generation] no
+        // longer matches, that is exactly what happened: some other connection is now current, and
+        // this stale loop must not touch shared state on its way out, or it would clobber a perfectly
+        // healthy new connection with a false "connection closed".
+        if (connectionGeneration.get() != generation) return
         _connection.value = ConnectionState.Disconnected
         // Anyone still waiting on a reply that will now never arrive must be told so, rather than
         // hang forever — a caller awaiting `play()` when the socket drops deserves an answer.
