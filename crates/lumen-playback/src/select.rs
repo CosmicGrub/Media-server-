@@ -67,7 +67,7 @@ fn select_audio(
 
 /// Higher is better. Ordered as a tuple so the comparison is lexicographic by priority, which keeps
 /// the precedence explicit rather than hidden in weight arithmetic.
-type AudioScore = (u8, u8, u8, u8, u8, u32, u32);
+type AudioScore = (u8, u8, u8, u8, u32, u32, u8);
 
 fn audio_score(a: &AudioStream, prefs: &TrackPreferences, caps: &ClientCapabilities) -> AudioScore {
     // Commentary and audio description are never auto-selected; they are deliberate choices.
@@ -91,7 +91,7 @@ fn audio_score(a: &AudioStream, prefs: &TrackPreferences, caps: &ClientCapabilit
     let default = u8::from(a.flags.default);
     let bitrate = u32::try_from(a.bitrate_bps.unwrap_or(0) / 1000).unwrap_or(u32::MAX);
 
-    (not_special, lang, original, fidelity, default, deliverable_channels, bitrate)
+    (not_special, lang, original, fidelity, deliverable_channels, bitrate, default)
 }
 
 fn select_subtitle(
@@ -307,6 +307,21 @@ mod tests {
         let sel = select(&src, &prefs(&["eng"], &["eng"]), &ClientCapabilities::reference_native());
         assert_eq!(sel.audio, Some(1), "still plays the only audio track");
         assert_eq!(sel.subtitle, None);
+    }
+
+    #[test]
+    fn fidelity_ladder_beats_default_flag() {
+        // docs/12 §4 rule 4 (fidelity ladder: channel count, then bitrate) must outrank rule 6
+        // (`FlagDefault`). Same language/codec/bitrate, differing only in channels and the
+        // default flag: the 5.1 track must win even though it is not flagged default.
+        let mut stereo_default = audio_track(1, "eng", AudioCodec::Ac3, 2);
+        stereo_default.flags.default = true;
+        let surround = audio_track(2, "eng", AudioCodec::Ac3, 6);
+        // surround.flags.default is false (StreamFlags::enabled() default).
+
+        let src = source(vec![stereo_default, surround], vec![]);
+        let sel = select(&src, &prefs(&["eng"], &[]), &ClientCapabilities::reference_native());
+        assert_eq!(sel.audio, Some(2), "higher channel count must beat the default flag");
     }
 
     #[test]
