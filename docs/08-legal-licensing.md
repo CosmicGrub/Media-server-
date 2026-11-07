@@ -5,6 +5,10 @@
 
 ## 1. The single most important decision: LGPL-only, dynamically linked
 
+🔴 **Current status, not just target:** this is the architecture the project is building toward and the policy
+`native/` and `cargo-deny` are held to. It is **not** what the Windows and Linux desktop release bundles ship
+today — see §1.4 below before assuming the rest of this section describes the real binaries in those bundles.
+
 FFmpeg is dual-licensed: **LGPL v2.1+** for the core, with parts available only under **GPL v2+**. The choice is
 determined by your build flags and linkage:
 
@@ -68,6 +72,44 @@ GPL-only mpv pieces. Options, in order of preference:
   than linking, but 🔴 get an opinion on whether your invocation creates a combined work.
 - **Ship the whole product as GPL.** Perfectly reasonable if you never want App Store distribution or proprietary
   licensing. Decide this consciously, not by accident.
+
+### 1.4 Current exception: the Windows desktop bundle ships GPL, statically linked (Linux is a narrower, separate concern)
+
+`native/` today holds only the LGPL-only build recipes (spike S4 has not yet produced built artifacts from them —
+see [`../native/README.md`](../native/README.md)). Pending that, the Windows and Linux desktop release bundles
+diverge from this section's architecture in two different ways:
+
+- **Windows.** `crates/lumen-play/package-windows.sh --with-mpv` and `.github/workflows/release.yml`'s "Bundle
+  mpv (Windows)" step fetch a **pre-built third-party mpv** from
+  [`shinchiro/mpv-winbuild-cmake`](https://github.com/shinchiro/mpv-winbuild-cmake)'s releases (SourceForge
+  first, GitHub releases as fallback) and bundle it unmodified. That upstream build is configured with
+  `--enable-gpl --enable-libx264 --enable-libx265` and links FFmpeg statically — exactly the "dynamic linking,
+  not static" line from §1.2 point 1, and the GPL encoders §1.3 says to avoid, violated at once.
+  [`../DEVICE.md`](../DEVICE.md) itself documents the shipped binary as "mpv.exe (statically linked FFmpeg and
+  libplacebo)". As distributed, the Windows bundle is **GPLv2+, not LGPL**.
+- **Linux.** `crates/lumen-play/package-linux.sh --with-mpv` and `release.yml`'s "Bundle mpv (Linux)" step
+  instead install mpv from Ubuntu's own `apt` repository and run `crates/lumen-play/vendor-mpv-linux.sh`, which
+  copies that system mpv and its codec/format/subtitle shared libraries beside the binary and rewrites `RPATH`
+  with `patchelf`. This is **dynamic linking**, not static — the script's own header is explicit that "nobody
+  ships a static mpv for Linux" — and it is **not** sourced from `shinchiro/mpv-winbuild-cmake` or SourceForge at
+  all. So the Windows problem above (static linking, third-party build provenance) does not apply to Linux. What
+  is unresolved is narrower: Ubuntu's distro FFmpeg, which that system mpv links against, is commonly built with
+  `--enable-gpl`/`--enable-libx264`/`--enable-libx265` in current releases, which would make the vendored
+  `libx264`/`libx265`/`libavcodec` shared libraries GPL-licensed despite the dynamic linking being otherwise
+  correct. 🔴 This has not been verified against the actual `ubuntu-latest` runner image — confirm before
+  assuming the Linux bundle is LGPL-clean.
+
+Both are recorded here as **conscious, disclosed exceptions** (per the "ship the whole product as GPL" option
+in §1.3 above for Windows; pending verification for Linux), not a silent gap:
+- While the Windows exception stands, that bundle is **GPLv2+ as distributed**, not LGPL — the LGPL obligations
+  in §1.2 (publish source, enable relinking, attribution) don't make this compliant; GPL has its own, broader
+  obligations.
+- `ci/license-gate.sh` (§1.1) does not inspect either the downloaded Windows `mpv.exe` or the vendored Linux
+  `mpv`/shared libraries — it scans `native/`'s recipes and an `FFMPEG_BIN` the caller supplies, neither of which
+  these binaries are. Nothing in CI currently flags either bundle.
+- Neither applies to macOS/iOS/tvOS: App Store terms independently forbid shipping GPL there, exception or not.
+- Closes when spike S4's `native/` build produces real LGPL mpv/FFmpeg for Windows and Linux and the bundling
+  steps switch to it — see [ADR-0002](adr/0002-lgpl-only-build.md), "Current exceptions", for the full record.
 
 ## 2. Codec patents (separate from copyright licensing)
 

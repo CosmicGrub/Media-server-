@@ -28,11 +28,20 @@ behaviour, that difference belongs in its `ClientCapabilities`, never in a secon
 decision logic. Divergence here reaches users as unexplained transcoding — the loudest complaint
 about every product we are competing with.
 
-**2. Never `--enable-gpl`.**
-One GPL flag makes the whole combined work GPL and permanently forecloses App Store distribution.
-`ci/license-gate.sh` blocks it. If you believe you need a GPL component, read
-[ADR-0002](docs/adr/0002-lgpl-only-build.md) §1.3 first — there is almost certainly a permissive
-substitute, and for encoders there definitely is.
+**2. Never `--enable-gpl` in `native/`.**
+One GPL flag in our own build recipes makes the whole combined work GPL and permanently
+forecloses App Store distribution. `ci/license-gate.sh` blocks it — but only there: it scans
+`native/`'s recipes and an FFmpeg binary you point it at, not any other binary. It does **not**
+see the pre-built, third-party, GPL, statically-linked mpv that `package-windows.sh --with-mpv`
+and `release.yml` currently download and bundle for the Windows desktop release, nor the
+distro-sourced mpv that `package-linux.sh --with-mpv`/`vendor-mpv-linux.sh` vendor (dynamically
+linked, but possibly GPL via Ubuntu's own FFmpeg packaging) for the Linux desktop release — those
+are disclosed exceptions to ADR-0002, not something the gate has verified. See
+[ADR-0002](docs/adr/0002-lgpl-only-build.md) "Current exceptions" and
+[`docs/08-legal-licensing.md`](docs/08-legal-licensing.md) §1.4 before assuming a green
+`license-gate` run says anything about those bundles. If you believe you need a GPL component,
+read [ADR-0002](docs/adr/0002-lgpl-only-build.md) §1.3 first — there is almost certainly a
+permissive substitute, and for encoders there definitely is.
 
 **3. Degradation is never silent.**
 Any code path that reduces fidelity must emit a `RejectReason`. `explain()` is a product surface

@@ -56,11 +56,16 @@ and all of them fail on the files you care about: DTS-HD MA in MKV, Dolby Vision
 subtitles, 100-track anime remuxes, BDMV folders. libmpv is the only embeddable engine that handles all of it and
 gives you `gpu-next`/libplacebo tone mapping and user shaders on top. See [`03-playback-engine.md`](03-playback-engine.md).
 
-### D2 — LGPL-only build discipline, enforced in CI
+### D2 — LGPL-only build discipline, enforced in CI (target architecture; Windows/Linux desktop currently exceptions)
 The moment someone builds FFmpeg with `--enable-gpl` (for `libx264`, `libx265`, or a GPL filter) the whole product
 becomes GPL and the iOS App Store — and any proprietary licensing you might want later — is off the table. Build
 LGPL-only, dynamically linked, from day one, and **fail the build** if `--enable-gpl` appears. This is a one-line CI
-check that saves a rewrite. See [`08-legal-licensing.md`](08-legal-licensing.md).
+check that saves a rewrite — **for the code it actually looks at.** `ci/license-gate.sh` scans `native/`'s own
+recipes and an FFmpeg binary built from them; it is not run against the pre-built, third-party, GPL,
+statically-linked mpv the Windows desktop release currently downloads and ships, nor against the dynamically-linked
+but distro-sourced mpv the Linux desktop release vendors (see [ADR-0002](adr/0002-lgpl-only-build.md), "Current
+exceptions"). Until those exceptions close, D2 holds for `native/` and for `cargo-deny`'s dependency policy, but
+**not** for what the Windows/Linux desktop release actually bundles. See [`08-legal-licensing.md`](08-legal-licensing.md).
 
 ### D3 — Direct Play is the product; transcoding is the failure mode
 Plex and Jellyfin transcode when they shouldn't, silently, and users find out when their remux turns to mush. Invert
