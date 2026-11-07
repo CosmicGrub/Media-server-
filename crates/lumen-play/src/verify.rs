@@ -36,6 +36,25 @@ pub const DEFAULT_REVERIFY_DAYS: u64 = 30;
 /// tier-and-oldest-first, never favouring the same subset of files forever.
 pub const DEFAULT_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
+/// Same race, same fix as `reindex::lock_index`: `persist::save`'s atomic rename only guards against
+/// a crash mid-write, not a second `lumen verify` (or `lumen reindex`) process loading the same
+/// on-disk snapshot while this one is still between its own `load` and `save`. An exclusive lock on
+/// a sidecar `.lock` file, held for the whole load-verify-save cycle, serializes the two instead of
+/// letting the second silently clobber whatever the first just persisted.
+fn lock_index(db: &Path) -> Result<std::fs::File, String> {
+    let mut lock_path = db.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = std::path::PathBuf::from(lock_path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("locking {}: {e}", lock_path.display()))?;
+    fs4::FileExt::lock(&file).map_err(|e| format!("locking {}: {e}", lock_path.display()))?;
+    Ok(file)
+}
+
 /// Run one verification pass against `db`: load the persisted index, re-check whatever
 /// [`lumen_index::Index::verify`] says is due within `budget_bytes`, and save the result back --
 /// including any mismatch found, so it stays flagged for the next invocation until resolved.
@@ -44,6 +63,8 @@ pub fn run(
     reverify_days: u64,
     budget_bytes: u64,
 ) -> Result<(Index, VerifyReport), String> {
+    let _lock = lock_index(db)?;
+
     let mut index = load(db).map_err(|e| format!("reading {}: {e}", db.display()))?;
     let now = unix_now();
     let reverify_after_secs = reverify_days.saturating_mul(24 * 60 * 60);
@@ -237,6 +258,30 @@ mod tests {
         let (_, second) = run(&db, 0, DEFAULT_BUDGET_BYTES).unwrap();
 
         assert_eq!(second.confirmed, 1, "must load the prior baseline from disk, not start blind");
+    }
+
+    #[test]
+    fn lock_index_excludes_a_second_acquirer_while_the_first_holds_it() {
+        // Same race, same mechanism as `reindex::lock_index`'s own test: a second `lumen verify` (or
+        // `lumen reindex`) process must not be able to begin its own load-verify-save cycle while
+        // this one still holds the sidecar lock, or it could load the same stale snapshot and
+        // silently clobber whatever this one is about to persist.
+        let d = TempDir::new("lock-mutex");
+        let db = d.0.join(".lumen-index");
+
+        let first = lock_index(&db).unwrap();
+
+        let mut lock_path = db.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let second_handle = std::fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(
+            matches!(fs4::FileExt::try_lock(&second_handle), Err(fs4::TryLockError::WouldBlock)),
+            "a second process must not be able to acquire the lock while the first still holds it"
+        );
+
+        drop(first);
+        fs4::FileExt::try_lock(&second_handle)
+            .expect("once the first process's lock is released, a second must be able to acquire it");
     }
 
     #[test]

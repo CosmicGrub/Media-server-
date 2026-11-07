@@ -21,6 +21,28 @@ pub fn default_index_path(root: &Path) -> PathBuf {
     root.join(".lumen-index")
 }
 
+/// `persist::save`'s atomic temp-file-then-rename protects a reindex against a crash mid-write, but
+/// nothing stops a *second* `lumen reindex` (or `lumen verify`) process from loading the same
+/// on-disk snapshot while this one is still between its own `load` and `save` -- each would discover
+/// a different newly-added file, and whichever saves second silently clobbers the file with its own
+/// stale view, erasing the first process's already-persisted record. An exclusive lock on a sidecar
+/// `.lock` file, held for the whole load-reindex-save cycle, closes that window: a second process
+/// blocks here until the first's lock is dropped, by which point the first's save has already landed
+/// and the second's own `load` picks it up instead of racing it.
+fn lock_index(db: &Path) -> Result<std::fs::File, String> {
+    let mut lock_path = db.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("locking {}: {e}", lock_path.display()))?;
+    fs4::FileExt::lock(&file).map_err(|e| format!("locking {}: {e}", lock_path.display()))?;
+    Ok(file)
+}
+
 /// Run one incremental reindex pass against `db`: load the persisted index (or start empty),
 /// reconcile it against what `scan::candidate_paths` finds under `root` right now -- probing only
 /// what a cheap fingerprint says has actually changed -- and save the result back.
@@ -28,6 +50,8 @@ pub fn default_index_path(root: &Path) -> PathBuf {
 /// Returns the loaded-and-updated index plus the report of what happened, so a caller can print a
 /// summary, decide whether to tell paired clients the library changed, or both.
 pub fn run(root: &Path, db: &Path) -> Result<(Index, ReindexReport), String> {
+    let _lock = lock_index(db)?;
+
     let mut index = load(db).map_err(|e| format!("reading {}: {e}", db.display()))?;
     let observed = scan::candidate_paths(std::slice::from_ref(&root.to_path_buf()));
 
@@ -177,5 +201,107 @@ mod tests {
             "a fresh process must load prior state from disk, not start blind"
         );
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn lock_index_excludes_a_second_acquirer_while_the_first_holds_it() {
+        let d = TempDir::new("lock-mutex");
+        let db = d.0.join(".lumen-index");
+
+        let first = lock_index(&db).unwrap();
+
+        // The same mechanism a real second `lumen reindex` process would use to open the sidecar
+        // lock file: a fresh `File` handle on the identical path. `flock` locks are scoped to the
+        // open file description, not the process, so this is a faithful stand-in for "a second
+        // process tries to start its own cycle" without actually spawning one.
+        let mut lock_path = db.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let second_handle = std::fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(
+            matches!(fs4::FileExt::try_lock(&second_handle), Err(fs4::TryLockError::WouldBlock)),
+            "a second process must not be able to acquire the lock while the first still holds it"
+        );
+
+        drop(first);
+        fs4::FileExt::try_lock(&second_handle)
+            .expect("once the first process's lock is released, a second must be able to acquire it");
+    }
+
+    #[test]
+    fn two_overlapping_reindex_cycles_lose_neither_discovery() {
+        // Reproduces the finding's own race: two "processes" load the same on-disk snapshot, each
+        // discovers a different newly-added file, and -- without the lock -- whichever saves second
+        // used to silently clobber the file with its own stale view, erasing the first process's
+        // already-persisted record. `lock_index` closes that window by holding the lock for the
+        // whole load-reindex-save cycle, so a second process cannot even begin its own `load` until
+        // the first's `save` has already landed.
+        let d = TempDir::new("race");
+        let existing = d.file("existing.mkv", &mkv_bytes());
+        let movie_a = d.file("Movie A.mkv", &mkv_bytes());
+        let movie_b = d.file("Movie B.mkv", &mkv_bytes());
+        let db = d.0.join(".lumen-index");
+
+        // Baseline, already indexed and persisted before either process starts -- matches the
+        // finding's own repro's starting state ("baseline saved: 1 live record(s)").
+        let mut baseline = Index::default();
+        baseline.reindex(std::slice::from_ref(&existing), |path, _| probe_one(path)).unwrap();
+        save(&db, &baseline).unwrap();
+
+        let (lock_acquired_tx, lock_acquired_rx) = std::sync::mpsc::channel::<()>();
+        let (cycle_done_tx, cycle_done_rx) = std::sync::mpsc::channel::<()>();
+        let db_a = db.clone();
+        let existing_a = existing.clone();
+        let movie_a_a = movie_a.clone();
+
+        // "Process A": acquires the lock first (signalled below, so ordering is deterministic
+        // rather than a timing guess), then runs a full load-reindex-save cycle discovering
+        // `Movie A.mkv`, and only releases the lock once that closure returns.
+        let a = std::thread::spawn(move || {
+            let _lock = lock_index(&db_a).unwrap();
+            lock_acquired_tx.send(()).unwrap();
+
+            let mut index = load(&db_a).unwrap();
+            index
+                .reindex(&[existing_a.clone(), movie_a_a.clone()], |path, _| probe_one(path))
+                .unwrap();
+            save(&db_a, &index).unwrap();
+
+            cycle_done_tx.send(()).unwrap();
+            // `_lock` drops here, at the end of the closure -- strictly after `save` and after the
+            // `cycle_done` signal above.
+        });
+
+        // Wait until process A definitely holds the lock before "process B" tries for it, so the
+        // test exercises a real, deterministic contention rather than a race on who gets there
+        // first.
+        lock_acquired_rx.recv().unwrap();
+
+        // This is exactly where, before the fix, process B would load the same stale baseline
+        // process A started from and go on to silently erase `Movie A.mkv` with its own save. With
+        // the lock in place this call blocks -- a real OS-level `flock` wait, not a timeout -- until
+        // process A's lock (and therefore its whole cycle, including its `save`) is gone.
+        let lock_b = lock_index(&db).unwrap();
+        assert!(
+            cycle_done_rx.try_recv().is_ok(),
+            "process B must not be able to start its own cycle until process A's has fully finished"
+        );
+
+        let mut index_b = load(&db).unwrap();
+        index_b
+            .reindex(&[existing.clone(), movie_a.clone(), movie_b.clone()], |path, _| {
+                probe_one(path)
+            })
+            .unwrap();
+        save(&db, &index_b).unwrap();
+        drop(lock_b);
+        a.join().unwrap();
+
+        let final_index = load(&db).unwrap();
+        assert!(
+            final_index.get(&movie_a).is_some(),
+            "process A's discovery must survive process B's save"
+        );
+        assert!(final_index.get(&movie_b).is_some(), "process B's own discovery must be present");
+        assert!(final_index.get(&existing).is_some(), "the original baseline record must survive");
     }
 }
