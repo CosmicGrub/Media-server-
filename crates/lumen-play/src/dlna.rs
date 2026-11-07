@@ -61,7 +61,8 @@ use std::time::{Duration, Instant};
 use lumen_discovery::{
     Announcement, BrowseFlag, DeviceIdentity, DidlObject, DidlResource, ObjectClass, Responder,
     SearchCriteria, build_browse_response, build_cd_search_response, build_device_description,
-    build_didl_lite, build_get_current_connection_ids_response, build_get_protocol_info_response,
+    build_didl_lite, build_get_current_connection_ids_response,
+    build_get_current_connection_info_response, build_get_protocol_info_response,
     build_get_search_capabilities_response, build_get_sort_capabilities_response,
     build_get_system_update_id_response, build_soap_fault, connection_manager_scpd,
     content_directory_scpd, parse_browse_request, parse_search_request,
@@ -905,6 +906,12 @@ fn handle_connection_manager_control(tcp: &mut TcpStream, req: &HttpRequest, _bo
             tcp,
             "text/xml; charset=\"utf-8\"",
             build_get_current_connection_ids_response().as_bytes(),
+        );
+    } else if action.contains("#GetCurrentConnectionInfo") {
+        write_ok(
+            tcp,
+            "text/xml; charset=\"utf-8\"",
+            build_get_current_connection_info_response().as_bytes(),
         );
     } else {
         write_soap_fault(tcp, 401, "Invalid Action");

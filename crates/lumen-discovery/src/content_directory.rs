@@ -395,10 +395,25 @@ fn escape_xml(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            other => out.push(other),
+            other if is_xml_legal_char(other) => out.push(other),
+            // XML 1.0's Char production forbids raw control bytes like BEL (0x07). Such bytes are
+            // legal in Unix filenames (mangled rips, bad encodings) and would otherwise pass straight
+            // through into `<dc:title>`, making the whole Browse/Search response not well-formed.
+            _ => out.push('\u{FFFD}'),
         }
     }
     out
+}
+
+/// Whether `c` is legal in XML 1.0 character data per the Char production:
+/// `#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]`.
+fn is_xml_legal_char(c: char) -> bool {
+    matches!(c,
+        '\u{9}' | '\u{A}' | '\u{D}'
+        | '\u{20}'..='\u{D7FF}'
+        | '\u{E000}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{10FFFF}'
+    )
 }
 
 /// The inverse of [`escape_xml`], for reading a leaf element's text content back out.
@@ -522,6 +537,26 @@ mod tests {
         let didl = build_didl_lite(&objects);
         assert!(!didl.contains("& \""), "raw & or \" must never appear unescaped in the XML");
         assert!(didl.contains("Ampersand &amp; &quot;Friends&quot; &lt;Special&gt;"));
+    }
+
+    #[test]
+    fn a_title_with_a_raw_control_byte_never_produces_not_well_formed_xml() {
+        // Raw C0 control bytes like BEL (0x07) are legal in Unix filenames (mangled rips, bad
+        // encodings) but XML 1.0's Char production forbids them outside tab/LF/CR. A single such
+        // filename must never make the whole Browse/Search response fail to parse.
+        let objects = vec![DidlObject {
+            id: "4".into(),
+            parent_id: "0".into(),
+            title: "Movie\u{7}.mkv".into(),
+            class: ObjectClass::VideoItem,
+            resource: None,
+        }];
+        let didl = build_didl_lite(&objects);
+        assert!(
+            !didl.contains('\u{7}'),
+            "a raw control byte must not reach the output verbatim: {didl}"
+        );
+        assert!(didl.contains("Movie\u{FFFD}.mkv"));
     }
 
     #[test]

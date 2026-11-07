@@ -209,6 +209,28 @@ pub fn build_get_current_connection_ids_response() -> String {
         .to_string()
 }
 
+/// `ConnectionManager:1#GetCurrentConnectionInfo`'s response, for the same single implicit
+/// connection ID `"0"` that `build_get_current_connection_ids_response` always reports: no
+/// `AVTransport`/`RenderingControl` service exists on this device, so `AVTransportID` and `RcsID`
+/// are `-1` (unknown/not applicable); `Direction` is always `Output` and `PeerConnectionManager`/
+/// `PeerConnectionID` are left empty/`-1` because `lumen serve` never tracks who the peer is, only
+/// that it sources media. `Status` is always `OK` -- there is no failure state this stub can detect.
+pub fn build_get_current_connection_info_response() -> String {
+    "<?xml version=\"1.0\"?>\
+     <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+     s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+     <s:Body><u:GetCurrentConnectionInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:ConnectionManager:1\">\
+     <RcsID>-1</RcsID>\
+     <AVTransportID>-1</AVTransportID>\
+     <ProtocolInfo></ProtocolInfo>\
+     <PeerConnectionManager></PeerConnectionManager>\
+     <PeerConnectionID>-1</PeerConnectionID>\
+     <Direction>Output</Direction>\
+     <Status>OK</Status>\
+     </u:GetCurrentConnectionInfoResponse></s:Body></s:Envelope>"
+        .to_string()
+}
+
 fn escape_xml(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -218,10 +240,25 @@ fn escape_xml(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            other => out.push(other),
+            other if is_xml_legal_char(other) => out.push(other),
+            // XML 1.0's Char production forbids raw control bytes like BEL (0x07). Such bytes are
+            // legal in Unix filenames (mangled rips, bad encodings) and would otherwise pass straight
+            // through into the SCPD/description output, making it not well-formed.
+            _ => out.push('\u{FFFD}'),
         }
     }
     out
+}
+
+/// Whether `c` is legal in XML 1.0 character data per the Char production:
+/// `#x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]`.
+fn is_xml_legal_char(c: char) -> bool {
+    matches!(c,
+        '\u{9}' | '\u{A}' | '\u{D}'
+        | '\u{20}'..='\u{D7FF}'
+        | '\u{E000}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{10FFFF}'
+    )
 }
 
 #[cfg(test)]
@@ -251,6 +288,22 @@ mod tests {
             "http://x",
         );
         assert!(doc.contains("Bob &amp; Alice&apos;s PC"));
+    }
+
+    #[test]
+    fn a_friendly_name_with_a_raw_control_byte_never_produces_not_well_formed_xml() {
+        // Raw C0 control bytes like BEL (0x07) are legal in Unix filenames (mangled rips, bad
+        // encodings) but XML 1.0's Char production forbids them outside tab/LF/CR. A single such
+        // name must never make the device description fail to parse.
+        let doc = build_device_description(
+            &DeviceIdentity { friendly_name: "Living Room\u{7} PC".into(), uuid: "x".into() },
+            "http://x",
+        );
+        assert!(
+            !doc.contains('\u{7}'),
+            "a raw control byte must not reach the output verbatim: {doc}"
+        );
+        assert!(doc.contains("Living Room\u{FFFD} PC"));
     }
 
     #[test]
@@ -361,5 +414,13 @@ mod tests {
             build_get_current_connection_ids_response()
                 .contains("<ConnectionIDs>0</ConnectionIDs>")
         );
+    }
+
+    #[test]
+    fn current_connection_info_answers_rather_than_faulting_on_the_connection_scpd_advertises() {
+        let resp = build_get_current_connection_info_response();
+        assert!(resp.contains("<u:GetCurrentConnectionInfoResponse"), "{resp}");
+        assert!(resp.contains("<Direction>Output</Direction>"), "this server only sources: {resp}");
+        assert!(resp.contains("<Status>OK</Status>"), "{resp}");
     }
 }

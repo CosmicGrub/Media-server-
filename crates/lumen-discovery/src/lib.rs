@@ -39,7 +39,8 @@ pub use content_directory::{
 };
 pub use descriptor::{
     DeviceIdentity, build_device_description, build_get_current_connection_ids_response,
-    build_get_protocol_info_response, connection_manager_scpd, content_directory_scpd,
+    build_get_current_connection_info_response, build_get_protocol_info_response,
+    connection_manager_scpd, content_directory_scpd,
 };
 pub use message::{
     Announcement, MSearchRequest, build_notify_alive, build_notify_byebye, build_search_response,
