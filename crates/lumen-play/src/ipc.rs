@@ -34,6 +34,27 @@ pub fn default_ipc_path(tag: &str) -> String {
     }
 }
 
+/// What a single command's reply told us -- see `Mpv::command_outcome`, the shared core behind both
+/// the long-standing `command`/`command_timeout` (which only ever needed `Option<Value>`) and
+/// `command_succeeded` (which needs to tell "rejected" and "timed out" apart from a real success,
+/// even one with nothing in `data`).
+enum CommandOutcome {
+    Success(Option<Value>),
+    Rejected,
+    TimedOut,
+}
+
+impl CommandOutcome {
+    /// The exact value `command`/`command_timeout` always returned for each case, preserved so
+    /// splitting `command_outcome` out from them changes nothing about their existing behavior.
+    fn into_data(self) -> Option<Value> {
+        match self {
+            Self::Success(data) => data,
+            Self::Rejected | Self::TimedOut => None,
+        }
+    }
+}
+
 pub struct Mpv {
     writer: Box<dyn Write + Send>,
     rx: Receiver<Value>,
@@ -158,6 +179,29 @@ impl Mpv {
         args: &[&str],
         timeout: Duration,
     ) -> std::io::Result<Option<Value>> {
+        Ok(self.command_outcome(args, timeout)?.into_data())
+    }
+
+    /// Run a command and report only whether mpv actually accepted it, waiting up to five seconds.
+    ///
+    /// Unlike [`command`](Self::command)/[`command_timeout`](Self::command_timeout), this does not
+    /// collapse "mpv rejected it" and "mpv answered success with nothing to return" into the same
+    /// `None` -- most commands with a side effect and no return value (`set_property`, `seek`,
+    /// `cycle`, ...) succeed with no `data` field at all, so that collapse is exactly right for a
+    /// *read* (an unsupported property is "unknown", not "failed") but wrong for a *command*, where
+    /// mpv rejecting it or never acknowledging it is a genuine failure the caller needs to see as one.
+    pub fn command_succeeded(&mut self, args: &[&str]) -> std::io::Result<bool> {
+        Ok(matches!(
+            self.command_outcome(args, Duration::from_secs(5))?,
+            CommandOutcome::Success(_)
+        ))
+    }
+
+    fn command_outcome(
+        &mut self,
+        args: &[&str],
+        timeout: Duration,
+    ) -> std::io::Result<CommandOutcome> {
         self.next_id += 1;
         let id = self.next_id;
         let quoted: Vec<String> = args.iter().map(|a| json::quote(a)).collect();
@@ -166,13 +210,13 @@ impl Mpv {
         let deadline = Instant::now() + timeout;
         loop {
             let Some(v) = self.recv_until(deadline) else {
-                return Ok(None); // timed out; the caller treats a missing answer as unknown
+                return Ok(CommandOutcome::TimedOut);
             };
             if v.get("request_id").and_then(Value::as_f64) == Some(id as f64) {
                 if v.get("error").and_then(Value::as_str) != Some("success") {
-                    return Ok(None);
+                    return Ok(CommandOutcome::Rejected);
                 }
-                return Ok(v.get("data").cloned());
+                return Ok(CommandOutcome::Success(v.get("data").cloned()));
             }
             // Not our reply. If it is an event it must survive — dropping it here is how an
             // `end-file` reason goes missing and a real failure gets recorded as "unknown".

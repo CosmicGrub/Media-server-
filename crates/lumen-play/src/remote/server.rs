@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,6 +43,26 @@ use crate::scan::{self, Scan, ScanOptions, ScannedFile};
 /// enough that a seek feels immediate on the client, long enough that idle connections cost nothing
 /// worth measuring.
 const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(300);
+
+/// Bounds how long a write to a client socket may block before this thread gives up on it and ends
+/// the connection -- the same reasoning as `CONNECTION_POLL_INTERVAL`'s read timeout, but applied to
+/// the direction that previously had no deadline at all. Without it, a peer that stops draining its
+/// receive buffer (asleep, off Wi-Fi, a NAT session dropped silently) blocks this thread's `write_all`
+/// for as long as the OS's own retransmission/zero-window behaviour allows -- effectively forever --
+/// which also permanently inflates `ServerContext::active_clients`, since `ActiveClientGuard`'s `Drop`
+/// can never run for a thread stuck in a write that never returns. Generous enough that a slow but
+/// live connection streaming an `http::CHUNK_SIZE`-sized chunk over a throttled link is never mistaken
+/// for a dead one.
+const CONNECTION_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Caps how large an incoming JSON line's buffered-but-incomplete prefix may grow before this
+/// connection is refused outright, matching `http.rs`'s own `MAX_HEADER_BYTES` rationale. This check
+/// runs before pairing/auth is ever consulted (a line has to be parsed before
+/// `ClientMessage::is_pre_auth` is checked), so without it an unauthenticated connection could grow
+/// `pending` without bound while forcing every read to rescan all of it for a `\n` that may never
+/// arrive -- pinning this thread's CPU core and growing its memory with nothing required but a
+/// completed TLS handshake.
+const MAX_PENDING_LINE_BYTES: usize = 16 * 1024;
 
 /// How often the driver thread re-reads mpv's own properties to build the next `PlaybackState`.
 const MPV_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -330,6 +350,14 @@ pub fn run(
     let mpv_child = Arc::new(Mutex::new(Some(child)));
     let _mpv_child_guard = MpvChildGuard(Arc::clone(&mpv_child));
 
+    // Set by the SIGTERM handler below *before* it kills mpv, and consulted by `drive_mpv` so mpv's
+    // IPC socket closing as a direct result of that kill is never mistaken for an unexpected crash
+    // worth respawning. Without this, the handler's `kill_mpv_child` + `std::process::exit` races
+    // `drive_mpv`'s own "the socket closed, respawn it" path on a different thread: a respawn that
+    // finishes forking a new mpv child before `process::exit` runs leaves that child coordinated with
+    // nothing, an instant orphan the instant this process actually exits.
+    let shutting_down = Arc::new(AtomicBool::new(false));
+
     // SIGTERM is what the deployment model `DEVICE.md` documents actually sends: a Windows Scheduled
     // Task configured to restart the service stops the old process before starting a fresh one, and
     // the systemd/Docker deployment `docs/05` describes stops the same way. Without a handler, mpv --
@@ -343,9 +371,14 @@ pub fn run(
     // find a live handler.
     {
         let mpv_child_for_signal = Arc::clone(&mpv_child);
+        let shutting_down_for_signal = Arc::clone(&shutting_down);
         let signal_log = Arc::clone(&log);
         if let Err(e) = ctrlc::set_handler(move || {
             signal_log("received a termination signal; stopping mpv before exiting");
+            // Set *before* the kill below: `drive_mpv` only ever observes mpv's socket closing after
+            // this kill actually lands, so setting the flag first guarantees it is already visible by
+            // the time that happens, closing the respawn race rather than merely narrowing it.
+            shutting_down_for_signal.store(true, Ordering::Release);
             kill_mpv_child(&mpv_child_for_signal);
             std::process::exit(143); // 128 + SIGTERM(15), the conventional shell-visible exit code
         }) {
@@ -369,11 +402,13 @@ pub fn run(
     let driver_mpv_child = Arc::clone(&mpv_child);
     let driver_ipc_path = ipc_path.clone();
     let driver_extra_mpv_args = extra_mpv_args.to_vec();
+    let driver_shutting_down = Arc::clone(&shutting_down);
     std::thread::spawn(move || {
         let respawn = MpvRespawnConfig {
             ipc_path: &driver_ipc_path,
             extra_mpv_args: &driver_extra_mpv_args,
             child: &driver_mpv_child,
+            shutting_down: &driver_shutting_down,
         };
         drive_mpv(mpv, rx, &driver_shared, &driver_library_version, &*driver_log, &respawn)
     });
@@ -515,6 +550,10 @@ struct MpvRespawnConfig<'a> {
     ipc_path: &'a str,
     extra_mpv_args: &'a [String],
     child: &'a Mutex<Option<std::process::Child>>,
+    /// Set by `run`'s SIGTERM handler before it kills mpv -- consulted so a socket close that is the
+    /// direct result of an intentional shutdown is never treated as an unexpected crash worth
+    /// respawning. See that flag's own doc comment in `run`.
+    shutting_down: &'a AtomicBool,
 }
 
 /// The one thread that ever touches the mpv connection: executes queued commands, then polls mpv's
@@ -536,6 +575,15 @@ fn drive_mpv(
     let mut last_poll = std::time::Instant::now() - MPV_POLL_INTERVAL;
     loop {
         if mpv.is_closed() {
+            // A shutdown already underway killed mpv itself -- this is not a crash, and the SIGTERM
+            // handler is already on its way to `process::exit`. Respawning here would race it: a
+            // fresh child could finish forking before that exit call runs, and once it does, nobody
+            // is left to ever kill that replacement again. Returning instead leaves the command loop
+            // exiting for good, exactly as whatever already called `kill_mpv_child` intended.
+            if respawn.shutting_down.load(Ordering::Acquire) {
+                log("driver: mpv's socket closed during shutdown; not respawning");
+                return;
+            }
             // Without a respawn, this used to be where the command loop returned for good: the
             // thread simply exited, and every command sent afterward answered "the player is not
             // responding" until a human noticed and restarted the whole `lumen serve` process by
@@ -650,19 +698,35 @@ fn respawn_mpv(
 }
 
 fn execute(mpv: &mut Mpv, body: CommandBody) -> Result<ReplyBody, String> {
-    let ok = |r: std::io::Result<Option<crate::json::Value>>| {
-        r.map(|_| ReplyBody::Ok).map_err(|e| e.to_string())
+    // `command_succeeded` (unlike plain `command`) tells an explicit mpv-side rejection or a timed-out
+    // reply apart from a genuine success that simply has nothing to return -- which is what most of
+    // these commands (`set_property`, `seek`, `cycle`, ...) do even when they work. Collapsing that
+    // distinction, as a bare `.map(|_| ReplyBody::Ok)` over `command`'s result would, is what let a
+    // real mpv-side rejection (an out-of-range seek while idle, say) get reported to the client as
+    // success.
+    let ok = |r: std::io::Result<bool>| match r {
+        Ok(true) => Ok(ReplyBody::Ok),
+        Ok(false) => Err("mpv rejected the command".to_string()),
+        Err(e) => Err(e.to_string()),
     };
     match body {
-        CommandBody::Play(path) => ok(mpv.command(&["loadfile", &path, "replace"])),
-        CommandBody::Pause => ok(mpv.command(&["set_property", "pause", "yes"])),
-        CommandBody::Resume => ok(mpv.command(&["set_property", "pause", "no"])),
-        CommandBody::Toggle => ok(mpv.command(&["cycle", "pause"])),
+        CommandBody::Play(path) => {
+            let reply = ok(mpv.command_succeeded(&["loadfile", &path, "replace"]))?;
+            // mpv is spawned with `--keep-open=yes`, so a file that already reached EOF parks mpv
+            // paused on the last frame -- `pause` is player-wide and survives `loadfile`, so without
+            // this a fresh `Play` would load the new file into an already-paused player and never
+            // actually start it. Mirrors the unpause `Resume` already does below.
+            ok(mpv.command_succeeded(&["set_property", "pause", "no"]))?;
+            Ok(reply)
+        }
+        CommandBody::Pause => ok(mpv.command_succeeded(&["set_property", "pause", "yes"])),
+        CommandBody::Resume => ok(mpv.command_succeeded(&["set_property", "pause", "no"])),
+        CommandBody::Toggle => ok(mpv.command_succeeded(&["cycle", "pause"])),
         CommandBody::Seek(ms) => {
-            ok(mpv.command(&["seek", &(ms as f64 / 1000.0).to_string(), "absolute"]))
+            ok(mpv.command_succeeded(&["seek", &(ms as f64 / 1000.0).to_string(), "absolute"]))
         }
         CommandBody::SetVolume(level) => {
-            ok(mpv.command(&["set_property", "volume", &level.to_string()]))
+            ok(mpv.command_succeeded(&["set_property", "volume", &level.to_string()]))
         }
         CommandBody::Health {
             tls_cert_expires_in_secs,
@@ -726,6 +790,9 @@ fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustl
     if tcp.set_read_timeout(Some(CONNECTION_POLL_INTERVAL)).is_err() {
         return;
     }
+    if tcp.set_write_timeout(Some(CONNECTION_WRITE_TIMEOUT)).is_err() {
+        return;
+    }
     let conn = match rustls::ServerConnection::new(Arc::clone(tls_config)) {
         Ok(c) => c,
         Err(e) => {
@@ -739,6 +806,11 @@ fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustl
     let mut last_sent_version = u64::MAX; // Never equal to a real version until one is observed.
     let mut pending = Vec::new(); // Bytes read but not yet forming a complete line.
     let mut chunk = [0u8; 4096];
+    // How much of `pending`, from the front, has already been scanned for a `\n` and found none --
+    // carried across reads so appending one more chunk only scans the bytes that chunk just added,
+    // never the whole, possibly-growing buffer from byte 0 again. Reset to 0 whenever `pending` is
+    // drained, since draining shifts every remaining byte's offset.
+    let mut scanned = 0usize;
 
     // Peek at whatever this connection sends first to decide which protocol it speaks: an HTTP
     // `GET`/`HEAD` for media streaming (`http::handle_connection`), or the JSON-line control protocol
@@ -770,8 +842,10 @@ fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustl
             Err(_) => return, // Any other I/O error (including a failed handshake) ends the connection.
         }
 
-        while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+        while let Some(rel_pos) = pending[scanned..].iter().position(|&b| b == b'\n') {
+            let pos = scanned + rel_pos;
             let line: Vec<u8> = pending.drain(..=pos).collect();
+            scanned = 0; // `pending` just shifted; nothing in what remains has been scanned yet.
             let line = String::from_utf8_lossy(&line);
             let line = line.trim_end_matches(['\n', '\r']);
             if line.is_empty() {
@@ -784,6 +858,21 @@ fn handle_connection(tcp: TcpStream, ctx: &ServerContext, tls_config: &Arc<rustl
             if !was_authed && authed {
                 active.mark_active();
             }
+        }
+        // No `\n` anywhere in what's left: remember that the whole thing has been scanned already,
+        // so the next read only looks at the bytes it actually adds.
+        scanned = pending.len();
+
+        if pending.len() > MAX_PENDING_LINE_BYTES {
+            // Runs before pairing/auth is ever checked, on purpose -- an unbounded, ever-rescanned
+            // `pending` is exactly as much a problem for an unauthenticated connection as for one
+            // that is already paired. `send`'s own result is ignored: whether or not this reaches the
+            // peer, the connection is ending either way.
+            let _ = send(
+                &mut tls,
+                &ServerMessage::Error { id: "?".into(), message: "line too long".into() },
+            );
+            return;
         }
 
         if authed {
