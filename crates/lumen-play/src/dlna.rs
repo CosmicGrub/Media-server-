@@ -62,6 +62,7 @@ use lumen_discovery::{
     Announcement, BrowseFlag, DeviceIdentity, DidlObject, DidlResource, ObjectClass, Responder,
     SearchCriteria, build_browse_response, build_cd_search_response, build_device_description,
     build_didl_lite, build_get_current_connection_ids_response, build_get_protocol_info_response,
+    build_get_search_capabilities_response, build_get_sort_capabilities_response,
     build_get_system_update_id_response, build_soap_fault, connection_manager_scpd,
     content_directory_scpd, parse_browse_request, parse_search_request,
 };
@@ -78,6 +79,14 @@ const CHUNK_SIZE: usize = 256 * 1024;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The same "bound it the way the header phase is already bounded" treatment, applied to the body
+/// phase: every real `Browse`/`Search` SOAP body this server ever needs to accept is a few hundred
+/// bytes, so 64 KiB is generous headroom, not a tight fit. Unlike the header loop's `pending.len()`
+/// check, which only ever learns the true size by reading, the body phase gets the size up front from
+/// the client-supplied `Content-Length` -- so it is rejected before a single body byte is read, rather
+/// than discovered mid-read like the header case.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// The MIME types this server can source, advertised via `ConnectionManager#GetProtocolInfo` --
 /// exactly [`content_type_for`]'s own range, so this list can never claim a format the actual
@@ -576,8 +585,15 @@ fn handle_connection(mut tcp: TcpStream, ctx: &DlnaContext) {
 
     let content_length: usize =
         req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if content_length > MAX_BODY_BYTES {
+        write_error(&mut tcp, 413, "Payload Too Large");
+        return;
+    }
     let mut body = pending[header_end..].to_vec();
     while body.len() < content_length {
+        if body.len() > MAX_BODY_BYTES {
+            return;
+        }
         match tcp.read(&mut chunk) {
             Ok(0) => return,
             Ok(n) => body.extend_from_slice(&chunk[..n]),
@@ -613,10 +629,10 @@ fn route(tcp: &mut TcpStream, req: &HttpRequest, body: &[u8], ctx: &DlnaContext)
 }
 
 /// Dispatches `POST /dlna/cd/control` on its `SOAPACTION` header -- the same header-based routing
-/// `handle_connection_manager_control` already uses for its own three actions. Exactly the three
-/// actions `content_directory_scpd` declares (`Browse`, `Search`, `GetSystemUpdateID`) are answered;
-/// anything else is the `401 Invalid Action` fault the SCPD's own doc promises never to need for an
-/// action it declared.
+/// `handle_connection_manager_control` already uses for its own three actions. Exactly the five
+/// actions `content_directory_scpd` declares (`Browse`, `Search`, `GetSystemUpdateID`,
+/// `GetSearchCapabilities`, `GetSortCapabilities`) are answered; anything else is the
+/// `401 Invalid Action` fault the SCPD's own doc promises never to need for an action it declared.
 fn handle_content_directory_control(
     tcp: &mut TcpStream,
     req: &HttpRequest,
@@ -637,6 +653,23 @@ fn handle_content_directory_control(
             tcp,
             "text/xml; charset=\"utf-8\"",
             build_get_system_update_id_response(id).as_bytes(),
+        );
+    } else if action.contains("#GetSearchCapabilities") {
+        // No in-arguments and nothing to look up: this responder supports no search properties
+        // beyond the two `SearchCriteria` shapes `handle_search` already special-cases (plain
+        // `dc:title contains "..."`), so an empty `SearchCaps` is the honest answer, not a stub.
+        write_ok(
+            tcp,
+            "text/xml; charset=\"utf-8\"",
+            build_get_search_capabilities_response().as_bytes(),
+        );
+    } else if action.contains("#GetSortCapabilities") {
+        // Same reasoning as `GetSearchCapabilities`: this responder does not sort `Browse`/`Search`
+        // results at all, so an empty `SortCaps` ("no sortable properties") is the honest answer.
+        write_ok(
+            tcp,
+            "text/xml; charset=\"utf-8\"",
+            build_get_sort_capabilities_response().as_bytes(),
         );
     } else {
         write_soap_fault(tcp, 401, "Invalid Action");
@@ -1778,7 +1811,7 @@ mod tests {
 
     #[test]
     fn an_undeclared_content_directory_action_is_still_a_401_fault() {
-        // The SCPD now declares three actions; anything else must remain the honest `Invalid Action`
+        // The SCPD now declares five actions; anything else must remain the honest `Invalid Action`
         // fault, not fall through into one of the real handlers by accident of substring matching.
         let (_d, root, scan, tree) = scan_tree("invalid-action", &[("A.mkv", b"a")]);
         let ctx = test_context(tree, scan, root);
@@ -1795,13 +1828,50 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert(
             "soapaction".to_string(),
-            "\"urn:schemas-upnp-org:service:ContentDirectory:1#GetSearchCapabilities\"".to_string(),
+            "\"urn:schemas-upnp-org:service:ContentDirectory:1#CreateObject\"".to_string(),
         );
         let req = HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
         handle_content_directory_control(&mut server_stream, &req, b"", &ctx);
         drop(server_stream);
         let response = reader.join().unwrap();
         assert!(response.contains("<errorCode>401</errorCode>"), "{response}");
+    }
+
+    #[test]
+    fn get_search_capabilities_and_get_sort_capabilities_answer_with_empty_caps_not_a_fault() {
+        // These two are UPnP-mandated actions this responder must answer, not fault on -- see
+        // `content_directory_scpd`'s own doc for why empty capabilities strings are the honest
+        // response rather than a stub.
+        let (_d, root, scan, tree) = scan_tree("search-sort-caps", &[("A.mkv", b"a")]);
+        let ctx = test_context(tree, scan, root);
+
+        for (action, outer, leaf) in [
+            ("GetSearchCapabilities", "GetSearchCapabilitiesResponse", "SearchCaps"),
+            ("GetSortCapabilities", "GetSortCapabilitiesResponse", "SortCaps"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let reader = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(addr).unwrap();
+                let mut resp = Vec::new();
+                stream.read_to_end(&mut resp).unwrap();
+                String::from_utf8_lossy(&resp).into_owned()
+            });
+            let (mut server_stream, _) = listener.accept().unwrap();
+            let mut headers = HashMap::new();
+            headers.insert(
+                "soapaction".to_string(),
+                format!("\"urn:schemas-upnp-org:service:ContentDirectory:1#{action}\""),
+            );
+            let req = HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
+            handle_content_directory_control(&mut server_stream, &req, b"", &ctx);
+            drop(server_stream);
+            let response = reader.join().unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK"), "{action}: {response}");
+            assert!(response.contains(&format!("<u:{outer}")), "{action}: {response}");
+            assert!(response.contains(&format!("<{leaf}></{leaf}>")), "{action}: {response}");
+            assert!(!response.contains("<errorCode>"), "{action}: {response}");
+        }
     }
 
     #[test]

@@ -33,6 +33,7 @@ mod message;
 pub use content_directory::{
     BrowseFlag, BrowseRequest, DidlObject, DidlResource, ObjectClass, SearchCriteria,
     SearchRequest, build_browse_response, build_cd_search_response, build_didl_lite,
+    build_get_search_capabilities_response, build_get_sort_capabilities_response,
     build_get_system_update_id_response, build_soap_fault, parse_browse_request,
     parse_search_request,
 };

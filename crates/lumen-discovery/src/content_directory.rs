@@ -312,6 +312,33 @@ pub fn build_get_system_update_id_response(id: u32) -> String {
     )
 }
 
+/// `ContentDirectory:1#GetSearchCapabilities`'s response: an empty `SearchCaps` -- per the UPnP spec
+/// a comma-separated list of the extra properties `Search` accepts beyond the two shapes
+/// [`SearchCriteria`] already models (`"*"` and single-clause `dc:title contains "..."`), so "none"
+/// is the honest answer, not a stub standing in for unfinished work.
+pub fn build_get_search_capabilities_response() -> String {
+    "<?xml version=\"1.0\"?>\
+     <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+     s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+     <s:Body><u:GetSearchCapabilitiesResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+     <SearchCaps></SearchCaps>\
+     </u:GetSearchCapabilitiesResponse></s:Body></s:Envelope>"
+        .to_string()
+}
+
+/// `ContentDirectory:1#GetSortCapabilities`'s response: an empty `SortCaps` -- this responder never
+/// sorts `Browse`/`Search` results (it returns them in whatever order the caller's own library index
+/// enumerates them), so "no sortable properties" is the honest answer.
+pub fn build_get_sort_capabilities_response() -> String {
+    "<?xml version=\"1.0\"?>\
+     <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+     s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+     <s:Body><u:GetSortCapabilitiesResponse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">\
+     <SortCaps></SortCaps>\
+     </u:GetSortCapabilitiesResponse></s:Body></s:Envelope>"
+        .to_string()
+}
+
 /// A SOAP fault, for a `Browse` request this responder could not satisfy -- an unrecognised
 /// `ObjectID`, chief among the real cases, is `701` ("No such object") per the ContentDirectory spec.
 pub fn build_soap_fault(code: u32, description: &str) -> String {

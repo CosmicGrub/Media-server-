@@ -56,24 +56,30 @@ pub fn build_device_description(identity: &DeviceIdentity, base_url: &str) -> St
     )
 }
 
-/// `ContentDirectory:1`'s SCPD: the three actions this responder actually implements (`Browse`;
+/// `ContentDirectory:1`'s SCPD: the five actions this responder actually implements (`Browse`;
 /// `Search` -- only over the bounded `SearchCriteria` subset `content_directory`'s own module doc
 /// describes: `"*"` and single-clause `dc:title contains "..."`, not the full UPnP search grammar;
-/// and `GetSystemUpdateID`, whose single `Id` out-argument is the evented `SystemUpdateID` state
+/// `GetSystemUpdateID`, whose single `Id` out-argument is the evented `SystemUpdateID` state
 /// variable itself, answered from `dlna.rs`'s live counter -- see
-/// [`crate::build_get_system_update_id_response`]), plus the read-only state variables every real
+/// [`crate::build_get_system_update_id_response`]; and `GetSearchCapabilities`/`GetSortCapabilities`,
+/// the other two actions UPnP `ContentDirectory:1` mandates every implementation answer, each
+/// returning an honestly empty capabilities string -- see
+/// [`crate::build_get_search_capabilities_response`] and
+/// [`crate::build_get_sort_capabilities_response`]), plus the read-only state variables every real
 /// client expects to find declared even when it never queries them directly (`SortCriteria` among
 /// them). Declaring an action this server does not implement would be the dishonest direction to get
 /// wrong -- a client that trusts the SCPD and calls it gets a SOAP fault it had no way to expect --
 /// which is exactly why `GetSystemUpdateID` was *not* declared until `dlna.rs` had a value that
-/// actually moves to answer it with. `SystemUpdateID` is declared `sendEvents="yes"` per the spec,
-/// but this responder serves no `eventSubURL` subscription (GENA) -- a client learns of a change by
-/// polling `GetSystemUpdateID` or by comparing the `UpdateID` its next `Browse` returns, both of which
-/// real renderers already do; pushing GENA events is future work, not a claim made here. `Search`'s
-/// `ContainerID` argument reuses `A_ARG_TYPE_ObjectID` rather than declaring its own state variable,
-/// matching the real UPnP `ContentDirectory:1` spec's own SCPD (a container id and an object id are
-/// the same string type; UPnP does not require a state variable's name to mirror the argument name
-/// that uses it).
+/// actually moves to answer it with (`GetSearchCapabilities`/`GetSortCapabilities` need no such
+/// readiness: an empty capabilities list is honest from the start, since this responder has never
+/// supported extra search properties or sorting). `SystemUpdateID` is declared `sendEvents="yes"` per
+/// the spec, but this responder serves no `eventSubURL` subscription (GENA) -- a client learns of a
+/// change by polling `GetSystemUpdateID` or by comparing the `UpdateID` its next `Browse` returns,
+/// both of which real renderers already do; pushing GENA events is future work, not a claim made
+/// here. `Search`'s `ContainerID` argument reuses `A_ARG_TYPE_ObjectID` rather than declaring its own
+/// state variable, matching the real UPnP `ContentDirectory:1` spec's own SCPD (a container id and an
+/// object id are the same string type; UPnP does not require a state variable's name to mirror the
+/// argument name that uses it).
 pub fn content_directory_scpd() -> &'static str {
     "<?xml version=\"1.0\"?>\
      <scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">\
@@ -115,6 +121,18 @@ pub fn content_directory_scpd() -> &'static str {
      <argument><name>Id</name><direction>out</direction><relatedStateVariable>SystemUpdateID</relatedStateVariable></argument>\
      </argumentList>\
      </action>\
+     <action>\
+     <name>GetSearchCapabilities</name>\
+     <argumentList>\
+     <argument><name>SearchCaps</name><direction>out</direction><relatedStateVariable>SearchCapabilities</relatedStateVariable></argument>\
+     </argumentList>\
+     </action>\
+     <action>\
+     <name>GetSortCapabilities</name>\
+     <argumentList>\
+     <argument><name>SortCaps</name><direction>out</direction><relatedStateVariable>SortCapabilities</relatedStateVariable></argument>\
+     </argumentList>\
+     </action>\
      </actionList>\
      <serviceStateTable>\
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_ObjectID</name><dataType>string</dataType></stateVariable>\
@@ -127,6 +145,8 @@ pub fn content_directory_scpd() -> &'static str {
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_Result</name><dataType>string</dataType></stateVariable>\
      <stateVariable sendEvents=\"no\"><name>A_ARG_TYPE_UpdateID</name><dataType>ui4</dataType></stateVariable>\
      <stateVariable sendEvents=\"yes\"><name>SystemUpdateID</name><dataType>ui4</dataType></stateVariable>\
+     <stateVariable sendEvents=\"no\"><name>SearchCapabilities</name><dataType>string</dataType></stateVariable>\
+     <stateVariable sendEvents=\"no\"><name>SortCapabilities</name><dataType>string</dataType></stateVariable>\
      </serviceStateTable>\
      </scpd>"
 }
@@ -234,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn the_content_directory_scpd_declares_exactly_the_three_actions_this_server_implements() {
+    fn the_content_directory_scpd_declares_exactly_the_five_actions_this_server_implements() {
         let scpd = content_directory_scpd();
         assert!(scpd.contains("<name>Browse</name>"));
         assert!(scpd.contains("<name>ObjectID</name>"));
@@ -247,10 +267,56 @@ mod tests {
             "SearchCriteria must be declared as its own state variable: {scpd}"
         );
         assert!(scpd.contains("<name>GetSystemUpdateID</name>"), "{scpd}");
+        assert!(scpd.contains("<name>GetSearchCapabilities</name>"), "{scpd}");
+        assert!(scpd.contains("<name>GetSortCapabilities</name>"), "{scpd}");
         assert_eq!(
             scpd.matches("<action>").count(),
-            3,
-            "Browse, Search, GetSystemUpdateID -- and nothing this server does not answer: {scpd}"
+            5,
+            "Browse, Search, GetSystemUpdateID, GetSearchCapabilities, GetSortCapabilities -- the \
+             two UPnP-mandated actions included, and nothing else this server does not answer: {scpd}"
+        );
+    }
+
+    #[test]
+    fn get_search_capabilities_is_declared_with_a_single_out_argument_bound_to_search_capabilities()
+    {
+        let scpd = content_directory_scpd();
+        let start = scpd.find("<name>GetSearchCapabilities</name>").expect("the action is declared");
+        let end = start + scpd[start..].find("</action>").expect("the action is closed");
+        let action = &scpd[start..end];
+        assert_eq!(action.matches("<argument>").count(), 1, "exactly one argument: {action}");
+        assert!(action.contains("<name>SearchCaps</name>"), "{action}");
+        assert!(action.contains("<direction>out</direction>"), "{action}");
+        assert!(
+            action.contains("<relatedStateVariable>SearchCapabilities</relatedStateVariable>"),
+            "{action}"
+        );
+        assert!(
+            scpd.contains(
+                "<stateVariable sendEvents=\"no\"><name>SearchCapabilities</name><dataType>string</dataType>"
+            ),
+            "{scpd}"
+        );
+    }
+
+    #[test]
+    fn get_sort_capabilities_is_declared_with_a_single_out_argument_bound_to_sort_capabilities() {
+        let scpd = content_directory_scpd();
+        let start = scpd.find("<name>GetSortCapabilities</name>").expect("the action is declared");
+        let end = start + scpd[start..].find("</action>").expect("the action is closed");
+        let action = &scpd[start..end];
+        assert_eq!(action.matches("<argument>").count(), 1, "exactly one argument: {action}");
+        assert!(action.contains("<name>SortCaps</name>"), "{action}");
+        assert!(action.contains("<direction>out</direction>"), "{action}");
+        assert!(
+            action.contains("<relatedStateVariable>SortCapabilities</relatedStateVariable>"),
+            "{action}"
+        );
+        assert!(
+            scpd.contains(
+                "<stateVariable sendEvents=\"no\"><name>SortCapabilities</name><dataType>string</dataType>"
+            ),
+            "{scpd}"
         );
     }
 
