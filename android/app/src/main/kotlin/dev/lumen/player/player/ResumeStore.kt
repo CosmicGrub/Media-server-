@@ -81,12 +81,13 @@ class ResumeStore(context: Context) {
          *
          * Two rules, because one is wrong at each end of the range. A ninety-second margin is right
          * for a feature film and would swallow a three-minute clip whole; a 97% fraction is right for
-         * the clip and leaves four minutes of a four-hour film counting as unwatched.
+         * the clip and leaves four minutes of a four-hour film counting as unwatched. Both must agree
+         * — i.e. the cutoff is the *later* of the two thresholds — or whichever rule is wrong for this
+         * duration fires first and swallows the file anyway.
          */
         fun isEffectivelyFinished(positionMs: Long, durationMs: Long): Boolean {
             if (durationMs <= 0) return false
-            return positionMs >= durationMs - END_MARGIN_MS ||
-                positionMs >= durationMs * END_FRACTION
+            return positionMs >= maxOf((durationMs - END_MARGIN_MS).toDouble(), durationMs * END_FRACTION)
         }
     }
 }

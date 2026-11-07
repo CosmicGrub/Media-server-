@@ -54,6 +54,35 @@ class ResumePolicyTest {
     }
 
     @Test
+    fun `the two end rules combine with AND, not OR, so neither alone can swallow a file`() {
+        // A clip at or under the margin itself: the margin threshold collapses to zero or below, so
+        // if the rules were OR'd, every non-negative position (including one barely past the start)
+        // would read as "finished". The fraction rule must be the one that actually governs here.
+        assertFalse(
+            "1s into a 90s clip is nowhere near finished",
+            ResumeStore.isEffectivelyFinished(1_000, 90_000),
+        )
+
+        // A mid-length clip, sampled inside the window between the two raw thresholds (duration -
+        // 90s = 90_000, duration * 97% = 174_600). An OR of the two rules would fire as soon as the
+        // *lower* threshold (90_000) is crossed; requiring both pushes the real cutoff out to the
+        // higher one (174_600), so this position is not finished yet.
+        val clip = 3 * 60 * 1000L // 180_000ms
+        assertFalse(
+            "100s into a 3m clip is well short of either documented cutoff",
+            ResumeStore.isEffectivelyFinished(100_000, clip),
+        )
+        assertFalse(
+            "just under the 97% cutoff of a 3m clip is not finished",
+            ResumeStore.isEffectivelyFinished(174_599, clip),
+        )
+        assertTrue(
+            "right at the 97% cutoff of a 3m clip is finished",
+            ResumeStore.isEffectivelyFinished(174_600, clip),
+        )
+    }
+
+    @Test
     fun `an unknown duration resumes rather than losing the position`() {
         // Duration is not always known — a stream, or metadata that has not arrived. Treating that
         // as "finished" would throw the position away for exactly the files hardest to navigate.
