@@ -425,16 +425,15 @@ jobs:
   # `needs: build` on a matrix job only succeeds once every leg does, so neither path ever publishes
   # with one platform silently missing because its own build broke.
   #
-  # Gated to this branch (for the rolling release) or a version tag (for a pinned one), not also main
-  # or the shared development branch: this file's own Windows-specific verification steps above (the
-  # CRT-static check, the codec-coverage check) do not exist on those branches yet, and publishing
-  # from a branch that cannot itself produce what the release notes claim would be worse than not
-  # publishing at all. A `v*` tag is exempt from that reasoning -- it is only ever cut from a commit
-  # that already passed those checks as a branch push first.
+  # Gated to the default branch and the shared development branch (for the rolling release) or a
+  # version tag (for a pinned one) -- the same pair `android.yml`'s own `publish` job already uses --
+  # not to a device-specific fork branch: this file's own Windows-specific verification steps above
+  # (the CRT-static check, the codec-coverage check) run on every push to either of those branches,
+  # so both can produce what the release notes claim.
   publish:
     name: publish release
     needs: build
-    if: github.ref == 'refs/heads/device/windows-pc' || startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/claude/multiplatform-media-player-server-b7dwe7' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     permissions:
       contents: write
