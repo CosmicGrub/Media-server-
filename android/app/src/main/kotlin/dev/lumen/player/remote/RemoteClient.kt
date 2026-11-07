@@ -67,13 +67,15 @@ class RemoteClient {
     private val nextId = AtomicLong(1)
     private val pending = ConcurrentHashMap<String, CompletableDeferred<RemoteProtocol.ServerMessage>>()
 
-    /** Identifies which [connect] call a given [readLoop] belongs to. Bumped every time [connect]
-     * wires up a new socket, so a reader loop whose socket was superseded by a later [connect] can
-     * tell, once it finally notices its own socket died, that it is not the current connection
-     * anymore -- see the generation check at the end of [readLoop]. Without this, a reader loop left
-     * over from a connection that [close] asked to tear down (but could not wait for, since [close]
-     * is not suspending) would run its "connection closed" cleanup on the *new* connection's shared
-     * `pending`/`_connection` state once it finally unblocks. */
+    /** Identifies which [connect] call a given [readLoop] belongs to. Bumped by every [close]
+     * (including the one [connect] starts with), *before* anything else it does, so even a
+     * [readLoop] already blocked in a read right now -- cancelling [readerJob] can't interrupt that,
+     * and `reader.readLine()` is a blocking call, not a suspending one -- is marked superseded before
+     * the socket closes under it. [readLoop] captures the value in force at the moment it is
+     * launched and checks it both before every write to shared state and once more after its read
+     * loop exits, so a reader coroutine that outlives its own connection (including one serving a
+     * line that was already sitting in `BufferedReader`'s internal buffer when the socket closed)
+     * can never present a superseded connection's data as the current one's. */
     private val connectionGeneration = AtomicLong(0)
 
     private val _connection = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
@@ -100,7 +102,9 @@ class RemoteClient {
      */
     suspend fun connect(host: String, port: Int, pinnedFingerprint: String?) {
         close()
-        val generation = connectionGeneration.incrementAndGet()
+        // close() just above already bumped connectionGeneration, so reading it here (rather than
+        // incrementing again) ties this connect() to the generation close() just established.
+        val generation = connectionGeneration.get()
         _connection.value = ConnectionState.Connecting
         try {
             val s = withContext(Dispatchers.IO) {
@@ -132,6 +136,12 @@ class RemoteClient {
             while (true) {
                 val line = reader.readLine() ?: break // null means the peer closed the connection.
                 if (line.isBlank()) continue
+                // close() (directly, or as the first step of a later connect()) may have already
+                // moved on by the time this line is read -- e.g. it was already sitting in the
+                // BufferedReader's internal buffer when the socket was closed, which doesn't stop it
+                // being served afterwards. Once that has happened, this loop belongs to a superseded
+                // connection and must not write its data into state the UI reads as current.
+                if (connectionGeneration.get() != generation) return
                 when (val msg = RemoteProtocol.parseServerMessage(line)) {
                     is RemoteProtocol.ServerMessage.State -> _playback.value = msg.playback
                     is RemoteProtocol.ServerMessage.Paired -> pending.remove(msg.id)?.complete(msg)
@@ -259,8 +269,17 @@ class RemoteClient {
         }
 
     /** Tear down the socket and stop the reader loop. Safe to call more than once, and safe to call
-     * before ever connecting. */
+     * before ever connecting.
+     *
+     * Bumps [connectionGeneration] first, before anything else, so that even a [readLoop] still
+     * blocked in a read right now (cancelling [readerJob] can't interrupt that) is marked superseded
+     * before the socket closes under it -- see [connectionGeneration]'s doc. Also resets [_playback]
+     * back to a neutral value along with everything else: without this, a reconnect (or a connection
+     * to a different server entirely) would leave the previous connection's `now_playing`/
+     * `library_version` sitting in [playback] until this session's own first `state` push arrives,
+     * which can be rendered as if it belonged to the new connection. */
     fun close() {
+        connectionGeneration.incrementAndGet()
         readerJob?.cancel()
         readerJob = null
         runCatching { socket?.close() }
@@ -271,6 +290,7 @@ class RemoteClient {
         }
         pending.clear()
         _connection.value = ConnectionState.Disconnected
+        _playback.value = RemoteProtocol.PlaybackState(null, 0)
     }
 
     /** Releases this client permanently — unlike [close], the coroutine scope itself is torn down,
