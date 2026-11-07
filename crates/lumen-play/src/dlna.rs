@@ -1863,7 +1863,8 @@ mod tests {
                 "soapaction".to_string(),
                 format!("\"urn:schemas-upnp-org:service:ContentDirectory:1#{action}\""),
             );
-            let req = HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
+            let req =
+                HttpRequest { method: "POST".into(), path: "/dlna/cd/control".into(), headers };
             handle_content_directory_control(&mut server_stream, &req, b"", &ctx);
             drop(server_stream);
             let response = reader.join().unwrap();

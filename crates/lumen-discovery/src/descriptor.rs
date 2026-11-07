@@ -281,7 +281,8 @@ mod tests {
     fn get_search_capabilities_is_declared_with_a_single_out_argument_bound_to_search_capabilities()
     {
         let scpd = content_directory_scpd();
-        let start = scpd.find("<name>GetSearchCapabilities</name>").expect("the action is declared");
+        let start =
+            scpd.find("<name>GetSearchCapabilities</name>").expect("the action is declared");
         let end = start + scpd[start..].find("</action>").expect("the action is closed");
         let action = &scpd[start..end];
         assert_eq!(action.matches("<argument>").count(), 1, "exactly one argument: {action}");

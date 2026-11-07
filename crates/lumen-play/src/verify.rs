@@ -280,8 +280,9 @@ mod tests {
         );
 
         drop(first);
-        fs4::FileExt::try_lock(&second_handle)
-            .expect("once the first process's lock is released, a second must be able to acquire it");
+        fs4::FileExt::try_lock(&second_handle).expect(
+            "once the first process's lock is released, a second must be able to acquire it",
+        );
     }
 
     #[test]
