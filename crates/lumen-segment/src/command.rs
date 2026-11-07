@@ -389,6 +389,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_real_ffmpeg_build_produces_a_valid_playable_fmp4_init_and_segment() {
+        // Held for the whole test, like every other subprocess-spawning test in this crate (see
+        // `SCRIPT_WRITE`'s own doc comment): a real `fork()` racing another thread's still-open write
+        // handle on an unrelated file -- not just two scripts racing each other -- can itself trip the
+        // kernel's "text file busy" check, so every test that forks a child here shares the one lock.
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
         if !std::process::Command::new("ffmpeg")
             .arg("-version")
             .stdout(std::process::Stdio::null())
@@ -513,6 +518,9 @@ mod tests {
     #[test]
     fn a_second_unrelated_real_ffmpeg_jobs_leftover_segments_are_never_counted_as_this_runs_output()
     {
+        // See the comment on this guard in `a_real_ffmpeg_build_produces_a_valid_playable_fmp4_init_and_segment`
+        // just above -- every subprocess-spawning test in this crate shares it.
+        let _guard = crate::test_support::SCRIPT_WRITE.lock().unwrap_or_else(|e| e.into_inner());
         if !std::process::Command::new("ffmpeg")
             .arg("-version")
             .stdout(std::process::Stdio::null())
