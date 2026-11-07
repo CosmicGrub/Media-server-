@@ -267,13 +267,15 @@ impl Index {
                         missing_by_sketch.contains_key(&sketch)
                     });
 
-                    // What verification history (if any) survives into the fresh record. A move or a
-                    // same-content "unchanged" both mean the bytes provably have not changed -- see
-                    // the two verdict arms below for why each one is provably safe to carry forward --
-                    // so a previously-established digest (and any unresolved-mismatch flag) is still
-                    // valid, and re-verifying from scratch would be wasted I/O. `New`/`Modified` mean
-                    // the opposite: this content has never been confirmed, so verification -- and any
-                    // suspicion carried over from whatever used to be at this path -- starts clean.
+                    // What verification history (if any) survives into the fresh record. Only a
+                    // same-content "unchanged" means the bytes provably have not changed -- see that
+                    // arm below -- so a previously-established digest (and any unresolved-mismatch
+                    // flag) is still valid there, and re-verifying from scratch would be wasted I/O.
+                    // `New`/`Modified` mean the opposite: this content has never been confirmed, so
+                    // verification -- and any suspicion carried over from whatever used to be at this
+                    // path -- starts clean. `Moved` is deliberately grouped with `New`/`Modified`
+                    // here, not with `Unchanged`: see the `Moved` arm below for why a sketch match
+                    // alone is not strong enough evidence to carry a "confirmed good" claim forward.
                     let mut carried: Option<(Option<Verified>, bool)> = None;
 
                     match verdict {
@@ -296,11 +298,21 @@ impl Index {
                         ScanVerdict::New => report.new += 1,
                         ScanVerdict::Moved { from_sketch } => {
                             report.moved += 1;
+                            // Deliberately does NOT carry `last_verified`/`mismatch_pending` forward
+                            // from the old path, unlike the `Unchanged` arm above. `ContentSketch` is
+                            // a cheap head/middle/tail sample (see its doc comment), not a
+                            // cryptographic digest, so two genuinely different files past
+                            // `FULL_READ_THRESHOLD` can collide on it while differing in the large
+                            // unsampled middle -- `classify` would then report `Moved` for a file that
+                            // was never actually the old path's bytes. Inheriting a "confirmed good"
+                            // digest on that unearned trust turns the next `verify` pass's correct
+                            // mismatch detection into a false corruption alarm on a perfectly healthy
+                            // new file. A move is therefore treated like `Modified`/`New`: it starts
+                            // with no verification history, and the next `verify` pass establishes a
+                            // fresh baseline against the file's own bytes -- one extra full read, paid
+                            // only once, in exchange for never propagating a claim this pass never
+                            // actually earned.
                             if let Some(old_path) = missing_by_sketch.remove(&from_sketch) {
-                                carried = self
-                                    .by_path
-                                    .get(&old_path)
-                                    .map(|r| (r.last_verified, r.mismatch_pending));
                                 claimed_by_move.insert(old_path);
                             }
                         }
@@ -698,14 +710,16 @@ mod tests {
     }
 
     #[test]
-    fn a_moved_files_verification_history_survives_the_move() {
-        // The end-to-end regression for the carry-forward fix `reindex`'s `Moved` arm applies: real
-        // verification history, established against real bytes on disk, must not reset to "never
-        // verified" just because the same file moved. A real `Index::verify` against the actual
-        // written file, not a hand-built `Verified` value, is what makes this a genuine regression
-        // test rather than one that could pass even if the plumbing between `verify` and `reindex`
-        // were subtly wrong.
-        let dir = tmp_dir("move-carries-verification");
+    fn a_moved_file_does_not_inherit_unearned_verification_history() {
+        // `ContentSketch` is a cheap head/middle/tail sample, not a cryptographic digest (its own
+        // doc comment says so), so a `Moved` verdict is only ever as trustworthy as that sample --
+        // it is not proof the bytes at the new path are the old path's bytes. Carrying the old
+        // record's `last_verified`/`mismatch_pending` forward on nothing but a sketch match would
+        // claim "confirmed good" for content that was never actually confirmed. So a move starts
+        // with clean verification history, exactly like `New`/`Modified`, and the next real
+        // `Index::verify` pass (not a hand-built `Verified` value) is what establishes a fresh,
+        // honestly-earned baseline against the file's real bytes at its new path.
+        let dir = tmp_dir("move-does-not-carry-verification");
         let old_path = write_file(&dir, "old-name.mkv", b"identical bytes, new home");
 
         let mut idx = Index::default();
@@ -735,10 +749,21 @@ mod tests {
 
         let after_move = idx.get(&new_path).unwrap();
         assert_eq!(
-            after_move.last_verified, established,
-            "the same bytes moving to a new path must not lose their confirmed-good history"
+            after_move.last_verified, None,
+            "a sketch-only Moved verdict must not inherit the old path's confirmed-good history"
         );
         assert!(!after_move.mismatch_pending);
+
+        // The next verify pass establishes its own, honestly-earned baseline against the real
+        // bytes at the new path -- one extra full read, paid once, instead of a false mismatch.
+        let verify_after_move = idx.verify(2_000, 24 * 60 * 60, u64::MAX, digest_of);
+        assert_eq!(verify_after_move.baseline_established, 1);
+        assert!(verify_after_move.mismatched.is_empty());
+        assert_eq!(
+            idx.get(&new_path).unwrap().last_verified.map(|v| v.digest),
+            established.map(|v| v.digest),
+            "the fresh baseline must agree with the file's real (unchanged) bytes"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
