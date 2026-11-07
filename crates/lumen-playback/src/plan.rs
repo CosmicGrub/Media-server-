@@ -1,7 +1,9 @@
 //! The shape of a playback decision: what happens to each stream, the tier achieved, and every
 //! better outcome that was rejected with its reason.
 
-use lumen_model::{AudioCodec, ChannelLayout, Container, Integrity, SubtitleCodec, VideoCodec};
+use lumen_model::{
+    AudioCodec, ChannelLayout, ColorPrimaries, Container, Integrity, SubtitleCodec, VideoCodec,
+};
 
 use crate::reason::RejectReason;
 
@@ -86,7 +88,11 @@ impl ToneMapRolloff {
         let Some(display) = display_peak_nits else {
             return Self::Aggressive;
         };
-        let content = content_peak_nits.unwrap_or(Self::DEFAULT_CONTENT_PEAK_NITS);
+        // A reported-but-zero (or otherwise non-positive) peak is a malformed/zeroed SMPTE ST 2086
+        // tag, not a real "the mastering peak is zero nits" claim -- treat it the same as an absent
+        // one rather than letting it trivially satisfy `display >= content`.
+        let content =
+            content_peak_nits.filter(|&n| n > 0).unwrap_or(Self::DEFAULT_CONTENT_PEAK_NITS);
         if display >= content {
             Self::Gentle
         } else if display.saturating_mul(2) >= content {
@@ -107,6 +113,10 @@ pub struct VideoTranscodeSpec {
     /// How hard the tone map should compress highlights when `tone_map_to_sdr` is set. `None`
     /// whenever `tone_map_to_sdr` is false -- there is nothing to grade.
     pub tone_map_rolloff: Option<ToneMapRolloff>,
+    /// The display's own gamut to map the picture's primaries down into, when the display's
+    /// physical gamut does not cover them and the client cannot gamut map locally. `None` when no
+    /// gamut operation is required -- there is nothing for the transcoder to do.
+    pub gamut_map: Option<ColorPrimaries>,
     pub deinterlace: bool,
     pub burn_in_subtitles: bool,
 }
@@ -381,6 +391,7 @@ mod tests {
             max_bitrate_bps: None,
             tone_map_to_sdr: false,
             tone_map_rolloff: None,
+            gamut_map: None,
             deinterlace: false,
             burn_in_subtitles: false,
         };
@@ -493,5 +504,18 @@ mod tests {
         // monitor figure.
         assert_eq!(ToneMapRolloff::for_headroom(Some(1_000), None), ToneMapRolloff::Gentle);
         assert_eq!(ToneMapRolloff::for_headroom(Some(250), None), ToneMapRolloff::Aggressive);
+    }
+
+    #[test]
+    fn a_zeroed_mastering_peak_is_graded_like_an_unreported_one_not_a_real_zero() {
+        // A malformed/zeroed SMPTE ST 2086 tag (`Some(0)`) must not be read as "the content's
+        // mastering peak is genuinely zero nits", which would make `display >= content` trivially
+        // true for any real display and grade the worst case as the easiest rolloff. It gets the
+        // same treatment as a wholly unreported (`None`) peak.
+        assert_eq!(ToneMapRolloff::for_headroom(Some(200), Some(0)), ToneMapRolloff::Aggressive);
+        assert_eq!(
+            ToneMapRolloff::for_headroom(Some(200), Some(0)),
+            ToneMapRolloff::for_headroom(Some(200), None)
+        );
     }
 }

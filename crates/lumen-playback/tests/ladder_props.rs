@@ -674,6 +674,39 @@ fn bit_perfect_policy_blocks_with_the_underlying_cause_still_visible() {
 }
 
 #[test]
+fn bit_perfect_is_enforced_even_when_transcode_is_allowed() {
+    // `UserPolicy::bit_perfect` and `UserPolicy::transcode` are two independent fields -- nothing
+    // says setting the former also requires setting the latter to `None`. A user who sets
+    // `bit_perfect: true` and leaves `transcode` at its default (`Allowed`) must still get the
+    // bit-perfect guarantee enforced, not a silent resample.
+    let mut caps = ClientCapabilities::reference_native();
+    caps.audio_sink = AudioSinkCaps::stereo_pcm("Bluetooth headphones");
+    caps.policy = UserPolicy { bit_perfect: true, transcode: TranscodePolicy::Allowed };
+
+    let mut src = MediaSource::new(Container::Matroska, Transport::Local);
+    src.audio.push(AudioStream {
+        index: 0,
+        codec: AudioCodec::Flac,
+        layout: ChannelLayout::STEREO,
+        sample_rate: 96_000,
+        bit_depth: Some(24),
+        bitrate_bps: None,
+        language: Language::new("eng"),
+        title: None,
+        flags: StreamFlags::enabled(),
+        has_objects: false,
+    });
+
+    let p = plan(&src, full_selection(&src), &caps);
+
+    // Before the fix this resampled 96 kHz -> 48 kHz and played it, in flat contradiction of
+    // `bit_perfect`'s own doc comment ("No resampling, no mixing, no volume scaling; exclusive
+    // device access").
+    assert!(p.is_blocked(), "bit_perfect must block a forced resample, not allow it: {p:#?}");
+    assert!(p.reason_keys().contains(&"UserPolicy"), "{:?}", p.reason_keys());
+}
+
+#[test]
 fn dv_profile_7_fel_plays_the_base_layer_and_labels_it_honestly() {
     // docs/11 §7: FEL is not reconstructible in open source. The requirement is an honest label on a
     // working base-layer playback, never a support claim.
@@ -803,6 +836,18 @@ fn bt2020_content_forces_a_transcode_when_the_client_cannot_gamut_map() {
 
     assert!(!p.video.is_copy(), "no gamut mapping available means the stream must adapt: {p:#?}");
     assert!(p.reason_keys().contains(&"GamutUnsupportedByDisplay"), "{:?}", p.reason_keys());
+    // The forced transcode must actually carry a gamut-mapping instruction, or `explain()`'s "the
+    // picture was gamut mapped" claim is false for exactly this case.
+    match &p.video {
+        VideoPath::Transcode(spec) => {
+            assert_eq!(
+                spec.gamut_map,
+                Some(caps.display.gamut),
+                "forced transcode has no gamut-mapping instruction: {p:#?}"
+            );
+        }
+        other => panic!("expected a forced transcode, got {other:?}"),
+    }
 }
 
 #[test]

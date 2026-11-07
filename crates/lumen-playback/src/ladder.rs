@@ -13,8 +13,8 @@
 
 use lumen_caps::{ClientCapabilities, TranscodePolicy};
 use lumen_model::{
-    AudioCodec, AudioStream, ChannelLayout, Container, HdrFormat, Integrity, MasteringDisplay,
-    MediaSource, SubtitleCodec, SubtitleStream, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, ChannelLayout, ColorPrimaries, Container, HdrFormat, Integrity,
+    MasteringDisplay, MediaSource, SubtitleCodec, SubtitleStream, VideoCodec, VideoStream,
 };
 
 use crate::plan::{
@@ -123,11 +123,21 @@ pub fn plan(source: &MediaSource, selection: Selection, caps: &ClientCapabilitie
 /// prevent.
 fn enforce_policy(plan: PlaybackPlan, caps: &ClientCapabilities) -> PlaybackPlan {
     let policy = caps.policy;
-    let violates = match policy.transcode {
-        TranscodePolicy::Allowed => false,
-        TranscodePolicy::AudioOnly => !plan.video.is_copy(),
-        TranscodePolicy::None => !plan.is_direct() || plan.container != ContainerPlan::Original,
-    };
+    // `bit_perfect` is its own, independent constraint on the *audio* path -- "no resampling, no
+    // mixing, no volume scaling; exclusive device access" -- and must be checked whatever
+    // `policy.transcode` says. Only `None`/`Passthrough`/`ExclusiveBitPerfect` satisfy all of that;
+    // every other path decodes, resamples, downmixes, extracts a subset of the stream, or re-encodes.
+    let bit_perfect_violation = policy.bit_perfect
+        && !matches!(
+            plan.audio,
+            AudioPath::None | AudioPath::Passthrough | AudioPath::ExclusiveBitPerfect
+        );
+    let violates = bit_perfect_violation
+        || match policy.transcode {
+            TranscodePolicy::Allowed => false,
+            TranscodePolicy::AudioOnly => !plan.video.is_copy(),
+            TranscodePolicy::None => !plan.is_direct() || plan.container != ContainerPlan::Original,
+        };
     if !violates || plan.is_blocked() {
         return plan;
     }
@@ -311,6 +321,7 @@ fn decide_video(
         max_bitrate_bps: bitrate_ceiling(caps, source.bitrate_bps),
         tone_map_to_sdr: hdr.is_hdr() && !caps.display.handles_hdr(hdr),
         tone_map_rolloff: tone_map_rolloff_for(caps, hdr, v.color.mastering),
+        gamut_map: gamut_map_for(caps, primaries),
         deinterlace: v.field_order.is_interlaced(),
         burn_in_subtitles: false,
     })
@@ -332,6 +343,19 @@ fn tone_map_rolloff_for(
         caps.display.peak_luminance_nits,
         mastering.map(|m| m.max_luminance_nits),
     ))
+}
+
+/// Whether a forced transcode must also gamut-map the picture, and to what gamut -- `None` when the
+/// display's own gamut already covers `primaries` or the client can gamut map locally, so there is
+/// nothing for the transcoder to do. Populating this is what makes
+/// [`RejectReason::GamutUnsupportedByDisplay`]'s "the picture was gamut mapped" claim actually true
+/// for the case it is forced to a server-side transcode (`docs/13` §3.2).
+fn gamut_map_for(caps: &ClientCapabilities, primaries: ColorPrimaries) -> Option<ColorPrimaries> {
+    if caps.display.handles_gamut(primaries) || caps.can_tone_map {
+        None
+    } else {
+        Some(caps.display.gamut)
+    }
 }
 
 /// Prefer the most efficient codec the client can actually decode, so a forced transcode costs the
@@ -547,6 +571,7 @@ fn decide_container(
                     }),
                     tone_map_rolloff: video
                         .and_then(|x| tone_map_rolloff_for(caps, x.color.hdr, x.color.mastering)),
+                    gamut_map: video.and_then(|x| gamut_map_for(caps, x.color.primaries)),
                     deinterlace: video.is_some_and(|x| x.field_order.is_interlaced()),
                     burn_in_subtitles: false,
                 })
@@ -665,6 +690,10 @@ fn decide_subtitle(
                 max_bitrate_bps: bitrate_ceiling(caps, None),
                 tone_map_to_sdr: false,
                 tone_map_rolloff: None,
+                // This branch only runs when `decide_video` returned `Copy`, which only happens
+                // when the display already handles the stream's gamut or the client gamut maps
+                // locally -- so there is nothing for a server-side transcode to do here either.
+                gamut_map: None,
                 deinterlace: false,
                 burn_in_subtitles: true,
             }),
