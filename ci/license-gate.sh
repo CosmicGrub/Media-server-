@@ -126,6 +126,22 @@ else
   info "cargo-deny not installed; skipping (install with: cargo install cargo-deny)"
 fi
 
+# ── 4. Rust dependency bans (deny.toml [bans], including the openssl ban) ──────────────────────────
+# `check licenses` above only evaluates the [licenses] table -- it never touches [bans], so the
+# openssl ban and the rest of deny.toml's bans policy would otherwise be dead configuration that
+# CI never runs. advisories ([advisories]) is deliberately not run here yet; see the NOTE in
+# deny.toml.
+check
+if command -v cargo-deny >/dev/null 2>&1 || cargo deny --version >/dev/null 2>&1; then
+  if (cd "$ROOT" && cargo deny check bans 2>&1 | tail -20); then
+    pass "cargo-deny bans policy satisfied"
+  else
+    fail "cargo-deny found a bans policy violation"
+  fi
+else
+  info "cargo-deny not installed; skipping (install with: cargo install cargo-deny)"
+fi
+
 echo
 if [[ $FAILURES -gt 0 ]]; then
   red "license gate FAILED — $FAILURES of $CHECKS checks"
