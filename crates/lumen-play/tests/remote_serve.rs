@@ -498,13 +498,12 @@ fn a_client_pairs_plays_seeks_and_reads_state_back_from_real_mpv() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         let msg = read_message(&mut tls);
-        if msg.ty().as_deref() == Some("state") {
-            if let Some(serde_json_lite::Val::Map(np)) = msg.0.get("now_playing") {
-                if np.get("path").is_some() {
-                    saw_playing = true;
-                    break;
-                }
-            }
+        if msg.ty().as_deref() == Some("state")
+            && let Some(serde_json_lite::Val::Map(np)) = msg.0.get("now_playing")
+            && np.get("path").is_some()
+        {
+            saw_playing = true;
+            break;
         }
     }
     assert!(saw_playing, "expected an unprompted state push naming the file now playing");
@@ -1512,13 +1511,12 @@ fn distinct_library_versions_over(
     let mut pending = String::new();
     while std::time::Instant::now() < deadline {
         let Some(msg) = try_read_message(tls, &mut pending) else { continue };
-        if msg.ty().as_deref() == Some("state") {
-            if let Some(v) = num_in(&msg.0, "library_version").map(|n| n as u64) {
-                if v > max_seen {
-                    beyond_baseline.push(v);
-                    max_seen = v;
-                }
-            }
+        if msg.ty().as_deref() == Some("state")
+            && let Some(v) = num_in(&msg.0, "library_version").map(|n| n as u64)
+            && v > max_seen
+        {
+            beyond_baseline.push(v);
+            max_seen = v;
         }
     }
     beyond_baseline

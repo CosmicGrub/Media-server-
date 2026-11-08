@@ -126,6 +126,28 @@ else
   info "cargo-deny not installed; skipping (install with: cargo install cargo-deny)"
 fi
 
+# ── 4. Rust dependency advisories ────────────────────────────────────────────────────────────────
+# RUSTSEC advisories against the locked dependency graph. rustls, rustls-webpki and time each had
+# an unpatched advisory against the versions previously locked, which is why this check was never
+# turned on here before -- enabling it would have failed every PR on those pre-existing grounds.
+# They're patched now (see Cargo.lock), so this enforces the graph stays patched rather than
+# drifting back silently.
+#
+# `cargo deny check bans` is deliberately not wired in alongside this: deny.toml's
+# `wildcards = "deny"` policy currently fails on this workspace's own internal path dependencies
+# (`foo.workspace = true` has no version req, which cargo-deny reads as a wildcard) -- a real,
+# separate gap this change does not fix.
+check
+if command -v cargo-deny >/dev/null 2>&1 || cargo deny --version >/dev/null 2>&1; then
+  if (cd "$ROOT" && cargo deny check advisories 2>&1 | tail -20); then
+    pass "cargo-deny advisory policy satisfied"
+  else
+    fail "cargo-deny found an unpatched advisory"
+  fi
+else
+  info "cargo-deny not installed; skipping (install with: cargo install cargo-deny)"
+fi
+
 echo
 if [[ $FAILURES -gt 0 ]]; then
   red "license gate FAILED — $FAILURES of $CHECKS checks"

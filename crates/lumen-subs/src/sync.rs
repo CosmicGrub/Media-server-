@@ -202,18 +202,16 @@ pub fn detect_correction(cue_starts: &[i64], speech_starts: &[i64]) -> SyncCorre
             nearest(speech_starts, first_cue, MAX_PAIR_WINDOW_MS),
             nearest(speech_starts, last_cue, MAX_PAIR_WINDOW_MS),
         )
-    {
-        if let Some((from, to)) =
+        && let Some((from, to)) =
             detect_framerate_mismatch(first_cue, first_speech, last_cue, last_speech)
-        {
-            // After rescaling, whatever constant offset remains is applied on top.
-            let scaled_first = ((first_cue as f64) * (from / to)).round() as i64;
-            return SyncCorrection::Rescale {
-                from_fps: from,
-                to_fps: to,
-                then_offset_ms: first_speech - scaled_first,
-            };
-        }
+    {
+        // After rescaling, whatever constant offset remains is applied on top.
+        let scaled_first = ((first_cue as f64) * (from / to)).round() as i64;
+        return SyncCorrection::Rescale {
+            from_fps: from,
+            to_fps: to,
+            then_offset_ms: first_speech - scaled_first,
+        };
     }
 
     if offset.abs() <= SYNC_TOLERANCE_MS {

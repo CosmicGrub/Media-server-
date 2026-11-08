@@ -444,8 +444,9 @@ fn preferred_rate(caps: &ClientCapabilities, source_rate: u32) -> u32 {
     let sink = &caps.audio_sink;
     let mut best = *sink.pcm_sample_rates.first().unwrap_or(&48_000);
     for &r in &sink.pcm_sample_rates {
-        let related = source_rate % r == 0 || r % source_rate == 0;
-        let better_related = related && (best % source_rate != 0 && source_rate % best != 0);
+        let related = source_rate.is_multiple_of(r) || r.is_multiple_of(source_rate);
+        let better_related =
+            related && (!best.is_multiple_of(source_rate) && !source_rate.is_multiple_of(best));
         if better_related || (r > best && r <= source_rate) {
             best = r;
         }

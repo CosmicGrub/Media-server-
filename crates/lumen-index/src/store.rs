@@ -235,12 +235,13 @@ impl Index {
             };
 
             let known_here = self.by_path.get(path).filter(|r| !r.tombstoned);
-            if let Some(known) = known_here {
-                if known.fingerprint.size == fp.size && known.fingerprint.mtime_ns == fp.mtime_ns {
-                    report.unchanged += 1;
-                    fresh.insert(path.clone(), known.clone());
-                    continue;
-                }
+            if let Some(known) = known_here
+                && known.fingerprint.size == fp.size
+                && known.fingerprint.mtime_ns == fp.mtime_ns
+            {
+                report.unchanged += 1;
+                fresh.insert(path.clone(), known.clone());
+                continue;
             }
 
             match probe(path, &fp) {

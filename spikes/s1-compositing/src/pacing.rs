@@ -274,15 +274,15 @@ pub fn judge(
         ));
     }
 
-    if let (Some(limit), Some(actual)) = (thresholds.max_added_cpu_frac, added_cpu) {
-        if actual > limit {
-            noted = true;
-            findings.push(format!(
-                "Compositing cost {:.2} extra CPU cores (soft limit {limit:.2}). Not fatal, but it \
-                 is battery and thermal headroom.",
-                actual
-            ));
-        }
+    if let (Some(limit), Some(actual)) = (thresholds.max_added_cpu_frac, added_cpu)
+        && actual > limit
+    {
+        noted = true;
+        findings.push(format!(
+            "Compositing cost {:.2} extra CPU cores (soft limit {limit:.2}). Not fatal, but it \
+             is battery and thermal headroom.",
+            actual
+        ));
     }
 
     if let (Some(limit), Some(actual)) = (thresholds.max_osd_latency_ms, osd_latency_ms) {

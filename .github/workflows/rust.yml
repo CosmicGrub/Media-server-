@@ -218,13 +218,13 @@ jobs:
     runs-on: ${{ vars.LUMEN_RUNNER_LINUX || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
-      # ci/license-gate.sh's Rust-dependency check (step 3) only runs if `cargo-deny` is already on
-      # PATH -- otherwise it just prints "not installed; skipping" and reports success, which left
-      # deny.toml's licence policy unenforced on every real CI run. `cargo install cargo-deny` would
-      # compile the tool from source (several minutes); taiki-e/install-action instead fetches the
-      # maintainer's prebuilt release binary -- seconds, not minutes. Pinned to the cargo-deny
-      # version this workflow was last verified against so a new release can't silently change
-      # what "passes" means; bump deliberately.
+      # ci/license-gate.sh's Rust-dependency checks (steps 3-4: licences, advisories) only run if
+      # `cargo-deny` is already on PATH -- otherwise they just print "not installed; skipping" and
+      # report success, which left deny.toml's policy unenforced on every real CI run. `cargo install
+      # cargo-deny` would compile the tool from source (several minutes); taiki-e/install-action
+      # instead fetches the maintainer's prebuilt release binary -- seconds, not minutes. Pinned to
+      # the cargo-deny version this workflow was last verified against so a new release can't
+      # silently change what "passes" means; bump deliberately.
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:

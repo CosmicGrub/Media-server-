@@ -110,12 +110,11 @@ fn parse_search_criteria(text: &str) -> SearchCriteria {
     if trimmed == "*" {
         return SearchCriteria::MatchAll;
     }
-    if let Some(rest) = trimmed.strip_prefix("dc:title") {
-        if let Some(rest) = rest.trim_start().strip_prefix("contains") {
-            if let Some(needle) = parse_search_quoted_string(rest.trim_start()) {
-                return SearchCriteria::TitleContains(needle);
-            }
-        }
+    if let Some(rest) = trimmed.strip_prefix("dc:title")
+        && let Some(rest) = rest.trim_start().strip_prefix("contains")
+        && let Some(needle) = parse_search_quoted_string(rest.trim_start())
+    {
+        return SearchCriteria::TitleContains(needle);
     }
     SearchCriteria::Unsupported
 }

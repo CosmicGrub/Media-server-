@@ -55,19 +55,20 @@ impl ServerCert {
         let key_path = dir.join("tls-key.der");
         let expiry_path = dir.join("tls-cert-expires.txt");
 
-        if let (Ok(cert_der), Ok(key_der)) = (std::fs::read(&cert_path), std::fs::read(&key_path)) {
-            if !cert_der.is_empty() && !key_der.is_empty() {
-                // Missing, unreadable, unparsable, or too large to represent as a `SystemTime` at
-                // all (a corrupted or hand-edited sidecar, a torn write) is all the same outcome
-                // here: unknown expiry, not a fabricated date and never a reason to fail loading an
-                // otherwise-good cert -- see `expiry_from_secs`, which is what keeps a value that
-                // merely parses as a valid `u64` from overflowing straight into a startup panic.
-                let expires_at = std::fs::read_to_string(&expiry_path)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .and_then(expiry_from_secs);
-                return Ok(Self { cert_der, key_der, expires_at });
-            }
+        if let (Ok(cert_der), Ok(key_der)) = (std::fs::read(&cert_path), std::fs::read(&key_path))
+            && !cert_der.is_empty()
+            && !key_der.is_empty()
+        {
+            // Missing, unreadable, unparsable, or too large to represent as a `SystemTime` at
+            // all (a corrupted or hand-edited sidecar, a torn write) is all the same outcome
+            // here: unknown expiry, not a fabricated date and never a reason to fail loading an
+            // otherwise-good cert -- see `expiry_from_secs`, which is what keeps a value that
+            // merely parses as a valid `u64` from overflowing straight into a startup panic.
+            let expires_at = std::fs::read_to_string(&expiry_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .and_then(expiry_from_secs);
+            return Ok(Self { cert_der, key_der, expires_at });
         }
 
         // No hostname to speak of on a home LAN; the subject name is never checked by a client that

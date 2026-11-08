@@ -24,7 +24,12 @@ exclude = ["spikes/s1-compositing/ui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88 (not 1.85): the RUSTSEC-2026-0009 fix in time >=0.3.47 raised that crate's own MSRV to
+# 1.88.0, and resolver = "3" above makes cargo's dependency resolution MSRV-aware -- understating
+# this would make cargo silently decline the patched version and lock back to the vulnerable one.
+# CI (dtolnay/rust-toolchain@stable) always builds on current stable regardless, so this only
+# changes the floor we claim, not what actually runs.
+rust-version = "1.88"
 license = "MPL-2.0"
 repository = "https://github.com/CosmicGrub/Media-server-"
 
